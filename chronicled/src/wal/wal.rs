@@ -60,6 +60,46 @@ async fn open_segment(path: PathBuf, io_mode: IoMode) -> Result<Box<dyn Segment>
     }
 }
 
+async fn open_existing_segment(
+    path: PathBuf,
+    io_mode: IoMode,
+    write_offset: u64,
+) -> Result<Box<dyn Segment>, UnitError> {
+    match io_mode {
+        IoMode::Advanced => {
+            let ds = DirectSegment::open_existing(path, write_offset)
+                .await
+                .map_err(|e| UnitError::Storage(e.to_string()))?;
+            Ok(Box::new(ds))
+        }
+        IoMode::Basic => {
+            let s = StandardSegment::open_existing(path, write_offset)
+                .await
+                .map_err(|e| UnitError::Storage(e.to_string()))?;
+            Ok(Box::new(s))
+        }
+        IoMode::Mmap => {
+            let ms = MmapSegment::open_existing(path, write_offset)
+                .await
+                .map_err(|e| UnitError::Storage(e.to_string()))?;
+            Ok(Box::new(ms))
+        }
+    }
+}
+
+fn wal_logical_len(path: &Path) -> Result<u64, UnitError> {
+    let data = std::fs::read(path)
+        .map_err(|e| UnitError::Storage(format!("failed to read WAL segment: {}", e)))?;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        match Record::decode(&data[offset..]) {
+            Ok((_, size)) => offset += size,
+            Err(_) => break,
+        }
+    }
+    Ok(offset as u64)
+}
+
 fn discover_segments(dir: &Path) -> Vec<(u64, PathBuf)> {
     let mut segments = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -135,7 +175,6 @@ pub struct Wal {
     wal_writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     wal_syncer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     dir: PathBuf,
-    io_mode: IoMode,
 }
 
 impl Wal {
@@ -158,7 +197,9 @@ impl Wal {
 
         let existing = discover_segments(&dir);
         let (current_segment_id, segment) = if let Some((last_id, last_path)) = existing.last() {
-            let seg = open_segment(last_path.clone(), options.io_mode).await?;
+            let write_offset = wal_logical_len(last_path)?;
+            let seg =
+                open_existing_segment(last_path.clone(), options.io_mode, write_offset).await?;
             (*last_id, seg)
         } else {
             let path = dir.join(segment_filename(0));
@@ -206,7 +247,6 @@ impl Wal {
             wal_writer_handle: Arc::new(Mutex::new(Some(wal_writer_handle))),
             wal_syncer_handle: Arc::new(Mutex::new(Some(wal_syncer_handle))),
             dir,
-            io_mode: options.io_mode,
         })
     }
 
@@ -235,8 +275,6 @@ impl Wal {
         from_segment_id: u64,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<u8>, UnitError>> + Send + '_>> {
         let segments = discover_segments(&self.dir);
-        let io_mode = self.io_mode;
-
         let replay_segments: Vec<(u64, PathBuf)> = segments
             .into_iter()
             .filter(|(id, _)| *id >= from_segment_id)
@@ -244,17 +282,7 @@ impl Wal {
 
         Box::pin(stream! {
             for (seg_id, path) in replay_segments {
-                let seg_result = open_segment(path.clone(), io_mode).await;
-                let mut seg = match seg_result {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(segment_id = seg_id, error = ?e, "failed to open wal segment for replay");
-                        yield Err(e);
-                        return;
-                    }
-                };
-
-                let data = match seg.read_all().await {
+                let data = match tokio::fs::read(&path).await {
                     Ok(d) => d,
                     Err(e) => {
                         warn!(segment_id = seg_id, error = ?e, "failed to read wal segment");
@@ -436,11 +464,6 @@ async fn flush_batch(
     let encoded_len = encoded.len();
     match state.current_segment.write(&encoded).await {
         Ok(base_offset) => {
-            if let Some(m) = crate::observability::global_metrics() {
-                m.wal_writes.add(1, &[]);
-                m.wal_bytes.add(encoded_len as u64, &[]);
-            }
-
             let global_base = state.global_offset(base_offset);
 
             let mut current_offset = global_base;
@@ -471,12 +494,7 @@ async fn bg_wal_syncer(
         match advanced_offset_rx.changed().await {
             Ok(_) => {
                 let advanced_offset = *advanced_offset_rx.borrow();
-                let start = std::time::Instant::now();
                 inner.sync_data().await;
-                if let Some(m) = crate::observability::global_metrics() {
-                    m.wal_sync_latency
-                        .record(start.elapsed().as_secs_f64(), &[]);
-                }
                 if let Err(err) = commit_offset_tx.send(advanced_offset) {
                     warn!(error = ?err, "no active subscriber for synced offset");
                 }
@@ -486,5 +504,71 @@ async fn bg_wal_syncer(
                 break;
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chronicle_proto::pb_ext::Event;
+    use futures_util::StreamExt;
+    use prost::Message;
+
+    async fn wait_synced(wal: &Wal, wal_offset: i64) {
+        let mut synced = wal.watch_synced();
+        while *synced.borrow() < wal_offset {
+            synced.changed().await.unwrap();
+        }
+    }
+
+    fn test_event(offset: i64, payload: &[u8]) -> Event {
+        Event {
+            timeline_id: 1,
+            term: 1,
+            offset,
+            payload: Some(payload.to_vec().into()),
+            crc32: None,
+            timestamp: offset * 100,
+            schema_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_reopen_replays_full_events_without_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let first = test_event(1, b"first");
+        let wal = Wal::new(WalOptions {
+            dir: wal_dir.to_string_lossy().to_string(),
+            max_segment_size: None,
+            io_mode: IoMode::Basic,
+        })
+        .await
+        .unwrap();
+        let first_offset = wal.append(first.encode_to_vec()).await.unwrap();
+        wait_synced(&wal, first_offset).await;
+        wal.shutdown().await;
+
+        let second = test_event(2, b"second");
+        let reopened = Wal::new(WalOptions {
+            dir: wal_dir.to_string_lossy().to_string(),
+            max_segment_size: None,
+            io_mode: IoMode::Basic,
+        })
+        .await
+        .unwrap();
+        let second_offset = reopened.append(second.encode_to_vec()).await.unwrap();
+        wait_synced(&reopened, second_offset).await;
+
+        let mut stream = reopened.read_stream().await;
+        let first_replayed = stream.next().await.unwrap().unwrap();
+        let second_replayed = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert_eq!(Event::decode(first_replayed.as_slice()).unwrap(), first);
+        assert_eq!(Event::decode(second_replayed.as_slice()).unwrap(), second);
+
+        reopened.shutdown().await;
     }
 }

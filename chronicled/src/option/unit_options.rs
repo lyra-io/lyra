@@ -202,27 +202,6 @@ impl SegmentOptions {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct RetentionOptions {
-    #[serde(default)]
-    pub ttl_hours: Option<u64>,
-    #[serde(default = "default_retention_interval_secs")]
-    pub interval_secs: u64,
-}
-
-impl Default for RetentionOptions {
-    fn default() -> Self {
-        Self {
-            ttl_hours: None,
-            interval_secs: default_retention_interval_secs(),
-        }
-    }
-}
-
-fn default_retention_interval_secs() -> u64 {
-    3600
-}
-
 #[derive(Debug, Deserialize, Default)]
 pub struct UnitOptions {
     #[serde(default)]
@@ -234,8 +213,6 @@ pub struct UnitOptions {
     #[serde(default)]
     pub log: LogOptions,
     #[serde(default)]
-    pub catalog: catalog::CatalogOptions,
-    #[serde(default)]
     pub compaction: CompactionOptions,
     #[serde(default)]
     pub segments: SegmentOptions,
@@ -243,8 +220,6 @@ pub struct UnitOptions {
     pub io_mode: IoMode,
     #[serde(default)]
     pub index: IndexOptions,
-    #[serde(default)]
-    pub retention: RetentionOptions,
 }
 
 fn default_server_address() -> SocketAddr {

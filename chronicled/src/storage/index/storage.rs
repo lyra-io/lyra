@@ -106,24 +106,16 @@ impl Storage {
     }
 
     pub fn put_index_batch(&self, entries: &[((i64, i64), IndexEntry)]) -> Result<(), UnitError> {
-        let start = std::time::Instant::now();
         let mut batch = WriteBatch::default();
         for &((timeline_id, offset), ref entry) in entries {
             let key = encode_key(timeline_id, offset);
             let value = entry.encode();
             batch.put(key, value);
         }
-        let result = self
-            .inner
+        self.inner
             .database
             .write_opt(batch, &self.inner.write_options)
-            .map_err(|e| UnitError::Storage(e.to_string()));
-        if let Some(m) = crate::observability::global_metrics() {
-            m.index_writes.add(entries.len() as u64, &[]);
-            m.index_write_latency
-                .record(start.elapsed().as_secs_f64(), &[]);
-        }
-        result
+            .map_err(|e| UnitError::Storage(e.to_string()))
     }
 
     pub fn delete_index_batch(&self, keys: &[(i64, i64)]) -> Result<(), UnitError> {
@@ -155,7 +147,6 @@ impl Storage {
         start_offset: i64,
         end_offset: i64,
     ) -> Vec<(i64, IndexEntry)> {
-        let scan_start = std::time::Instant::now();
         let start_key = encode_key(timeline_id, start_offset);
         let iter = self.inner.database.iterator(rocksdb::IteratorMode::From(
             &start_key,
@@ -180,11 +171,6 @@ impl Storage {
                 }
                 Err(_) => break,
             }
-        }
-        if let Some(m) = crate::observability::global_metrics() {
-            m.index_reads.add(1, &[]);
-            m.index_read_latency
-                .record(scan_start.elapsed().as_secs_f64(), &[]);
         }
         results
     }

@@ -86,9 +86,6 @@ impl WriteCache {
         active.size.fetch_add(proto_data.len(), Ordering::Relaxed);
         let idx = active.buffer.push(proto_data);
         active.index.insert((timeline_id, offset), idx as u32);
-        if let Some(m) = crate::observability::global_metrics() {
-            m.write_cache_entries.add(1, &[]);
-        }
     }
 
     pub fn try_seal(&self) -> bool {

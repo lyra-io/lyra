@@ -17,20 +17,35 @@ impl MmapSegment {
     }
 
     pub async fn with_capacity(path: PathBuf, initial_size: u64) -> Result<Self, Error> {
-        let (file, mmap) = tokio::task::spawn_blocking({
+        Self::open(path, initial_size, true, 0).await
+    }
+
+    pub async fn open_existing(path: PathBuf, write_offset: u64) -> Result<Self, Error> {
+        Self::open(path, DEFAULT_MAX_SEGMENT_SIZE, false, write_offset).await
+    }
+
+    async fn open(
+        path: PathBuf,
+        initial_size: u64,
+        truncate: bool,
+        write_offset: u64,
+    ) -> Result<Self, Error> {
+        let (file, mmap, capacity) = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || -> Result<(File, MmapMut), Error> {
+            move || -> Result<(File, MmapMut, u64), Error> {
+                let existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let capacity = initial_size.max(write_offset).max(existing_len);
                 let file = OpenOptions::new()
                     .create(true)
                     .read(true)
                     .write(true)
-                    .truncate(true)
+                    .truncate(truncate)
                     .open(&path)?;
 
-                file.set_len(initial_size)?;
+                file.set_len(capacity)?;
 
                 let mmap = unsafe { MmapMut::map_mut(&file)? };
-                Ok((file, mmap))
+                Ok((file, mmap, capacity))
             }
         })
         .await
@@ -39,8 +54,8 @@ impl MmapSegment {
         Ok(Self {
             file,
             mmap,
-            write_offset: 0,
-            capacity: initial_size,
+            write_offset,
+            capacity,
         })
     }
 

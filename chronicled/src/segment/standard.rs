@@ -14,11 +14,19 @@ pub struct StandardSegment {
 
 impl StandardSegment {
     pub async fn new(path: PathBuf) -> Result<Self, Error> {
+        Self::open(path, true, 0).await
+    }
+
+    pub async fn open_existing(path: PathBuf, write_offset: u64) -> Result<Self, Error> {
+        Self::open(path, false, write_offset).await
+    }
+
+    async fn open(path: PathBuf, truncate: bool, write_offset: u64) -> Result<Self, Error> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .truncate(true)
+            .truncate(truncate)
             .open(&path)
             .await?;
 
@@ -27,12 +35,17 @@ impl StandardSegment {
             .write(true)
             .open(&path)?;
 
-        Ok(StandardSegment {
+        let mut segment = StandardSegment {
             path,
             file,
             std_file,
-            write_offset: 0,
-        })
+            write_offset,
+        };
+        segment
+            .file
+            .seek(std::io::SeekFrom::Start(write_offset))
+            .await?;
+        Ok(segment)
     }
 
     pub async fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {

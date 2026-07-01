@@ -1,6 +1,4 @@
-pub mod actor;
 pub mod error;
-pub mod observability;
 pub mod option;
 pub mod segment;
 pub mod storage;

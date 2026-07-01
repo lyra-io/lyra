@@ -106,11 +106,19 @@ pub struct DirectSegment {
 
 impl DirectSegment {
     pub async fn new(path: PathBuf) -> Result<Self, Error> {
+        Self::open(path, true, 0).await
+    }
+
+    pub async fn open_existing(path: PathBuf, write_offset: u64) -> Result<Self, Error> {
+        Self::open(path, false, write_offset).await
+    }
+
+    async fn open(path: PathBuf, truncate: bool, write_offset: u64) -> Result<Self, Error> {
         let file = tokio::task::spawn_blocking({
             let path = path.clone();
             move || {
                 let mut opts = OpenOptions::new();
-                opts.create(true).read(true).write(true).truncate(true);
+                opts.create(true).read(true).write(true).truncate(truncate);
 
                 #[cfg(target_os = "linux")]
                 {
@@ -137,7 +145,7 @@ impl DirectSegment {
         Ok(Self {
             path,
             file,
-            write_offset: 0,
+            write_offset,
             buf: AlignedBuffer::new(PAGE_SIZE * 4),
         })
     }

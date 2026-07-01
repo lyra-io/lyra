@@ -73,8 +73,6 @@ pub(crate) trait CompactionLevel: Send + Sync {
             if source_segments.len() < self.trigger() {
                 return Ok(());
             }
-            let compact_start = std::time::Instant::now();
-
             let source_ids: HashSet<u64> = source_segments.iter().map(|m| m.id).collect();
             let entries = self.index().scan_by_segment_ids(&source_ids);
 
@@ -142,15 +140,6 @@ pub(crate) trait CompactionLevel: Send + Sync {
             self.index().put_index_batch(&all_new_entries)?;
             let ids: Vec<u64> = source_ids.into_iter().collect();
             self.segment_manager().remove_segments(&ids);
-
-            if let Some(m) = crate::observability::global_metrics() {
-                m.record_compaction(
-                    self.target_level(),
-                    compact_start.elapsed().as_secs_f64(),
-                    source_segments.iter().map(|s| s.size).sum::<u64>(),
-                    0,
-                );
-            }
 
             info!(
                 name = self.name(),
