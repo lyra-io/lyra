@@ -1,6 +1,6 @@
 # Milestone 1: Standalone Unit Write Thread Model
 
-Milestone 1 is scoped to a single `chronicle-unit` accepting writes directly through the existing gRPC `Record` stream. It does not require catalog-backed timeline creation or registration, admin APIs, metrics, retention, unit-side reads, ensemble replication, segment replacement, or client-side distributed recovery.
+Milestone 1 is scoped to a single `chronicle-unit` accepting writes directly through the existing gRPC `Record` stream. It does not require catalog-backed timeline creation or registration, admin APIs, metrics, retention, compaction, segment storage, unit-side reads, ensemble replication, segment replacement, or client-side distributed recovery.
 
 The goal is to make the unit-local write path internally consistent and restart-safe before layering the distributed timeline writer on top.
 
@@ -24,6 +24,7 @@ Out of scope for this milestone:
 - Admin service APIs.
 - Metrics and Prometheus export.
 - Retention management.
+- Segment storage and compaction.
 - Ensemble selection or replacement.
 - Cross-unit replication.
 - Client-side `StateMachine` reconciliation.
@@ -120,7 +121,7 @@ Milestone 1 implementation should satisfy these invariants:
 - WAL/cache agreement: replaying durable WAL records produces the same events that were acknowledged.
 - Term safety: stale-term writes are rejected before WAL append.
 - Logical offset clarity: client-visible offsets come from `Event.offset`, not WAL byte offsets.
-- Backpressure propagation: if the write cache cannot accept synced events, the sync coroutine stops draining in-flight writes; the in-flight channel fills; the receive coroutine stops polling the gRPC request stream.
+- Backpressure propagation: bounded in-flight capacity stops the receive coroutine from polling the gRPC request stream when WAL-sync application falls behind.
 - Finite shutdown: stopping the unit cancels stream coroutines and waits for them to exit.
 
 ## Implementation Status
@@ -130,11 +131,11 @@ Implemented in this milestone pass:
 - Removed the read and write actor layer from `chronicle-unit`.
 - Removed unit-side read serving; `Fetch` now returns `UNIMPLEMENTED` on the unit.
 - Removed unit-side admin service, metrics/Prometheus setup, retention manager, and catalog registration/reporting.
+- Removed unit-side segment management and compaction; the standalone unit replays WAL directly into an in-memory write cache.
 - `UnitService::record` now creates a per-stream receive path and a per-stream WAL-sync apply path.
 - Accepted writes append encoded full `Event` records to the WAL.
-- WAL recovery opens existing segments without truncating them and replays full `Event` records into the write cache.
-- `UnitService` tracks spawned stream tasks through `UnitServiceTasks`; `Unit::stop` cancels and joins them before shutting down the compaction pipeline and WAL.
-- Stream sync cancellation is aware of write-cache backpressure, so blocked cache application exits during unit shutdown.
+- WAL recovery opens existing WAL files without truncating them and replays full `Event` records into the write cache.
+- `UnitService` tracks spawned stream tasks through `UnitServiceTasks`; `Unit::stop` cancels and joins them before shutting down the WAL.
 
 ## Acceptance Tests
 
@@ -143,14 +144,15 @@ Covered by focused tests:
 - A valid write is acknowledged only after WAL sync and then appears in `WriteCache`.
 - A stale-term write is rejected and does not append to WAL.
 - WAL replay after reopening the unit recovers full `Event` records.
-- Cache-backpressured sync work exits on cancellation, which protects unit shutdown from hanging on stream tasks.
+- Stream tasks are tracked and joined during shutdown.
 
 ## Implementation Order
 
 1. Replace write actors with direct record-stream receive/sync coroutines.
-2. Add WAL open modes so recovery can read existing segments without truncating them.
+2. Add WAL open modes so recovery can read existing WAL files without truncating them.
 3. Remove unit-side read serving while leaving the proto/client fetch surface untouched.
 4. Remove admin, metrics, retention, and catalog registration from the standalone unit.
-5. Add unit-service task tracking and graceful stream-task shutdown.
-6. Add focused WAL replay and standalone write tests.
-7. Re-run `cargo fmt --all --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace`.
+5. Remove segment management and compaction from the standalone unit.
+6. Add unit-service task tracking and graceful stream-task shutdown.
+7. Add focused WAL replay and standalone write tests.
+8. Re-run `cargo fmt --all --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace`.

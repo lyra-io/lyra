@@ -530,7 +530,7 @@ mod tests {
     async fn record_stream_syncs_to_wal_before_ack_and_cache_visibility() {
         let dir = tempfile::tempdir().unwrap();
         let wal = test_wal(&dir.path().join("wal")).await;
-        let write_cache = WriteCache::new(1024 * 1024);
+        let write_cache = WriteCache::new();
         let timeline_state = Arc::new(TimelineStateManager::new());
         timeline_state.fence(1, 1).unwrap();
         let context = CancellationToken::new();
@@ -579,7 +579,7 @@ mod tests {
     async fn stale_term_write_is_rejected_before_wal_append() {
         let dir = tempfile::tempdir().unwrap();
         let wal = test_wal(&dir.path().join("wal")).await;
-        let write_cache = WriteCache::new(1024 * 1024);
+        let write_cache = WriteCache::new();
         let timeline_state = Arc::new(TimelineStateManager::new());
         timeline_state.fence(1, 2).unwrap();
         let context = CancellationToken::new();
@@ -616,43 +616,5 @@ mod tests {
         assert!(replay.next().await.is_none());
 
         wal.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn synced_write_blocked_on_cache_exits_on_cancellation() {
-        let write_cache = WriteCache::new(1);
-        write_cache.put_direct(test_event(1, 1, b"first"), false);
-        assert!(write_cache.try_seal());
-        write_cache.put_direct(test_event(1, 2, b"second"), false);
-
-        let timeline_state = TimelineStateManager::new();
-        let context = CancellationToken::new();
-        let (response_tx, mut response_rx) = mpsc::channel(1);
-        let ack = Arc::new(BatchAck::new(response_tx, 1, 1, 1));
-        let mut pending = VecDeque::from([InflightWrite {
-            wal_offset: 10,
-            event: test_event(1, 3, b"blocked"),
-            trunc: false,
-            ack,
-        }]);
-
-        let cancel = context.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            cancel.cancel();
-        });
-
-        let completed = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            drain_synced_writes(&mut pending, 10, &write_cache, &timeline_state, &context),
-        )
-        .await
-        .unwrap();
-
-        assert!(!completed);
-        assert!(pending.is_empty());
-        let status = response_rx.recv().await.unwrap().unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Cancelled);
-        assert!(write_cache.scan(1, 3, 3).is_empty());
     }
 }

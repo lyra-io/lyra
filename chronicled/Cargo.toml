@@ -17,8 +17,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 dashmap = { workspace = true }
 xxhash-rust = { workspace = true }
-num_cpus = { workspace = true }
-rocksdb = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 boxcar = { workspace = true }
 
@@ -29,11 +27,6 @@ futures-util = { workspace = true }
 async-stream = { workspace = true }
 memmap2 = { workspace = true }
 libc = { workspace = true }
-aws-sdk-s3 = { workspace = true }
-aws-config = { workspace = true }
-bytes = { workspace = true }
-lru = { workspace = true }
-sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.8"

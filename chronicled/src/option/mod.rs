@@ -3,7 +3,6 @@ use crate::error::unit_error::UnitError::Codec;
 use crate::option::unit_options::UnitOptions;
 use std::fs;
 
-pub mod auto_config;
 pub mod unit_options;
 
 impl TryInto<UnitOptions> for String {
