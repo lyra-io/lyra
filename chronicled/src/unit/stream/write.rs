@@ -1,6 +1,4 @@
 use crate::storage::Storage;
-use crate::storage::write_cache::WriteCache;
-use crate::unit::timeline_state::TimelineStateManager;
 use chronicle_proto::pb_ext::{RecordEventsRequest, RecordEventsResponse, StatusCode};
 use futures_util::{Stream, StreamExt};
 use prost::Message;
@@ -13,8 +11,6 @@ use tonic::Status;
 #[derive(Clone)]
 pub(crate) struct RecordStreamContext {
     pub(crate) storage: Arc<dyn Storage>,
-    pub(crate) write_cache: WriteCache,
-    pub(crate) timeline_state: Arc<TimelineStateManager>,
     pub(crate) context: CancellationToken,
     pub(crate) inflight_capacity: usize,
 }
@@ -110,13 +106,7 @@ pub(crate) async fn run_record_stream<S>(
     let (inflight_tx, inflight_rx) = mpsc::channel(context.inflight_capacity);
     let receive_loop =
         receive_record_requests(stream, response_tx.clone(), inflight_tx, context.clone());
-    let sync_loop = sync_record_inflight(
-        inflight_rx,
-        context.storage,
-        context.write_cache,
-        context.timeline_state,
-        context.context,
-    );
+    let sync_loop = sync_record_inflight(inflight_rx, context.storage, context.context);
     tokio::join!(receive_loop, sync_loop);
 }
 
@@ -200,10 +190,7 @@ async fn enqueue_record_batch(
             batch_term = Some(event.term);
         }
 
-        if let Err(current_term) = context
-            .timeline_state
-            .check_term(event.timeline_id, event.term)
-        {
+        if let Err(current_term) = context.storage.check_term(event.timeline_id, event.term) {
             let _ = response_tx
                 .send(Ok(RecordEventsResponse {
                     code: StatusCode::InvalidTerm.into(),
@@ -264,8 +251,6 @@ async fn enqueue_record_batch(
 async fn sync_record_inflight(
     mut inflight_rx: mpsc::Receiver<InflightWrite>,
     storage: Arc<dyn Storage>,
-    write_cache: WriteCache,
-    timeline_state: Arc<TimelineStateManager>,
     context: CancellationToken,
 ) {
     let mut synced_offset = *storage.watch_synced().borrow();
@@ -274,15 +259,7 @@ async fn sync_record_inflight(
     let mut inflight_closed = false;
 
     loop {
-        if !drain_synced_writes(
-            &mut pending,
-            synced_offset,
-            &write_cache,
-            &timeline_state,
-            &context,
-        )
-        .await
-        {
+        if !drain_synced_writes(&mut pending, synced_offset, &storage, &context).await {
             fail_pending_and_close(&mut pending, &mut inflight_rx).await;
             break;
         }
@@ -318,8 +295,7 @@ async fn sync_record_inflight(
 async fn drain_synced_writes(
     pending: &mut VecDeque<InflightWrite>,
     synced_offset: i64,
-    write_cache: &WriteCache,
-    timeline_state: &TimelineStateManager,
+    storage: &Arc<dyn Storage>,
     context: &CancellationToken,
 ) -> bool {
     while pending
@@ -329,14 +305,15 @@ async fn drain_synced_writes(
         let write = pending.pop_front().unwrap();
         let timeline_id = write.event.timeline_id;
         let offset = write.event.offset;
+        let trunc = write.trunc;
         tokio::select! {
             _ = context.cancelled() => {
                 write.ack.fail_status(Status::cancelled("record stream cancelled")).await;
                 return false;
             }
-            _ = write_cache.put(write.event, write.trunc) => {}
+            _ = storage.apply_write(write.event, trunc) => {}
         }
-        timeline_state.update_lra(timeline_id, offset);
+        storage.update_lra(timeline_id, offset);
         write.ack.complete_ok(offset).await;
     }
     true
@@ -364,7 +341,8 @@ async fn fail_pending_writes(pending: &mut VecDeque<InflightWrite>, status: Stat
 mod tests {
     use super::*;
     use crate::option::unit_options::IoMode;
-    use crate::storage::wal::{Wal, WalOptions};
+    use crate::storage::UnitStorage;
+    use crate::storage::wal::WalOptions;
     use chronicle_proto::pb_ext::{Event, RecordEventsRequestItem};
     use futures_util::StreamExt;
 
@@ -380,9 +358,9 @@ mod tests {
         }
     }
 
-    async fn test_wal(dir: &std::path::Path) -> Arc<Wal> {
+    async fn test_storage(dir: &std::path::Path) -> Arc<UnitStorage> {
         Arc::new(
-            Wal::new(WalOptions {
+            UnitStorage::open(WalOptions {
                 dir: dir.to_string_lossy().to_string(),
                 max_segment_size: None,
                 io_mode: IoMode::Basic,
@@ -395,16 +373,12 @@ mod tests {
     #[tokio::test]
     async fn record_stream_syncs_to_wal_before_ack_and_cache_visibility() {
         let dir = tempfile::tempdir().unwrap();
-        let wal = test_wal(&dir.path().join("wal")).await;
-        let write_cache = WriteCache::new();
-        let timeline_state = Arc::new(TimelineStateManager::new());
-        timeline_state.fence(1, 1).unwrap();
+        let storage = test_storage(&dir.path().join("wal")).await;
+        storage.fence(1, 1).unwrap();
         let context = CancellationToken::new();
         let (response_tx, mut response_rx) = mpsc::channel(4);
         let stream_context = RecordStreamContext {
-            storage: wal.clone(),
-            write_cache: write_cache.clone(),
-            timeline_state: timeline_state.clone(),
+            storage: storage.clone(),
             context,
             inflight_capacity: 8,
         };
@@ -429,31 +403,27 @@ mod tests {
         assert_eq!(response.code, StatusCode::Ok as i32);
         assert_eq!(response.commit_offset, 7);
 
-        let cached = write_cache.scan(1, 7, 7);
+        let cached = storage.scan_cached(1, 7, 7);
         assert_eq!(cached, vec![event.clone()]);
-        assert_eq!(timeline_state.get_state(1).unwrap().lra, 7);
+        assert_eq!(storage.fence(1, 2).unwrap(), 7);
 
-        let mut replay = wal.read_stream();
+        let mut replay = storage.wal().read_stream();
         let replayed = replay.next().await.unwrap().unwrap();
         assert_eq!(Event::decode(replayed.as_slice()).unwrap(), event);
         assert!(replay.next().await.is_none());
 
-        wal.shutdown().await;
+        storage.shutdown().await;
     }
 
     #[tokio::test]
     async fn stale_term_write_is_rejected_before_wal_append() {
         let dir = tempfile::tempdir().unwrap();
-        let wal = test_wal(&dir.path().join("wal")).await;
-        let write_cache = WriteCache::new();
-        let timeline_state = Arc::new(TimelineStateManager::new());
-        timeline_state.fence(1, 2).unwrap();
+        let storage = test_storage(&dir.path().join("wal")).await;
+        storage.fence(1, 2).unwrap();
         let context = CancellationToken::new();
         let (response_tx, mut response_rx) = mpsc::channel(4);
         let stream_context = RecordStreamContext {
-            storage: wal.clone(),
-            write_cache: write_cache.clone(),
-            timeline_state: timeline_state.clone(),
+            storage: storage.clone(),
             context,
             inflight_capacity: 8,
         };
@@ -476,11 +446,11 @@ mod tests {
         let response = response_rx.recv().await.unwrap().unwrap();
         assert_eq!(response.code, StatusCode::InvalidTerm as i32);
         assert_eq!(response.commit_offset, -1);
-        assert!(write_cache.scan(1, 0, 10).is_empty());
+        assert!(storage.scan_cached(1, 0, 10).is_empty());
 
-        let mut replay = wal.read_stream();
+        let mut replay = storage.wal().read_stream();
         assert!(replay.next().await.is_none());
 
-        wal.shutdown().await;
+        storage.shutdown().await;
     }
 }

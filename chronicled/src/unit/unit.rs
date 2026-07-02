@@ -1,20 +1,16 @@
 use crate::error::unit_error::UnitError;
 use crate::option::unit_options::{ServerOptions, UnitOptions};
-use crate::storage::Storage;
-use crate::storage::wal::{Wal, WalOptions};
-use crate::storage::write_cache::WriteCache;
-use crate::unit::timeline_state::TimelineStateManager;
-use crate::unit::write_path::{RecordStreamContext, run_record_stream};
+use crate::storage::wal::WalOptions;
+use crate::storage::{Storage, UnitStorage};
+use crate::unit::stream::{RecordStreamContext, run_record_stream};
 use chronicle_proto::pb_ext::chronicle_server::{Chronicle, ChronicleServer};
 use chronicle_proto::pb_ext::{
-    Event, FenceRequest, FenceResponse, FetchEventsRequest, FetchEventsResponse,
-    RecordEventsRequest, RecordEventsResponse, StatusCode,
+    FenceRequest, FenceResponse, FetchEventsRequest, FetchEventsResponse, RecordEventsRequest,
+    RecordEventsResponse, StatusCode,
 };
-use futures_util::StreamExt;
-use prost::Message;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Mutex as TokioMutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -28,14 +24,12 @@ const RESPONSE_BUFFER: usize = 4;
 
 pub struct Unit {
     inner: Arc<UnitInner>,
-    external_handle: Option<Arc<TokioMutex<Option<JoinHandle<()>>>>>,
+    external_handle: JoinHandle<()>,
 }
 
 struct UnitInner {
     context: CancellationToken,
     storage: Arc<dyn Storage>,
-    write_cache: WriteCache,
-    timeline_state: Arc<TimelineStateManager>,
     stream_handles: Mutex<Vec<JoinHandle<()>>>,
     inflight_capacity: usize,
 }
@@ -73,73 +67,27 @@ impl Unit {
         info!("unit initializing");
         let context = CancellationToken::new();
 
-        let wal = Wal::new(WalOptions {
+        let storage = UnitStorage::open(WalOptions {
             dir: options.wal.dir.clone(),
             max_segment_size: None,
             io_mode: options.io_mode,
         })
         .await?;
-        let storage: Arc<dyn Storage> = Arc::new(wal);
+        let storage: Arc<dyn Storage> = Arc::new(storage);
         info!(dir = %options.wal.dir, "storage opened");
 
-        let write_cache = WriteCache::new();
-
-        info!("replaying storage into write cache");
-        let mut stream = storage.read_stream();
-        let mut replayed = 0u64;
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(data) => {
-                    if let Ok(event) = Event::decode(data.as_slice()) {
-                        write_cache.put_direct(event, false);
-                        replayed += 1;
-                    }
-                }
-                Err(e) => {
-                    warn!(error = ?e, "storage replay error reading record");
-                    break;
-                }
-            }
-        }
-        drop(stream);
-        info!(events = replayed, "storage replay complete");
-
-        let timeline_state = Arc::new(TimelineStateManager::new());
         let inner = Arc::new(UnitInner {
             context,
             storage,
-            write_cache,
-            timeline_state,
             stream_handles: Mutex::new(Vec::new()),
             inflight_capacity: DEFAULT_INFLIGHT_NUM,
         });
-        let external_handle = Arc::new(TokioMutex::new(None));
-        let unit = Self {
+        let external_handle = bg_start_external_service(options.server.clone(), inner.clone());
+
+        Ok(Self {
             inner,
-            external_handle: Some(external_handle.clone()),
-        };
-
-        let handle = bg_start_external_service(options.server.clone(), unit.service());
-        *external_handle.lock().await = Some(handle);
-
-        Ok(unit)
-    }
-
-    fn service(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            external_handle: None,
-        }
-    }
-
-    fn record_stream_context(&self) -> RecordStreamContext {
-        RecordStreamContext {
-            storage: self.inner.storage.clone(),
-            write_cache: self.inner.write_cache.clone(),
-            timeline_state: self.inner.timeline_state.clone(),
-            context: self.inner.context.clone(),
-            inflight_capacity: self.inner.inflight_capacity,
-        }
+            external_handle,
+        })
     }
 
     pub async fn stop(self) {
@@ -147,13 +95,8 @@ impl Unit {
 
         self.inner.context.cancel();
 
-        if let Some(external_handle) = self.external_handle {
-            let handle = external_handle.lock().await.take();
-            if let Some(handle) = handle
-                && let Err(err) = handle.await
-            {
-                error!(error = ?err, "unexpected error closing external service");
-            }
+        if let Err(err) = self.external_handle.await {
+            error!(error = ?err, "unexpected error closing external service");
         }
         self.inner.shutdown_streams().await;
         self.inner.storage.shutdown().await;
@@ -161,8 +104,18 @@ impl Unit {
     }
 }
 
+impl UnitInner {
+    fn record_stream_context(&self) -> RecordStreamContext {
+        RecordStreamContext {
+            storage: self.storage.clone(),
+            context: self.context.clone(),
+            inflight_capacity: self.inflight_capacity,
+        }
+    }
+}
+
 #[tonic::async_trait]
-impl Chronicle for Unit {
+impl Chronicle for UnitInner {
     type RecordStream = BoxStream<RecordEventsResponse>;
 
     async fn record(
@@ -170,7 +123,7 @@ impl Chronicle for Unit {
         request: Request<Streaming<RecordEventsRequest>>,
     ) -> Result<Response<Self::RecordStream>, Status> {
         let (tx, rx) = mpsc::channel(RESPONSE_BUFFER);
-        self.inner.spawn_stream(run_record_stream(
+        self.spawn_stream(run_record_stream(
             request.into_inner(),
             tx,
             self.record_stream_context(),
@@ -194,7 +147,7 @@ impl Chronicle for Unit {
         request: Request<FenceRequest>,
     ) -> Result<Response<FenceResponse>, Status> {
         let req = request.into_inner();
-        match self.inner.timeline_state.fence(req.timeline_id, req.term) {
+        match self.storage.fence(req.timeline_id, req.term) {
             Ok(lra) => Ok(Response::new(FenceResponse {
                 code: StatusCode::Ok.into(),
                 lra,
@@ -209,16 +162,18 @@ impl Chronicle for Unit {
     }
 }
 
-fn bg_start_external_service(options: ServerOptions, unit: Unit) -> JoinHandle<()> {
-    let context = unit.inner.context.clone();
+fn bg_start_external_service(options: ServerOptions, inner: Arc<UnitInner>) -> JoinHandle<()> {
+    let context = inner.context.clone();
     tokio::spawn(async move {
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
-        health_reporter.set_serving::<ChronicleServer<Unit>>().await;
+        health_reporter
+            .set_serving::<ChronicleServer<UnitInner>>()
+            .await;
 
         info!(addr = %options.bind_address, "grpc service starting");
         let serve_future = Server::builder()
             .add_service(health_service)
-            .add_service(ChronicleServer::new(unit))
+            .add_service(ChronicleServer::from_arc(inner))
             .serve_with_shutdown(options.bind_address, context.cancelled());
         info!("unit ready");
         if let Err(err) = serve_future.await {

@@ -1,14 +1,12 @@
 use crate::error::unit_error::UnitError;
 use crate::option::unit_options::IoMode;
-use crate::segment::Segment;
-use crate::segment::direct::DirectSegment;
-use crate::segment::mmap::MmapSegment;
-use crate::segment::record::{Record, RecordBatch};
-use crate::segment::standard::StandardSegment;
-use crate::storage::Storage;
+use crate::storage::segment::Segment;
+use crate::storage::segment::direct::DirectSegment;
+use crate::storage::segment::mmap::MmapSegment;
+use crate::storage::segment::record::{Record, RecordBatch};
+use crate::storage::segment::standard::StandardSegment;
 use crate::storage::wal::INVALID_OFFSET;
 use async_stream::stream;
-use async_trait::async_trait;
 use futures_util::stream::Stream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -367,25 +365,6 @@ impl Wal {
                 }
             }
         }
-    }
-}
-
-#[async_trait]
-impl Storage for Wal {
-    async fn append(&self, data: Vec<u8>) -> Result<i64, UnitError> {
-        Wal::append(self, data).await
-    }
-
-    fn watch_synced(&self) -> Receiver<i64> {
-        Wal::watch_synced(self)
-    }
-
-    fn read_stream(&self) -> Pin<Box<dyn Stream<Item = Result<Vec<u8>, UnitError>> + Send + '_>> {
-        Wal::read_stream(self)
-    }
-
-    async fn shutdown(&self) {
-        Wal::shutdown(self).await;
     }
 }
 
