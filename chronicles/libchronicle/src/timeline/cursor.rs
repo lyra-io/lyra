@@ -84,7 +84,7 @@ impl EventStream {
             }
         }
         Err(ChronicleError::UnitNotEnough(
-            "no reachable unit in segment ensemble".into(),
+            "no reachable unit in vfs ensemble".into(),
         ))
     }
 
@@ -100,9 +100,9 @@ impl EventStream {
         let segment = catalog
             .get_segment_for_offset(timeline_name, start)
             .await
-            .map_err(|e| ChronicleError::Internal(format!("segment lookup failed: {}", e)))?
+            .map_err(|e| ChronicleError::Internal(format!("vfs lookup failed: {}", e)))?
             .ok_or_else(|| {
-                ChronicleError::Internal(format!("no segment covers offset {}", start))
+                ChronicleError::Internal(format!("no vfs covers offset {}", start))
             })?;
 
         let conn = Self::pick_conn(pool, &segment.value)?;
@@ -207,14 +207,14 @@ impl Stream for EventStream {
                     warn!(
                         error = %e,
                         retry = self.retries,
-                        "fetch stream error, reconnecting"
+                        "fetch ss error, reconnecting"
                     );
                     self.inner = None;
                     continue;
                 }
                 Poll::Ready(None) => {
                     if self.tail {
-                        // Re-poll — next iteration will lazy-load the segment again.
+                        // Re-poll — next iteration will lazy-load the vfs again.
                         self.inner = None;
                         cx.waker().wake_by_ref();
                         return Poll::Pending;

@@ -1,4 +1,4 @@
-use super::Segment;
+use super::StreamSegment;
 use std::io::Error;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -55,7 +55,7 @@ impl StandardSegment {
 }
 
 #[async_trait::async_trait]
-impl Segment for StandardSegment {
+impl StreamSegment for StandardSegment {
     async fn write(&mut self, data: &[u8]) -> Result<u64, Error> {
         let offset_before = self.write_offset;
         self.file.write_all(data).await?;

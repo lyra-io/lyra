@@ -1,4 +1,4 @@
-use super::{DEFAULT_MAX_SEGMENT_SIZE, Segment};
+use super::{DEFAULT_MAX_SEGMENT_SIZE, StreamSegment};
 use memmap2::MmapMut;
 use std::fs::{File, OpenOptions};
 use std::io::Error;
@@ -73,7 +73,7 @@ impl MmapSegment {
 }
 
 #[async_trait::async_trait]
-impl Segment for MmapSegment {
+impl StreamSegment for MmapSegment {
     async fn write(&mut self, data: &[u8]) -> Result<u64, Error> {
         let offset_before = self.write_offset;
         let end = self.write_offset + data.len() as u64;
@@ -102,7 +102,7 @@ impl Segment for MmapSegment {
         if end > self.write_offset as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "read past end of mmap segment",
+                "read past end of mmap vfs",
             ));
         }
         buf.copy_from_slice(&self.mmap[start..end]);

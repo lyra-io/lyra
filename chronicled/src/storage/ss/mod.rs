@@ -3,10 +3,8 @@ pub mod mmap;
 pub mod record;
 pub mod standard;
 
-pub const DEFAULT_MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
-
 #[async_trait::async_trait]
-pub trait Segment: Send {
+pub trait StreamSegment: Send {
     async fn write(&mut self, data: &[u8]) -> Result<u64, std::io::Error>;
     async fn sync(&self) -> Result<(), std::io::Error>;
     async fn read_all(&mut self) -> Result<Vec<u8>, std::io::Error>;

@@ -55,7 +55,7 @@ impl UnitInner {
             };
             for handle in handles {
                 if let Err(err) = handle.await {
-                    warn!(error = ?err, "unit stream task join error");
+                    warn!(error = ?err, "unit ss task join error");
                 }
             }
         }

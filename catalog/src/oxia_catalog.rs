@@ -179,7 +179,7 @@ impl OxiaCatalog {
                 },
                 other => CatalogError::from(other),
             })?;
-        // TODO: also delete segment keys
+        // TODO: also delete vfs keys
         Ok(())
     }
 
@@ -195,7 +195,7 @@ impl OxiaCatalog {
 
         let mut timelines = Vec::with_capacity(result.records.len());
         for record in &result.records {
-            // Skip segment keys (contain /seg-)
+            // Skip vfs keys (contain /seg-)
             if record.key.contains("/seg-") {
                 continue;
             }
@@ -251,7 +251,7 @@ impl OxiaCatalog {
         for record in &result.records {
             if let Some(ref value) = record.value {
                 let seg = Segment::decode(value.as_slice()).map_err(|e| {
-                    CatalogError::Internal(format!("failed to decode segment: {}", e))
+                    CatalogError::Internal(format!("failed to decode vfs: {}", e))
                 })?;
                 segments.push(Versioned::new(seg, record.version.version_id));
             }
@@ -267,10 +267,10 @@ impl OxiaCatalog {
         Ok(segments.into_iter().last())
     }
 
-    /// Get the segment that covers a given offset (floor lookup).
+    /// Get the vfs that covers a given offset (floor lookup).
     ///
     /// Scans segments with `start_offset <= offset` and returns the last one
-    /// (the segment with the largest start_offset that doesn't exceed `offset`).
+    /// (the vfs with the largest start_offset that doesn't exceed `offset`).
     pub async fn get_segment_for_offset(
         &self,
         timeline_name: &str,
@@ -286,12 +286,12 @@ impl OxiaCatalog {
             .await
             .map_err(CatalogError::from)?;
 
-        // Take the last record — the segment with the largest start_offset <= offset.
+        // Take the last record — the vfs with the largest start_offset <= offset.
         if let Some(record) = result.records.last()
             && let Some(ref value) = record.value
         {
             let seg = Segment::decode(value.as_slice())
-                .map_err(|e| CatalogError::Internal(format!("failed to decode segment: {}", e)))?;
+                .map_err(|e| CatalogError::Internal(format!("failed to decode vfs: {}", e)))?;
             return Ok(Some(Versioned::new(seg, record.version.version_id)));
         }
         Ok(None)
@@ -313,9 +313,9 @@ impl OxiaCatalog {
         }
     }
 
-    /// Get the writable (last) segment for a timeline, or create one.
+    /// Get the writable (last) vfs for a timeline, or create one.
     ///
-    /// The `ensemble_supplier` is only called when no segment exists — it
+    /// The `ensemble_supplier` is only called when no vfs exists — it
     /// should select the ensemble (e.g. via `select_ensemble`).
     ///
     /// Uses `ExpectVersionId(-1)` for creation so concurrent callers race
@@ -342,7 +342,7 @@ impl OxiaCatalog {
             Err(CatalogError::VersionConflict { .. }) => self
                 .get_last_segment(timeline_name)
                 .await?
-                .ok_or_else(|| CatalogError::Internal("segment vanished after conflict".into())),
+                .ok_or_else(|| CatalogError::Internal("vfs vanished after conflict".into())),
             Err(e) => Err(e),
         }
     }
@@ -424,10 +424,10 @@ impl OxiaCatalog {
             .collect())
     }
 
-    /// Subscribe to segment key updates for a timeline.
+    /// Subscribe to vfs key updates for a timeline.
     ///
-    /// Uses Oxia sequence key subscription to receive the highest segment key
-    /// each time a new segment is written. The receiver yields the full key
+    /// Uses Oxia sequence key subscription to receive the highest vfs key
+    /// each time a new vfs is written. The receiver yields the full key
     /// string (e.g. `/chronicle/timelines/{name}/seg-0000000000000000001`).
     pub async fn subscribe_segments(
         &self,

@@ -134,7 +134,7 @@ impl StateMachine {
 // Replicate — run an operation on all ensemble units with auto-recovery
 //
 // Returns the successful results once ALL units succeed.
-// On partial failure: quarantine → find replacement → update segment → retry.
+// On partial failure: quarantine → find replacement → update vfs → retry.
 // ---------------------------------------------------------------------------
 
 async fn broadcast<R, Op, OpFut>(state: &mut State, op: Op) -> Vec<(UnitInfo, R)>
@@ -186,7 +186,7 @@ where
             find_replacement_ensemble(&state.catalog, &healthy, &mut quarantined).await;
 
         if let Err(e) = update_segment(state, &new_ensemble).await {
-            warn!(error = %e, "failed to update segment during recovery");
+            warn!(error = %e, "failed to update vfs during recovery");
             continue;
         }
 
@@ -304,7 +304,7 @@ fn subscribe_watches(
 }
 
 // ---------------------------------------------------------------------------
-// Init — new term, segment, fence via replicate
+// Init — new term, vfs, fence via replicate
 // ---------------------------------------------------------------------------
 
 async fn recover(state: &mut State) -> Result<(), ChronicleError> {

@@ -141,7 +141,7 @@ impl Conn {
     // -- lifecycle ------------------------------------------------------------
 
     /// Gracefully close both record and fetch streams: drop request senders
-    /// so servers see end-of-stream, wait for response readers to drain,
+    /// so servers see end-of-ss, wait for response readers to drain,
     /// then clear all subscribers.
     pub async fn close(&self) {
         self.record_stream.close().await;
@@ -161,8 +161,8 @@ impl Conn {
         Ok(response.into_inner())
     }
 
-    /// Send a record request. The gRPC stream is lazily opened on first call
-    /// and automatically reconnected if the previous stream died.
+    /// Send a record request. The gRPC ss is lazily opened on first call
+    /// and automatically reconnected if the previous ss died.
     pub async fn send_record(&self, request: RecordEventsRequest) -> Result<(), ChronicleError> {
         self.record_stream.send(request).await
     }
@@ -225,7 +225,7 @@ impl Conn {
     }
 
     /// Start a fetch. Subscribes for responses, sends the request through the
-    /// shared fetch stream, and returns a [`FetchStream`] that yields
+    /// shared fetch ss, and returns a [`FetchStream`] that yields
     /// responses. Automatically unsubscribes when dropped.
     pub async fn fetch(&self, request: FetchEventsRequest) -> Result<FetchStream, ChronicleError> {
         let timeline_id = request.timeline_id;
@@ -290,7 +290,7 @@ async fn record_response_reader(
                     );
                 }
             }
-            Ok(None) => break "stream ended".to_string(),
+            Ok(None) => break "ss ended".to_string(),
             Err(e) => {
                 warn!(endpoint = %endpoint, error = %e, "record_response_reader: error");
                 break e.to_string();
@@ -329,7 +329,7 @@ async fn fetch_response_reader(
                     }
                 }
             }
-            Ok(None) => break "stream ended".to_string(),
+            Ok(None) => break "ss ended".to_string(),
             Err(e) => {
                 warn!(endpoint = %endpoint, error = %e, "fetch_response_reader: error");
                 break e.to_string();

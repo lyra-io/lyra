@@ -1,4 +1,4 @@
-use super::Segment;
+use super::StreamSegment;
 use std::fs::{File, OpenOptions};
 use std::io::Error;
 use std::path::PathBuf;
@@ -152,7 +152,7 @@ impl DirectSegment {
 }
 
 #[async_trait::async_trait]
-impl Segment for DirectSegment {
+impl StreamSegment for DirectSegment {
     async fn write(&mut self, data: &[u8]) -> Result<u64, Error> {
         let offset_before = self.write_offset;
         let data_len = data.len() as u64;
