@@ -9,7 +9,6 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY proto/ proto/
-COPY chronicle-catalog/ chronicle-catalog/
 COPY chronicled/ chronicled/
 COPY chronicles/ chronicles/
 COPY clients/ clients/

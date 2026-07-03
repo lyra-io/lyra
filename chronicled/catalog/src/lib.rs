@@ -1,3 +1,4 @@
+pub mod dataset;
 pub mod error;
 pub mod oxia_catalog;
 
@@ -9,6 +10,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 use tracing::info;
+
+pub use dataset::*;
 
 /// Wraps a value with its catalog version for CAS operations.
 #[derive(Debug, Clone)]
@@ -27,6 +30,52 @@ pub const SEGMENT_KEY_PAD: usize = 19;
 
 #[async_trait]
 pub trait Catalog: Send + Sync {
+    async fn create_dataset(&self, _dataset: Dataset) -> Result<Versioned<Dataset>, CatalogError> {
+        Err(CatalogError::Unsupported("create_dataset".into()))
+    }
+
+    async fn update_dataset(
+        &self,
+        _dataset: Dataset,
+        _expected_version: i64,
+    ) -> Result<Versioned<Dataset>, CatalogError> {
+        Err(CatalogError::Unsupported("update_dataset".into()))
+    }
+
+    async fn get_dataset(&self, _name: &str) -> Result<Versioned<Dataset>, CatalogError> {
+        Err(CatalogError::Unsupported("get_dataset".into()))
+    }
+
+    async fn list_datasets(&self) -> Result<Vec<Versioned<Dataset>>, CatalogError> {
+        Err(CatalogError::Unsupported("list_datasets".into()))
+    }
+
+    async fn delete_dataset(
+        &self,
+        _name: &str,
+        _expected_version: i64,
+    ) -> Result<(), CatalogError> {
+        Err(CatalogError::Unsupported("delete_dataset".into()))
+    }
+
+    async fn submit_action(
+        &self,
+        _request: ActionRequest,
+    ) -> Result<Versioned<Action>, CatalogError> {
+        Err(CatalogError::Unsupported("submit_action".into()))
+    }
+
+    async fn get_action(&self, _id: &ActionId) -> Result<Versioned<Action>, CatalogError> {
+        Err(CatalogError::Unsupported("get_action".into()))
+    }
+
+    async fn list_actions(
+        &self,
+        _dataset: Option<&DatasetName>,
+    ) -> Result<Vec<Versioned<Action>>, CatalogError> {
+        Err(CatalogError::Unsupported("list_actions".into()))
+    }
+
     async fn get_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError>;
 
     async fn timeline_update(

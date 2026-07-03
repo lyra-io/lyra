@@ -233,6 +233,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronicle-lens"
+version = "0.1.0"
+dependencies = [
+ "chronicle-catalog",
+ "thiserror",
+]
+
+[[package]]
 name = "chronicle-proto"
 version = "0.1.0"
 dependencies = [
@@ -241,6 +249,15 @@ dependencies = [
  "prost-types 0.14.1",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "chronicle-sink"
+version = "0.1.0"
+dependencies = [
+ "chronicle-catalog",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -269,6 +286,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xxhash-rust",
+]
+
+[[package]]
+name = "chronicle-xunit"
+version = "0.1.0"
+dependencies = [
+ "chronicle-catalog",
+ "thiserror",
 ]
 
 [[package]]

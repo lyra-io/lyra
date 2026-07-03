@@ -6,7 +6,7 @@ resolver = "3"
 
 [dependencies]
 chronicle-proto = { workspace = true }
-chronicle-catalog = { path = "../../chronicle-catalog" }
+chronicle-catalog = { path = "../../chronicled/catalog" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }

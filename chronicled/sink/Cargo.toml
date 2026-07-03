@@ -1,0 +1,10 @@
+[package]
+name = "chronicle-sink"
+version = "0.1.0"
+edition = "2024"
+resolver = "3"
+
+[dependencies]
+chronicle-catalog = { path = "../catalog" }
+thiserror = { workspace = true }
+tracing = { workspace = true }

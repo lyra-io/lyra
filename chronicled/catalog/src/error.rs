@@ -13,6 +13,8 @@ pub enum CatalogError {
     AlreadyExists(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error("Unsupported catalog operation: {0}")]
+    Unsupported(String),
 }
 
 impl From<OxiaError> for CatalogError {
