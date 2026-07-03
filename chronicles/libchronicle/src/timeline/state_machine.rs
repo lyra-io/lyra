@@ -4,7 +4,8 @@ use crate::error::ChronicleError;
 use crate::error_inner::InnerError;
 use crate::{Event as UserEvent, Offset, TimelineOptions};
 use backoff::future;
-use catalog::Catalog;
+use chronicle_catalog::error::CatalogError;
+use chronicle_catalog::{CatalogRef, Versioned};
 use chronicle_proto::pb_catalog::{Segment, TimelineMeta, UnitInfo};
 use chronicle_proto::pb_ext::{RecordEventsRequest, RecordEventsRequestItem};
 use futures_util::future::{join_all, select_all};
@@ -28,7 +29,7 @@ struct RecordRequest {
 struct State {
     name: String,
     meta: TimelineMeta,
-    catalog: Arc<Catalog>,
+    catalog: CatalogRef,
     pool: Arc<ConnPool>,
     options: TimelineOptions,
     lrs: i64,
@@ -59,7 +60,7 @@ pub(crate) struct StateMachine {
 impl StateMachine {
     pub async fn start(
         name: &str,
-        catalog: Arc<Catalog>,
+        catalog: CatalogRef,
         pool: Arc<ConnPool>,
         options: &TimelineOptions,
     ) -> Result<Self, ChronicleError> {
@@ -218,7 +219,7 @@ where
 }
 
 async fn find_replacement_ensemble(
-    catalog: &Arc<Catalog>,
+    catalog: &CatalogRef,
     healthy: &VecDeque<UnitInfo>,
     quarantined: &mut VecDeque<UnitInfo>,
 ) -> Vec<UnitInfo> {
@@ -314,22 +315,13 @@ async fn recover(state: &mut State) -> Result<(), ChronicleError> {
         .await
         .map_err(|e| ChronicleError::Internal(e.to_string()))?;
 
-    let rf = state.options.replication_factor;
-    let catalog = state.catalog.clone();
-    let writable_segment = state
-        .catalog
-        .timeline_get_or_init_last_segment(&state.meta.name, || async {
-            let units = catalog.list_writable_units().await?;
-            select_ensemble(&units, &EMPTY_UNITS, &EMPTY_UNITS).ok_or_else(|| {
-                catalog::error::CatalogError::NotFound(format!(
-                    "need {} writable units, have {}",
-                    rf,
-                    units.len()
-                ))
-            })
-        })
-        .await
-        .map_err(|e| ChronicleError::UnitNotEnough(e.to_string()))?;
+    let writable_segment = get_or_init_last_segment(
+        state.catalog.clone(),
+        &state.meta.name,
+        state.options.replication_factor,
+    )
+    .await
+    .map_err(|e| ChronicleError::UnitNotEnough(e.to_string()))?;
 
     state.ensemble = writable_segment.value.ensemble.clone();
     state.segment_start_offset = writable_segment.value.start_offset;
@@ -394,6 +386,38 @@ async fn recover(state: &mut State) -> Result<(), ChronicleError> {
     );
 
     Ok(())
+}
+
+async fn get_or_init_last_segment(
+    catalog: CatalogRef,
+    timeline_name: &str,
+    replication_factor: usize,
+) -> Result<Versioned<Segment>, CatalogError> {
+    if let Some(last) = catalog.get_last_segment(timeline_name).await? {
+        return Ok(last);
+    }
+
+    let units = catalog.list_writable_units().await?;
+    let ensemble = select_ensemble(&units, &EMPTY_UNITS, &EMPTY_UNITS).ok_or_else(|| {
+        CatalogError::NotFound(format!(
+            "need {} writable units, have {}",
+            replication_factor,
+            units.len()
+        ))
+    })?;
+    let segment = Segment {
+        ensemble,
+        start_offset: 1,
+    };
+
+    match catalog.put_segment(timeline_name, &segment, -1).await {
+        Ok(segment) => Ok(segment),
+        Err(CatalogError::VersionConflict { .. }) => catalog
+            .get_last_segment(timeline_name)
+            .await?
+            .ok_or_else(|| CatalogError::Internal("vfs vanished after conflict".into())),
+        Err(error) => Err(error),
+    }
 }
 
 // ---------------------------------------------------------------------------

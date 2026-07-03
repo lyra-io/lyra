@@ -1,11 +1,12 @@
 [package]
-name = "catalog"
+name = "chronicle-catalog"
 version = "0.1.0"
 edition = "2024"
 resolver = "3"
 
 [dependencies]
 chronicle-proto = { workspace = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

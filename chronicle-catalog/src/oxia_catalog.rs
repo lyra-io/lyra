@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chronicle_proto::pb_catalog::{Segment, TimelineMeta, UnitInfo, UnitRegistration, UnitStatus};
 use liboxia::client::{GetOption, GetSequenceUpdatesOption, OxiaClient, PutOption};
 use liboxia::client_builder::OxiaClientBuilder;
@@ -7,8 +8,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc::Receiver;
 use tracing::{debug, info};
 
-use crate::Versioned;
 use crate::error::CatalogError;
+use crate::{Catalog, Versioned};
 
 const KEY_PREFIX: &str = "/chronicle/timelines/";
 const UNITS_PREFIX: &str = "/chronicle/units/";
@@ -250,9 +251,8 @@ impl OxiaCatalog {
         let mut segments = Vec::with_capacity(result.records.len());
         for record in &result.records {
             if let Some(ref value) = record.value {
-                let seg = Segment::decode(value.as_slice()).map_err(|e| {
-                    CatalogError::Internal(format!("failed to decode vfs: {}", e))
-                })?;
+                let seg = Segment::decode(value.as_slice())
+                    .map_err(|e| CatalogError::Internal(format!("failed to decode vfs: {}", e)))?;
                 segments.push(Versioned::new(seg, record.version.version_id));
             }
         }
@@ -442,5 +442,94 @@ impl OxiaCatalog {
             )
             .await
             .map_err(CatalogError::from)
+    }
+}
+
+#[async_trait]
+impl Catalog for OxiaCatalog {
+    async fn get_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
+        OxiaCatalog::get_timeline(self, name).await
+    }
+
+    async fn timeline_update(
+        &self,
+        meta: &TimelineMeta,
+        expected_version: i64,
+    ) -> Result<TimelineMeta, CatalogError> {
+        OxiaCatalog::timeline_update(self, meta, expected_version).await
+    }
+
+    async fn create_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
+        OxiaCatalog::create_timeline(self, name).await
+    }
+
+    async fn delete_timeline(&self, name: &str, expected_version: i64) -> Result<(), CatalogError> {
+        OxiaCatalog::delete_timeline(self, name, expected_version).await
+    }
+
+    async fn list_timelines(&self) -> Result<Vec<TimelineMeta>, CatalogError> {
+        OxiaCatalog::list_timelines(self).await
+    }
+
+    async fn put_segment(
+        &self,
+        timeline_name: &str,
+        segment: &Segment,
+        expected_version: i64,
+    ) -> Result<Versioned<Segment>, CatalogError> {
+        OxiaCatalog::put_segment(self, timeline_name, segment, expected_version).await
+    }
+
+    async fn list_segments(
+        &self,
+        timeline_name: &str,
+    ) -> Result<Vec<Versioned<Segment>>, CatalogError> {
+        OxiaCatalog::list_segments(self, timeline_name).await
+    }
+
+    async fn get_last_segment(
+        &self,
+        timeline_name: &str,
+    ) -> Result<Option<Versioned<Segment>>, CatalogError> {
+        OxiaCatalog::get_last_segment(self, timeline_name).await
+    }
+
+    async fn get_segment_for_offset(
+        &self,
+        timeline_name: &str,
+        offset: i64,
+    ) -> Result<Option<Versioned<Segment>>, CatalogError> {
+        OxiaCatalog::get_segment_for_offset(self, timeline_name, offset).await
+    }
+
+    async fn tl_fetch_or_insert(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
+        OxiaCatalog::tl_fetch_or_insert(self, name).await
+    }
+
+    async fn tl_new_term(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
+        OxiaCatalog::tl_new_term(self, name).await
+    }
+
+    async fn register_unit(&self, registration: &UnitRegistration) -> Result<(), CatalogError> {
+        OxiaCatalog::register_unit(self, registration).await
+    }
+
+    async fn unregister_unit(&self, address: &str, zone: &str) -> Result<(), CatalogError> {
+        OxiaCatalog::unregister_unit(self, address, zone).await
+    }
+
+    async fn list_units(&self) -> Result<Vec<UnitRegistration>, CatalogError> {
+        OxiaCatalog::list_units(self).await
+    }
+
+    async fn list_writable_units(&self) -> Result<Vec<UnitRegistration>, CatalogError> {
+        OxiaCatalog::list_writable_units(self).await
+    }
+
+    async fn subscribe_segments(
+        &self,
+        timeline_name: &str,
+    ) -> Result<Receiver<String>, CatalogError> {
+        OxiaCatalog::subscribe_segments(self, timeline_name).await
     }
 }

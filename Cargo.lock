@@ -194,9 +194,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
-name = "catalog"
+name = "cfg-if"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "chronicle-catalog"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chronicle-proto",
  "liboxia",
  "prost 0.13.5",
@@ -208,16 +215,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfg-if"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
 name = "chronicle-cli"
 version = "0.1.0"
 dependencies = [
- "catalog",
+ "chronicle-catalog",
  "chronicle-unit",
  "clap",
  "futures-util",
@@ -723,7 +724,7 @@ dependencies = [
  "async-trait",
  "backoff",
  "base64",
- "catalog",
+ "chronicle-catalog",
  "chronicle-proto",
  "dashmap",
  "futures-util",

@@ -3,14 +3,14 @@ use super::state_machine::StateMachine;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::ChronicleError;
 use crate::{Event as UserEvent, FetchOptions, Offset, StartPosition, TimelineOptions};
-use catalog::Catalog;
+use chronicle_catalog::CatalogRef;
 use std::sync::Arc;
 use tracing::info;
 
 struct TimelineInner {
     timeline_id: i64,
     timeline_name: String,
-    catalog: Arc<Catalog>,
+    catalog: CatalogRef,
     pool: Arc<ConnPool>,
     state_machine: Option<StateMachine>,
 }
@@ -22,7 +22,7 @@ pub struct Timeline {
 
 impl Timeline {
     pub async fn open(
-        catalog: Arc<Catalog>,
+        catalog: CatalogRef,
         pool: Arc<ConnPool>,
         name: &str,
         options: TimelineOptions,
@@ -47,7 +47,7 @@ impl Timeline {
     }
 
     pub async fn open_readonly(
-        catalog: Arc<Catalog>,
+        catalog: CatalogRef,
         pool: Arc<ConnPool>,
         name: &str,
         _options: TimelineOptions,

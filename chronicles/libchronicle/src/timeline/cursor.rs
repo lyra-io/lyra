@@ -2,7 +2,7 @@ use crate::Event;
 use crate::conn::Conn;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::ChronicleError;
-use catalog::Catalog;
+use chronicle_catalog::{Catalog, CatalogRef};
 use chronicle_proto::pb_catalog::Segment;
 use chronicle_proto::pb_ext::{ChunkType, FetchEventsRequest};
 use futures_util::{Stream, StreamExt};
@@ -21,7 +21,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub struct EventStream {
     timeline_id: i64,
     timeline_name: String,
-    catalog: Arc<Catalog>,
+    catalog: CatalogRef,
     pool: Arc<ConnPool>,
     position: Arc<AtomicI64>,
     inner: Option<InnerStream>,
@@ -39,7 +39,7 @@ impl EventStream {
     pub(crate) fn new(
         timeline_id: i64,
         timeline_name: String,
-        catalog: Arc<Catalog>,
+        catalog: CatalogRef,
         pool: Arc<ConnPool>,
         start_offset: i64,
     ) -> Self {
@@ -91,7 +91,7 @@ impl EventStream {
     async fn open_inner(
         timeline_id: i64,
         timeline_name: &str,
-        catalog: &Catalog,
+        catalog: &dyn Catalog,
         pool: &ConnPool,
         position: &Arc<AtomicI64>,
     ) -> Result<InnerStream, ChronicleError> {
@@ -101,9 +101,7 @@ impl EventStream {
             .get_segment_for_offset(timeline_name, start)
             .await
             .map_err(|e| ChronicleError::Internal(format!("vfs lookup failed: {}", e)))?
-            .ok_or_else(|| {
-                ChronicleError::Internal(format!("no vfs covers offset {}", start))
-            })?;
+            .ok_or_else(|| ChronicleError::Internal(format!("no vfs covers offset {}", start)))?;
 
         let conn = Self::pick_conn(pool, &segment.value)?;
 
@@ -178,7 +176,14 @@ impl Stream for EventStream {
                 let position = self.position.clone();
 
                 let mut fut = Box::pin(async move {
-                    Self::open_inner(timeline_id, &timeline_name, &catalog, &pool, &position).await
+                    Self::open_inner(
+                        timeline_id,
+                        &timeline_name,
+                        catalog.as_ref(),
+                        &pool,
+                        &position,
+                    )
+                    .await
                 });
                 match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(stream)) => {

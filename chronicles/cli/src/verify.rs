@@ -178,11 +178,11 @@ impl Stats {
 }
 
 pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let catalog_opts = catalog::CatalogOptions {
+    let catalog_opts = chronicle_catalog::CatalogOptions {
         service_address: args.catalog.clone(),
         ..Default::default()
     };
-    let catalog = Arc::new(catalog::build_catalog(&catalog_opts).await?);
+    let catalog = chronicle_catalog::build_catalog(&catalog_opts).await?;
 
     match catalog.list_units().await {
         Ok(units) => {

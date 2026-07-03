@@ -4,7 +4,7 @@ members = [
     "proto",
     "chronicled",
     "chronicles/libchronicle",
-    "catalog",
+    "chronicle-catalog",
     "chronicles/cli",
 ]
 

@@ -1,3 +1,4 @@
+use chronicle_cli::module::{ModuleAction, ModuleKind};
 use chronicle_cli::unit::UnitAction;
 use chronicle_cli::verify::VerifyArgs;
 use clap::Parser;
@@ -15,6 +16,22 @@ enum Commands {
         #[command(subcommand)]
         action: UnitAction,
     },
+    Catalog {
+        #[command(subcommand)]
+        action: ModuleAction,
+    },
+    Sink {
+        #[command(subcommand)]
+        action: ModuleAction,
+    },
+    Xunit {
+        #[command(subcommand)]
+        action: ModuleAction,
+    },
+    Lens {
+        #[command(subcommand)]
+        action: ModuleAction,
+    },
     Verify(VerifyArgs),
 }
 
@@ -24,6 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Unit { action } => chronicle_cli::unit::run(action).await?,
+        Commands::Catalog { action } => {
+            chronicle_cli::module::run(ModuleKind::Catalog, action).await?
+        }
+        Commands::Sink { action } => chronicle_cli::module::run(ModuleKind::Sink, action).await?,
+        Commands::Xunit { action } => chronicle_cli::module::run(ModuleKind::Xunit, action).await?,
+        Commands::Lens { action } => chronicle_cli::module::run(ModuleKind::Lens, action).await?,
         Commands::Verify(args) => {
             tracing_subscriber::fmt()
                 .with_env_filter(

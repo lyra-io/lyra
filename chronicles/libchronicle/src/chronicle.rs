@@ -3,7 +3,7 @@ use crate::conn::ConnOptions;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::ChronicleError;
 use crate::timeline::Timeline;
-use catalog::Catalog;
+use chronicle_catalog::CatalogRef;
 use opentelemetry::metrics::Meter;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,12 +51,12 @@ impl ChronicleOptions {
 }
 
 pub struct Chronicle {
-    catalog: Arc<Catalog>,
+    catalog: CatalogRef,
     pool: Arc<ConnPool>,
 }
 
 impl Chronicle {
-    pub fn new(catalog: Arc<Catalog>, options: ChronicleOptions) -> Self {
+    pub fn new(catalog: CatalogRef, options: ChronicleOptions) -> Self {
         Self {
             pool: Arc::new(ConnPool::new(options.conn_opts.clone())),
             catalog,
