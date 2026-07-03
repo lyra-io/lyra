@@ -54,6 +54,9 @@ lens:
     repository: chronicle-unit
     tag: dev
     pullPolicy: IfNotPresent
+  server:
+    bindAddress: "0.0.0.0:50051"
+    endpoint: "http://chronicle-lens:50051"
   resources:
     requests:
       memory: "128Mi"

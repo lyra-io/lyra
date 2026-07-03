@@ -1,4 +1,5 @@
 pub mod error;
+pub mod flight_sql;
 
 use catalog::{
     Action, ActionKind, ActionRequest, CatalogRef, DataType, Dataset, DatasetField, DatasetSchema,

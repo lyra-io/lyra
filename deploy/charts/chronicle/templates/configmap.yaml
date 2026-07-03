@@ -25,5 +25,9 @@ data:
     backend = "{{ .Values.catalog.backend }}"
     service_address = "{{ .Values.catalog.serviceAddress }}"
 
+    [lens]
+    bind_address = "{{ .Values.lens.server.bindAddress }}"
+    endpoint = "{{ .Values.lens.server.endpoint }}"
+
     [log]
     level = "{{ .Values.log.level }}"

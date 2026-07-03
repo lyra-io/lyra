@@ -7,9 +7,18 @@ resolver = "3"
 [dependencies]
 catalog = { path = "../../catalog" }
 libxunit = { path = "../../chronicles/libxunit" }
+arrow-array = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
 datafusion-sql = { workspace = true }
+futures-util = { workspace = true }
+prost = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 chronicle-xunit = { path = "../xunit" }
 tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }

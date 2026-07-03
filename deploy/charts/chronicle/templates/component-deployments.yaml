@@ -95,6 +95,9 @@ spec:
           imagePullPolicy: {{ .Values.lens.image.pullPolicy }}
           command: ["chronicle"]
           args: ["lens", "start", "--config", "/etc/chronicle/chronicled.toml"]
+          ports:
+            - containerPort: 50051
+              name: flight-sql
           volumeMounts:
             - name: config
               mountPath: /etc/chronicle

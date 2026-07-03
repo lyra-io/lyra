@@ -31,3 +31,20 @@ spec:
     - port: 7070
       targetPort: 7070
       name: grpc
+{{- if .Values.lens.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronicle-lens
+  labels:
+    app.kubernetes.io/name: chronicle-lens
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: chronicle-lens
+  ports:
+    - port: 50051
+      targetPort: 50051
+      name: flight-sql
+{{- end }}

@@ -35,6 +35,9 @@ crossbeam-skiplist = "0.1"
 boxcar = "0.2"
 futures-util = "0.3"
 async-stream = "0.3"
+arrow-array = "56.0.0"
+arrow-flight = { version = "56.0.0", features = ["flight-sql"] }
+arrow-schema = "56.0.0"
 opentelemetry = "^0.29"
 opentelemetry_sdk = { version = "^0.29", features = ["spec_unstable_metrics_views"] }
 opentelemetry-prometheus = "^0.29"

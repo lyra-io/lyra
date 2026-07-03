@@ -5,6 +5,7 @@ use chronicle_sink::{Sink, SinkOptions};
 use chronicle_xunit::Xunit;
 use serde::Deserialize;
 use std::io::IsTerminal;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -70,6 +71,7 @@ pub async fn run(kind: ModuleKind, action: ModuleAction) -> Result<(), Box<dyn s
             process::write_pid_file(&pid_file)?;
 
             let catalog = build_catalog(&config.catalog).await?;
+            let mut wait_for_shutdown_after_start = true;
             match kind {
                 ModuleKind::Catalog => {
                     info!("catalog component connected to Oxia");
@@ -82,12 +84,20 @@ pub async fn run(kind: ModuleKind, action: ModuleAction) -> Result<(), Box<dyn s
                     info!("xunit component started");
                 }
                 ModuleKind::Lens => {
-                    let _lens = chronicle_lens::Lens::new(catalog);
-                    info!("lens component started");
+                    wait_for_shutdown_after_start = false;
+                    let lens = chronicle_lens::Lens::new(catalog);
+                    chronicle_lens::flight_sql::serve_with_shutdown(
+                        lens,
+                        config.lens.bind_address,
+                        process::wait_for_shutdown(),
+                    )
+                    .await?;
                 }
             }
 
-            process::wait_for_shutdown().await;
+            if wait_for_shutdown_after_start {
+                process::wait_for_shutdown().await;
+            }
             info!(component = kind.command_name(), "received shutdown signal");
             process::remove_pid_file(&pid_file);
             Ok(())
@@ -111,7 +121,23 @@ struct ModuleConfig {
     #[serde(default)]
     catalog: CatalogOptions,
     #[serde(default)]
+    lens: LensConfig,
+    #[serde(default)]
     log: LogConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct LensConfig {
+    #[serde(default = "default_lens_bind_address")]
+    bind_address: SocketAddr,
+}
+
+impl Default for LensConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: default_lens_bind_address(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,9 +163,14 @@ fn load_config(path: Option<&str>) -> Result<ModuleConfig, Box<dyn std::error::E
         Some(path) => read_config(&path),
         None => Ok(ModuleConfig {
             catalog: CatalogOptions::default(),
+            lens: LensConfig::default(),
             log: LogConfig::default(),
         }),
     }
+}
+
+fn default_lens_bind_address() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50051)
 }
 
 fn resolve_config_path(path: Option<&str>) -> Option<String> {

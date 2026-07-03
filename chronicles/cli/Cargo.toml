@@ -16,6 +16,9 @@ chronicle-sink = { path = "../../chronicled/sink" }
 chronicle-xunit = { path = "../../chronicled/xunit" }
 chronicle-lens = { path = "../../chronicled/lens" }
 catalog = { path = "../../catalog" }
+arrow-array = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
