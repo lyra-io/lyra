@@ -1,6 +1,7 @@
 pub mod dataset;
 pub mod error;
 pub mod oxia_catalog;
+pub mod types;
 
 use async_trait::async_trait;
 use chronicle_proto::pb_catalog::{Segment, TimelineMeta, UnitRegistration};
@@ -12,6 +13,7 @@ use tokio::sync::mpsc::Receiver;
 use tracing::info;
 
 pub use dataset::*;
+pub use types::*;
 
 /// Wraps a value with its catalog version for CAS operations.
 #[derive(Debug, Clone)]

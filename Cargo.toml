@@ -2,12 +2,13 @@
 resolver = "3"
 members = [
     "proto",
-    "chronicled/catalog",
+    "chronicle-catalog",
     "chronicled/unit",
     "chronicled/sink",
     "chronicled/xunit",
     "chronicled/lens",
     "chronicles/libchronicle",
+    "chronicles/libxunit",
     "chronicles/cli",
 ]
 

@@ -1,10 +1,11 @@
 [package]
-name = "chronicle-lens"
+name = "libxunit"
 version = "0.1.0"
 edition = "2024"
 resolver = "3"
 
 [dependencies]
 chronicle-catalog = { path = "../../chronicle-catalog" }
-libxunit = { path = "../../chronicles/libxunit" }
+async-trait = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }

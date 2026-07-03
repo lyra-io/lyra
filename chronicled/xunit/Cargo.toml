@@ -5,5 +5,7 @@ edition = "2024"
 resolver = "3"
 
 [dependencies]
-chronicle-catalog = { path = "../catalog" }
+chronicle-catalog = { path = "../../chronicle-catalog" }
+libxunit = { path = "../../chronicles/libxunit" }
+async-trait = { workspace = true }
 thiserror = { workspace = true }

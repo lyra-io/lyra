@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub type DatasetName = String;
-pub type ActionId = String;
+use crate::types::{ActionId, DatasetName, SchemaVersion, TimestampMillis};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dataset {
@@ -11,8 +10,8 @@ pub struct Dataset {
     pub policies: DatasetPolicies,
     pub status: DatasetStatus,
     pub version: i64,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
+    pub created_at_ms: TimestampMillis,
+    pub updated_at_ms: TimestampMillis,
 }
 
 impl Dataset {
@@ -39,7 +38,7 @@ pub enum DatasetStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetSchema {
-    pub version: i64,
+    pub version: SchemaVersion,
     pub fields: Vec<DatasetField>,
 }
 
@@ -208,8 +207,8 @@ pub struct Action {
     pub status: ActionStatus,
     pub message: Option<String>,
     pub version: i64,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
+    pub created_at_ms: TimestampMillis,
+    pub updated_at_ms: TimestampMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
