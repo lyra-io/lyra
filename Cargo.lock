@@ -1139,7 +1139,7 @@ dependencies = [
  "futures-util",
  "libc",
  "liblyra",
- "lyra-unit",
+ "lyrad",
  "serde",
  "tokio",
  "toml",
@@ -1160,7 +1160,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lyra-unit"
+name = "lyrad"
 version = "0.1.0"
 dependencies = [
  "async-stream",

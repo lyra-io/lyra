@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "proto",
     "catalog",
-    "lyrad/unit",
+    "lyrad",
     "lyra/liblyra",
     "lyra/cli",
 ]

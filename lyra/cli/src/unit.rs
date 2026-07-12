@@ -1,7 +1,7 @@
 use crate::banner;
 use crate::process;
-use lyra_unit::option::unit_options::UnitOptions;
-use lyra_unit::unit::Unit;
+use lyrad::option::unit_options::UnitOptions;
+use lyrad::unit::Unit;
 use std::io::IsTerminal;
 use std::path::Path;
 use tracing::info;

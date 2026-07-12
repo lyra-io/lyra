@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 liblyra = { path = "../liblyra" }
-lyra-unit = { path = "../../lyrad/unit" }
+lyrad = { path = "../../lyrad" }
 catalog = { path = "../../catalog" }
 arrow-array = { workspace = true }
 arrow-flight = { workspace = true }
