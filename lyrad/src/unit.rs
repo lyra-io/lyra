@@ -1,19 +1,17 @@
 use crate::error::unit_error::UnitError;
-use crate::option::unit_options::{ServerOptions, UnitOptions};
+use crate::grpc::{self, GrpcService};
+use crate::option::unit_options::UnitOptions;
 use crate::storage::wal::WalOptions;
 use crate::storage::{Storage, UnitStorage};
-use crate::unit_service::UnitService;
-use lyra_proto::pb_ext::lyra_server::LyraServer;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
 use tracing::{error, info};
 
 const DEFAULT_INFLIGHT_NUM: usize = 4096;
 
 pub struct Unit {
-    service: UnitService,
+    service: GrpcService,
     external_handle: JoinHandle<()>,
 }
 
@@ -31,8 +29,8 @@ impl Unit {
         let storage: Arc<dyn Storage> = Arc::new(storage);
         info!(dir = %options.wal.dir, "storage opened");
 
-        let service = UnitService::new(context, storage, DEFAULT_INFLIGHT_NUM);
-        let external_handle = bg_start_external_service(options.server.clone(), service.clone());
+        let service = GrpcService::new(context, storage, DEFAULT_INFLIGHT_NUM);
+        let external_handle = grpc::spawn_server(options.server.clone(), service.clone());
 
         Ok(Self {
             service,
@@ -51,24 +49,4 @@ impl Unit {
         self.service.shutdown().await;
         info!("unit stopped");
     }
-}
-
-fn bg_start_external_service(options: ServerOptions, service: UnitService) -> JoinHandle<()> {
-    let context = service.context();
-    tokio::spawn(async move {
-        let (health_reporter, health_service) = tonic_health::server::health_reporter();
-        health_reporter
-            .set_serving::<LyraServer<UnitService>>()
-            .await;
-
-        info!(addr = %options.bind_address, "grpc service starting");
-        let serve_future = Server::builder()
-            .add_service(health_service)
-            .add_service(LyraServer::new(service))
-            .serve_with_shutdown(options.bind_address, context.cancelled());
-        info!("unit ready");
-        if let Err(err) = serve_future.await {
-            error!(error = %err, "grpc service error");
-        }
-    })
 }

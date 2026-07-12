@@ -1,6 +1,8 @@
+use crate::option::unit_options::ServerOptions;
 use crate::storage::Storage;
 use futures_util::{Stream, StreamExt};
 use lyra_proto::pb_ext::lyra_server::Lyra;
+use lyra_proto::pb_ext::lyra_server::LyraServer;
 use lyra_proto::pb_ext::{
     ChunkType, FenceRequest, FenceResponse, FetchEventsRequest, FetchEventsResponse,
     RecordEventsRequest, RecordEventsResponse, StatusCode,
@@ -14,22 +16,23 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::BoxStream;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::warn;
+use tracing::{error, info, warn};
 
 const RESPONSE_BUFFER: usize = 4;
 const FETCH_CHUNK_SIZE: usize = 1024;
 
 #[derive(Clone)]
-pub(crate) struct UnitService {
+pub struct GrpcService {
     context: CancellationToken,
     storage: Arc<dyn Storage>,
     stream_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     inflight_capacity: usize,
 }
 
-impl UnitService {
-    pub(crate) fn new(
+impl GrpcService {
+    pub fn new(
         context: CancellationToken,
         storage: Arc<dyn Storage>,
         inflight_capacity: usize,
@@ -42,11 +45,11 @@ impl UnitService {
         }
     }
 
-    pub(crate) fn context(&self) -> CancellationToken {
+    pub fn context(&self) -> CancellationToken {
         self.context.clone()
     }
 
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.context.cancel();
     }
 
@@ -58,7 +61,7 @@ impl UnitService {
         self.stream_handles.lock().unwrap().push(handle);
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         self.cancel();
         loop {
             let handles = {
@@ -70,7 +73,7 @@ impl UnitService {
             };
             for handle in handles {
                 if let Err(err) = handle.await {
-                    warn!(error = ?err, "unit stream task join error");
+                    warn!(error = ?err, "grpc stream task join error");
                 }
             }
         }
@@ -93,8 +96,28 @@ impl UnitService {
     }
 }
 
+pub fn spawn_server(options: ServerOptions, service: GrpcService) -> JoinHandle<()> {
+    let context = service.context();
+    tokio::spawn(async move {
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<LyraServer<GrpcService>>()
+            .await;
+
+        info!(addr = %options.bind_address, "grpc service starting");
+        let serve_future = Server::builder()
+            .add_service(health_service)
+            .add_service(LyraServer::new(service))
+            .serve_with_shutdown(options.bind_address, context.cancelled());
+        info!("grpc service ready");
+        if let Err(err) = serve_future.await {
+            error!(error = %err, "grpc service error");
+        }
+    })
+}
+
 #[tonic::async_trait]
-impl Lyra for UnitService {
+impl Lyra for GrpcService {
     type RecordStream = BoxStream<RecordEventsResponse>;
 
     async fn record(
@@ -609,7 +632,7 @@ mod tests {
     use crate::storage::wal::WalOptions;
     use crate::storage::{Storage, UnitStorage};
     use futures_util::StreamExt;
-    use lyra_proto::pb_ext::{Event, RecordEventsRequestItem};
+    use lyra_proto::pb_ext::{Event, RecordEventsRequestItem, lyra_client::LyraClient};
     use tempfile::tempdir;
 
     fn event(timeline_id: i64, offset: i64, payload: &[u8]) -> Event {
@@ -777,5 +800,100 @@ mod tests {
         assert_eq!(fetch_response.event.len(), 1);
         assert_eq!(fetch_response.event[0].offset, 1);
         assert_eq!(fetch_response.event[0].payload.as_deref(), Some(&b"a"[..]));
+    }
+
+    #[tokio::test]
+    async fn record_then_fetch_round_trips_over_tonic_service() {
+        let storage = test_storage().await;
+        let context = CancellationToken::new();
+        let service = GrpcService::new(context.clone(), storage, 16);
+        let server_service = service.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = async_stream::stream! {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => yield Ok::<_, std::io::Error>(stream),
+                    Err(error) => {
+                        yield Err(error);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let server_handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(LyraServer::new(server_service))
+                .serve_with_incoming_shutdown(incoming, context.cancelled())
+                .await
+                .unwrap();
+        });
+
+        let mut client = LyraClient::connect(format!("http://{}", addr))
+            .await
+            .unwrap();
+
+        let (record_tx, record_rx) = mpsc::channel(4);
+        let mut record_responses = client
+            .record(ReceiverStream::new(record_rx))
+            .await
+            .unwrap()
+            .into_inner();
+        record_tx
+            .send(RecordEventsRequest {
+                items: vec![RecordEventsRequestItem {
+                    event: Some(event(7, 1, b"a")),
+                    trunc: false,
+                    lra: 0,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let record_response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            record_responses.message(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(record_response.code, StatusCode::Ok as i32);
+        assert_eq!(record_response.commit_offset, 1);
+
+        let (fetch_tx, fetch_rx) = mpsc::channel(4);
+        let mut fetch_responses = client
+            .fetch(ReceiverStream::new(fetch_rx))
+            .await
+            .unwrap()
+            .into_inner();
+        fetch_tx
+            .send(FetchEventsRequest {
+                timeline_id: 7,
+                start_offset: 1,
+                end_offset: 2,
+            })
+            .await
+            .unwrap();
+
+        let fetch_response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fetch_responses.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(fetch_response.code, StatusCode::Ok as i32);
+        assert_eq!(fetch_response.r#type, ChunkType::Full as i32);
+        assert_eq!(fetch_response.event.len(), 1);
+        assert_eq!(fetch_response.event[0].offset, 1);
+        assert_eq!(fetch_response.event[0].payload.as_deref(), Some(&b"a"[..]));
+
+        service.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server_handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
