@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use liblyra::TimelineOptions;
+use liblyra::StreamOptions;
 use liblyra::lyra::{Lyra, LyraOptions};
 use liblyra::{Event, FetchOptions};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,7 +19,7 @@ pub struct VerifyArgs {
     pub units: Option<String>,
 
     #[arg(long, default_value = "4")]
-    pub timelines: usize,
+    pub streams: usize,
 
     #[arg(long, default_value = "100")]
     pub rate: u64,
@@ -37,7 +37,7 @@ pub struct VerifyArgs {
     pub duration: u64,
 }
 
-struct TimelineVerifier {
+struct StreamVerifier {
     name: String,
     written_payloads: BTreeMap<i64, Vec<u8>>,
     acked_offsets: BTreeSet<i64>,
@@ -46,7 +46,7 @@ struct TimelineVerifier {
     violations: Vec<String>,
 }
 
-impl TimelineVerifier {
+impl StreamVerifier {
     fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -199,15 +199,15 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => warn!(error = %e, "failed to list units from catalog (non-fatal)"),
     }
 
-    match catalog.list_timelines().await {
-        Ok(timelines) => info!(count = timelines.len(), "timelines found in catalog"),
-        Err(e) => warn!(error = %e, "failed to list timelines from catalog (non-fatal)"),
+    match catalog.list_streams().await {
+        Ok(streams) => info!(count = streams.len(), "streams found in catalog"),
+        Err(e) => warn!(error = %e, "failed to list streams from catalog (non-fatal)"),
     }
 
     let lyra = Arc::new(Lyra::new(catalog, LyraOptions::new()));
 
     info!(
-        timelines = args.timelines,
+        streams = args.streams,
         rate = args.rate,
         payload_size = args.payload_size,
         replication_factor = args.replication_factor,
@@ -218,19 +218,19 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let reading = Arc::new(AtomicBool::new(true));
     let stats = Arc::new(Stats::new());
 
-    let verifiers: Vec<Arc<Mutex<TimelineVerifier>>> = (0..args.timelines)
-        .map(|i| Arc::new(Mutex::new(TimelineVerifier::new(&format!("verify-{}", i)))))
+    let verifiers: Vec<Arc<Mutex<StreamVerifier>>> = (0..args.streams)
+        .map(|i| Arc::new(Mutex::new(StreamVerifier::new(&format!("verify-{}", i)))))
         .collect();
 
     let mut handles = Vec::new();
 
-    let mut timelines = Vec::new();
-    for i in 0..args.timelines {
+    let mut streams = Vec::new();
+    for i in 0..args.streams {
         let name = format!("verify-{}", i);
-        let timeline = match lyra
-            .open_timeline(
+        let stream = match lyra
+            .open_stream(
                 &name,
-                TimelineOptions::new()
+                StreamOptions::new()
                     .replication_factor(args.replication_factor)
                     .max_batch_size(256)
                     .linger(Duration::from_millis(5)),
@@ -239,11 +239,11 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
         {
             Ok(t) => t,
             Err(create_err) => {
-                info!(timeline = name, error = %create_err, "create failed, trying open");
+                info!(stream = name, error = %create_err, "create failed, trying open");
                 match lyra
-                    .open_timeline(
+                    .open_stream(
                         &name,
-                        TimelineOptions::new()
+                        StreamOptions::new()
                             .replication_factor(args.replication_factor)
                             .max_batch_size(256)
                             .linger(Duration::from_millis(5)),
@@ -252,16 +252,16 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     Ok(t) => t,
                     Err(e) => {
-                        error!(timeline = name, create_error = %create_err, open_error = %e, "failed to create/open timeline");
+                        error!(stream = name, create_error = %create_err, open_error = %e, "failed to create/open stream");
                         continue;
                     }
                 }
             }
         };
-        timelines.push((i, timeline));
+        streams.push((i, stream));
     }
 
-    for (i, timeline) in timelines {
+    for (i, stream) in streams {
         let stats = stats.clone();
         let running = running.clone();
         let verifier = verifiers[i].clone();
@@ -270,7 +270,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         handles.push(tokio::spawn(async move {
             let name = format!("verify-{}", i);
-            info!(timeline = name, "writer started");
+            info!(stream = name, "writer started");
 
             let interval = if rate > 0 {
                 Some(Duration::from_micros(1_000_000 / rate))
@@ -284,7 +284,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 payload.extend_from_slice(&seq.to_be_bytes());
                 payload.resize(payload_size, (seq % 256) as u8);
 
-                match timeline.record(Event::new(payload.clone())).await {
+                match stream.record(Event::new(payload.clone())).await {
                     Ok(result) => {
                         verifier.lock().await.record_ack(result.0, payload);
                         stats.written.fetch_add(1, Ordering::Relaxed);
@@ -292,7 +292,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         stats.write_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(timeline = name, error = %e, "write error");
+                        warn!(stream = name, error = %e, "write error");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
@@ -303,14 +303,14 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             tokio::time::sleep(Duration::from_secs(3)).await;
-            drop(timeline);
-            info!(timeline = name, events = seq, "writer stopped");
+            drop(stream);
+            info!(stream = name, events = seq, "writer stopped");
         }));
     }
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    for (i, verifier) in verifiers.iter().enumerate().take(args.timelines) {
+    for (i, verifier) in verifiers.iter().enumerate().take(args.streams) {
         let lyra = lyra.clone();
         let stats = stats.clone();
         let reading = reading.clone();
@@ -322,9 +322,9 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut stream = loop {
                 match lyra
-                    .open_timeline(
+                    .open_stream(
                         &name,
-                        TimelineOptions::new()
+                        StreamOptions::new()
                             .replication_factor(args.replication_factor)
                             .max_batch_size(256)
                             .linger(Duration::from_millis(5)),
@@ -340,7 +340,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             };
-            info!(timeline = name, "reader started");
+            info!(stream = name, "reader started");
 
             while reading.load(Ordering::Relaxed) {
                 match stream.next().await {
@@ -355,7 +355,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Some(Err(e)) => {
                         stats.read_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(timeline = name, error = %e, "read error");
+                        warn!(stream = name, error = %e, "read error");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     None => break,
@@ -433,7 +433,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         if verifier.violations.is_empty() {
             info!(
-                timeline = verifier.name,
+                stream = verifier.name,
                 acked, read, "PASS — all TLA+ invariants hold"
             );
         } else {
@@ -442,7 +442,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             total_violations += verifier.violations.len();
             error!(
-                timeline = verifier.name,
+                stream = verifier.name,
                 acked,
                 read,
                 violations = verifier.violations.len(),

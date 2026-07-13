@@ -125,17 +125,17 @@ impl Conn {
 
     // -- watermark subscribers ------------------------------------------------
 
-    pub fn subscribe_watermark(&self, timeline_id: i64, initial: i64) -> watch::Receiver<i64> {
-        if let Some(existing) = self.wm_subscribers.get(&timeline_id) {
+    pub fn subscribe_watermark(&self, stream_id: i64, initial: i64) -> watch::Receiver<i64> {
+        if let Some(existing) = self.wm_subscribers.get(&stream_id) {
             return existing.subscribe();
         }
         let (tx, rx) = watch::channel(initial);
-        self.wm_subscribers.insert(timeline_id, tx);
+        self.wm_subscribers.insert(stream_id, tx);
         rx
     }
 
-    pub fn unsubscribe_watermark(&self, timeline_id: i64) {
-        self.wm_subscribers.remove(&timeline_id);
+    pub fn unsubscribe_watermark(&self, stream_id: i64) {
+        self.wm_subscribers.remove(&stream_id);
     }
 
     // -- lifecycle ------------------------------------------------------------
@@ -152,10 +152,10 @@ impl Conn {
 
     // -- RPC ------------------------------------------------------------------
 
-    pub async fn fence(&self, timeline_id: i64, term: i64) -> Result<FenceResponse, InnerError> {
+    pub async fn fence(&self, stream_id: i64, term: i64) -> Result<FenceResponse, InnerError> {
         let mut client = self.client.clone();
         let response = client
-            .fence(FenceRequest { timeline_id, term })
+            .fence(FenceRequest { stream_id, term })
             .await
             .map_err(InnerError::from)?;
         Ok(response.into_inner())
@@ -169,7 +169,7 @@ impl Conn {
 
     pub async fn fence_with_retry(
         &self,
-        timeline_id: i64,
+        stream_id: i64,
         term: i64,
         timeout: Duration,
     ) -> Result<FenceResponse, InnerError> {
@@ -179,7 +179,7 @@ impl Conn {
         future::retry_notify(
             backoff,
             || async {
-                match self.fence(timeline_id, term).await {
+                match self.fence(stream_id, term).await {
                     Ok(resp) => Ok(resp),
                     Err(e @ InnerError::InvalidTerm { .. }) => Err(backoff::Error::permanent(e)),
                     Err(e) => Err(backoff::Error::transient(e)),
@@ -228,16 +228,16 @@ impl Conn {
     /// shared fetch ss, and returns a [`FetchStream`] that yields
     /// responses. Automatically unsubscribes when dropped.
     pub async fn fetch(&self, request: FetchEventsRequest) -> Result<FetchStream, LyraError> {
-        let timeline_id = request.timeline_id;
+        let stream_id = request.stream_id;
         let (tx, rx) = mpsc::channel::<Result<FetchEventsResponse, LyraError>>(64);
-        self.fetch_subscribers.insert(timeline_id, tx);
+        self.fetch_subscribers.insert(stream_id, tx);
         if let Err(error) = self.fetch_stream.send(request).await {
-            self.fetch_subscribers.remove(&timeline_id);
+            self.fetch_subscribers.remove(&stream_id);
             return Err(error);
         }
         Ok(FetchStream {
             rx,
-            timeline_id,
+            stream_id,
             subscribers: self.fetch_subscribers.clone(),
         })
     }
@@ -249,7 +249,7 @@ impl Conn {
 
 pub struct FetchStream {
     rx: mpsc::Receiver<Result<FetchEventsResponse, LyraError>>,
-    timeline_id: i64,
+    stream_id: i64,
     subscribers: Arc<DashMap<i64, mpsc::Sender<Result<FetchEventsResponse, LyraError>>>>,
 }
 
@@ -263,12 +263,12 @@ impl Stream for FetchStream {
 
 impl Drop for FetchStream {
     fn drop(&mut self) {
-        self.subscribers.remove(&self.timeline_id);
+        self.subscribers.remove(&self.stream_id);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Record response reader — demuxes watermarks by timeline_id to subscribers
+// Record response reader — demuxes watermarks by stream_id to subscribers
 // ---------------------------------------------------------------------------
 
 async fn record_response_reader(
@@ -280,13 +280,13 @@ async fn record_response_reader(
         match stream.message().await {
             Ok(Some(resp)) => {
                 if resp.code == StatusCode::Ok as i32 {
-                    if let Some(tx) = subscribers.get(&resp.timeline_id) {
+                    if let Some(tx) = subscribers.get(&resp.stream_id) {
                         let _ = tx.send(resp.commit_offset);
                     }
                 } else {
                     warn!(
                         endpoint = %endpoint,
-                        timeline_id = resp.timeline_id,
+                        stream_id = resp.stream_id,
                         code = resp.code,
                         "record_response_reader: non-ok response"
                     );
@@ -303,7 +303,7 @@ async fn record_response_reader(
 }
 
 // ---------------------------------------------------------------------------
-// Fetch response reader — demuxes fetch responses by timeline_id to subscribers
+// Fetch response reader — demuxes fetch responses by stream_id to subscribers
 // ---------------------------------------------------------------------------
 
 async fn fetch_response_reader(
@@ -314,17 +314,17 @@ async fn fetch_response_reader(
     let reason = loop {
         match stream.message().await {
             Ok(Some(resp)) => {
-                let timeline_id = resp.timeline_id;
-                if let Some(tx) = subscribers.get(&timeline_id) {
+                let stream_id = resp.stream_id;
+                if let Some(tx) = subscribers.get(&stream_id) {
                     match tx.try_send(Ok(resp)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            subscribers.remove(&timeline_id);
+                            subscribers.remove(&stream_id);
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             warn!(
                                 endpoint = %endpoint,
-                                timeline_id = timeline_id,
+                                stream_id = stream_id,
                                 "fetch subscriber full, dropping response"
                             );
                         }

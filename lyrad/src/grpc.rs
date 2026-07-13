@@ -157,7 +157,7 @@ impl Lyra for GrpcService {
         request: Request<FenceRequest>,
     ) -> Result<Response<FenceResponse>, Status> {
         let req = request.into_inner();
-        match self.storage.fence(req.timeline_id, req.term) {
+        match self.storage.fence(req.stream_id, req.term) {
             Ok(lra) => Ok(Response::new(FenceResponse {
                 code: StatusCode::Ok.into(),
                 lra,
@@ -188,7 +188,7 @@ struct InflightWrite {
 
 struct BatchAck {
     response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
-    timeline_id: i64,
+    stream_id: i64,
     term: i64,
     state: AsyncMutex<BatchAckState>,
 }
@@ -202,13 +202,13 @@ struct BatchAckState {
 impl BatchAck {
     fn new(
         response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
-        timeline_id: i64,
+        stream_id: i64,
         term: i64,
         item_count: usize,
     ) -> Self {
         Self {
             response_tx,
-            timeline_id,
+            stream_id,
             term,
             state: AsyncMutex::new(BatchAckState {
                 remaining: item_count,
@@ -231,7 +231,7 @@ impl BatchAck {
                 Some(Ok(RecordEventsResponse {
                     code: StatusCode::Ok.into(),
                     commit_offset: state.max_offset,
-                    timeline_id: self.timeline_id,
+                    stream_id: self.stream_id,
                     term: self.term,
                 }))
             } else {
@@ -328,7 +328,7 @@ async fn enqueue_record_batch(
     }
 
     let mut writes = Vec::with_capacity(item_count);
-    let mut batch_timeline_id = None;
+    let mut batch_stream_id = None;
     let mut batch_term = None;
 
     for item in request.items {
@@ -342,26 +342,26 @@ async fn enqueue_record_batch(
             }
         };
 
-        if let Some(timeline_id) = batch_timeline_id {
-            if timeline_id != event.timeline_id || batch_term != Some(event.term) {
+        if let Some(stream_id) = batch_stream_id {
+            if stream_id != event.stream_id || batch_term != Some(event.term) {
                 let _ = response_tx
                     .send(Err(Status::invalid_argument(
-                        "record batch must contain one timeline and term",
+                        "record batch must contain one stream and term",
                     )))
                     .await;
                 return;
             }
         } else {
-            batch_timeline_id = Some(event.timeline_id);
+            batch_stream_id = Some(event.stream_id);
             batch_term = Some(event.term);
         }
 
-        if let Err(current_term) = context.storage.check_term(event.timeline_id, event.term) {
+        if let Err(current_term) = context.storage.check_term(event.stream_id, event.term) {
             let _ = response_tx
                 .send(Ok(RecordEventsResponse {
                     code: StatusCode::InvalidTerm.into(),
                     commit_offset: -1,
-                    timeline_id: event.timeline_id,
+                    stream_id: event.stream_id,
                     term: current_term,
                 }))
                 .await;
@@ -371,9 +371,9 @@ async fn enqueue_record_batch(
         writes.push((event, item.trunc));
     }
 
-    let timeline_id = batch_timeline_id.unwrap_or_default();
+    let stream_id = batch_stream_id.unwrap_or_default();
     let term = batch_term.unwrap_or_default();
-    let ack = Arc::new(BatchAck::new(response_tx, timeline_id, term, item_count));
+    let ack = Arc::new(BatchAck::new(response_tx, stream_id, term, item_count));
 
     for (event, trunc) in writes {
         let permit = tokio::select! {
@@ -470,7 +470,7 @@ async fn drain_synced_writes(
         .is_some_and(|write| write.wal_offset <= synced_offset)
     {
         let write = pending.pop_front().unwrap();
-        let timeline_id = write.event.timeline_id;
+        let stream_id = write.event.stream_id;
         let offset = write.event.offset;
         let trunc = write.trunc;
         tokio::select! {
@@ -480,7 +480,7 @@ async fn drain_synced_writes(
             }
             _ = storage.apply_write(write.event, trunc) => {}
         }
-        storage.update_lra(timeline_id, offset);
+        storage.update_lra(stream_id, offset);
         write.ack.complete_ok(offset).await;
     }
     true
@@ -557,11 +557,7 @@ async fn handle_fetch_request(
 
     let events = context
         .storage
-        .read_events(
-            request.timeline_id,
-            request.start_offset,
-            request.end_offset,
-        )
+        .read_events(request.stream_id, request.start_offset, request.end_offset)
         .await
         .map_err(|error| Status::internal(error.to_string()))?;
 
@@ -571,7 +567,7 @@ async fn handle_fetch_request(
             FetchEventsResponse {
                 code: StatusCode::Ok.into(),
                 r#type: ChunkType::Full.into(),
-                timeline_id: request.timeline_id,
+                stream_id: request.stream_id,
                 event: Vec::new(),
                 advanced_offset: request.start_offset,
             },
@@ -602,7 +598,7 @@ async fn handle_fetch_request(
             FetchEventsResponse {
                 code: StatusCode::Ok.into(),
                 r#type: chunk_type.into(),
-                timeline_id: request.timeline_id,
+                stream_id: request.stream_id,
                 event: chunk.to_vec(),
                 advanced_offset,
             },
@@ -635,9 +631,9 @@ mod tests {
     use lyra_proto::pb_ext::{Event, RecordEventsRequestItem, lyra_client::LyraClient};
     use tempfile::tempdir;
 
-    fn event(timeline_id: i64, offset: i64, payload: &[u8]) -> Event {
+    fn event(stream_id: i64, offset: i64, payload: &[u8]) -> Event {
         Event {
-            timeline_id,
+            stream_id,
             term: 1,
             offset,
             payload: Some(payload.to_vec().into()),
@@ -685,7 +681,7 @@ mod tests {
         let responses = collect_fetch(
             storage,
             vec![FetchEventsRequest {
-                timeline_id: 7,
+                stream_id: 7,
                 start_offset: 2,
                 end_offset: 4,
             }],
@@ -714,7 +710,7 @@ mod tests {
         let responses = collect_fetch(
             storage,
             vec![FetchEventsRequest {
-                timeline_id: 7,
+                stream_id: 7,
                 start_offset: 10,
                 end_offset: 20,
             }],
@@ -736,7 +732,7 @@ mod tests {
         let responses = collect_fetch(
             storage,
             vec![FetchEventsRequest {
-                timeline_id: 7,
+                stream_id: 7,
                 start_offset: 20,
                 end_offset: 10,
             }],
@@ -788,7 +784,7 @@ mod tests {
         let fetch_responses = collect_fetch(
             storage,
             vec![FetchEventsRequest {
-                timeline_id: 7,
+                stream_id: 7,
                 start_offset: 1,
                 end_offset: 2,
             }],
@@ -871,7 +867,7 @@ mod tests {
             .into_inner();
         fetch_tx
             .send(FetchEventsRequest {
-                timeline_id: 7,
+                stream_id: 7,
                 start_offset: 1,
                 end_offset: 2,
             })

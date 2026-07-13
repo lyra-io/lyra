@@ -5,7 +5,7 @@ pub mod error;
 mod error_inner;
 pub mod lyra;
 pub mod metric;
-pub mod timeline;
+pub mod stream;
 pub mod xunit;
 
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ impl Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Offset(pub i64);
 
-pub use timeline::cursor::EventStream;
+pub use stream::cursor::EventStream;
 
 #[derive(Debug, Clone)]
 pub enum StartPosition {
@@ -112,7 +112,7 @@ const DEFAULT_MAX_INFLIGHT: usize = 1024;
 const DEFAULT_LINGER: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
-pub struct TimelineOptions {
+pub struct StreamOptions {
     pub(crate) retention: Option<Duration>,
     pub(crate) compaction: bool,
     pub(crate) replication_factor: usize,
@@ -123,7 +123,7 @@ pub struct TimelineOptions {
     pub(crate) request_timeout: Duration,
 }
 
-impl Default for TimelineOptions {
+impl Default for StreamOptions {
     fn default() -> Self {
         Self {
             retention: None,
@@ -138,7 +138,7 @@ impl Default for TimelineOptions {
     }
 }
 
-impl TimelineOptions {
+impl StreamOptions {
     pub fn new() -> Self {
         Self::default()
     }

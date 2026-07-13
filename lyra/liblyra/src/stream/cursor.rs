@@ -19,8 +19,8 @@ const MAX_RETRIES: usize = 5;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct EventStream {
-    timeline_id: i64,
-    timeline_name: String,
+    stream_id: i64,
+    stream_name: String,
     catalog: CatalogRef,
     pool: Arc<ConnPool>,
     position: Arc<AtomicI64>,
@@ -37,15 +37,15 @@ pub struct EventStream {
 
 impl EventStream {
     pub(crate) fn new(
-        timeline_id: i64,
-        timeline_name: String,
+        stream_id: i64,
+        stream_name: String,
         catalog: CatalogRef,
         pool: Arc<ConnPool>,
         start_offset: i64,
     ) -> Self {
         Self {
-            timeline_id,
-            timeline_name,
+            stream_id,
+            stream_name,
             catalog,
             pool,
             position: Arc::new(AtomicI64::new(start_offset)),
@@ -89,8 +89,8 @@ impl EventStream {
     }
 
     async fn open_inner(
-        timeline_id: i64,
-        timeline_name: &str,
+        stream_id: i64,
+        stream_name: &str,
         catalog: &dyn Catalog,
         pool: &ConnPool,
         position: &Arc<AtomicI64>,
@@ -98,7 +98,7 @@ impl EventStream {
         let start = position.load(Ordering::Relaxed);
 
         let segment = catalog
-            .get_segment_for_offset(timeline_name, start)
+            .get_segment_for_offset(stream_name, start)
             .await
             .map_err(|e| LyraError::Internal(format!("vfs lookup failed: {}", e)))?
             .ok_or_else(|| LyraError::Internal(format!("no vfs covers offset {}", start)))?;
@@ -107,7 +107,7 @@ impl EventStream {
 
         let mut fetch = conn
             .fetch(FetchEventsRequest {
-                timeline_id,
+                stream_id,
                 start_offset: start,
                 end_offset: i64::MAX,
             })
@@ -169,21 +169,15 @@ impl Stream for EventStream {
             }
 
             if self.inner.is_none() {
-                let timeline_id = self.timeline_id;
-                let timeline_name = self.timeline_name.clone();
+                let stream_id = self.stream_id;
+                let stream_name = self.stream_name.clone();
                 let catalog = self.catalog.clone();
                 let pool = self.pool.clone();
                 let position = self.position.clone();
 
                 let mut fut = Box::pin(async move {
-                    Self::open_inner(
-                        timeline_id,
-                        &timeline_name,
-                        catalog.as_ref(),
-                        &pool,
-                        &position,
-                    )
-                    .await
+                    Self::open_inner(stream_id, &stream_name, catalog.as_ref(), &pool, &position)
+                        .await
                 });
                 match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(stream)) => {

@@ -1,9 +1,9 @@
 use crate::conn::ConnOptions;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::LyraError;
-use crate::timeline::Timeline;
+use crate::stream::Stream;
 use crate::xunit::{AppendRowsRequest, RowData, ScanRequest, XunitClient};
-use crate::{Event, Offset, TimelineOptions};
+use crate::{Event, Offset, StreamOptions};
 use catalog::{CatalogRef, Dataset, OffsetRange, Versioned};
 use opentelemetry::metrics::Meter;
 use std::sync::Arc;
@@ -98,25 +98,25 @@ impl Lyra {
         })
     }
 
-    pub async fn open_timeline(
+    pub async fn open_stream(
         &self,
         name: &str,
-        options: TimelineOptions,
-    ) -> Result<Timeline, LyraError> {
-        Timeline::open(self.catalog.clone(), self.pool.clone(), name, options).await
+        options: StreamOptions,
+    ) -> Result<Stream, LyraError> {
+        Stream::open(self.catalog.clone(), self.pool.clone(), name, options).await
     }
 
-    pub async fn open_readonly_timeline(
+    pub async fn open_readonly_stream(
         &self,
         name: &str,
-        options: TimelineOptions,
-    ) -> Result<Timeline, LyraError> {
-        Timeline::open_readonly(self.catalog.clone(), self.pool.clone(), name, options).await
+        options: StreamOptions,
+    ) -> Result<Stream, LyraError> {
+        Stream::open_readonly(self.catalog.clone(), self.pool.clone(), name, options).await
     }
 
-    pub async fn drop_timeline(&self, name: &str) -> Result<(), LyraError> {
-        let tc = self.catalog.get_timeline(name).await?;
-        self.catalog.delete_timeline(name, tc.version).await?;
+    pub async fn drop_stream(&self, name: &str) -> Result<(), LyraError> {
+        let tc = self.catalog.get_stream(name).await?;
+        self.catalog.delete_stream(name, tc.version).await?;
         Ok(())
     }
 }

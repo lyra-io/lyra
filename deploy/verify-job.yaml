@@ -18,7 +18,7 @@ spec:
           command: ["lyra", "verify"]
           args:
             - --catalog=oxia:6648
-            - --timelines=4
+            - --streams=4
             - --rate=100
             - --replication-factor=3
             - --payload-size=256

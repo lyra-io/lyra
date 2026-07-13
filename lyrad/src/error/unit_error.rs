@@ -16,6 +16,6 @@ pub enum UnitError {
     Wal,
     #[error("Invalid term: current={current}, requested={requested}")]
     InvalidTerm { current: i64, requested: i64 },
-    #[error("Fenced: timeline {timeline_id} at term {term}")]
-    Fenced { timeline_id: i64, term: i64 },
+    #[error("Fenced: stream {stream_id} at term {term}")]
+    Fenced { stream_id: i64, term: i64 },
 }

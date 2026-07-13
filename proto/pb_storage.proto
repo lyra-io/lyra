@@ -5,7 +5,7 @@ import "pb_external.proto";
 
 
 message EventEntryMeta {
-  int64 timeline_id = 1;
+  int64 stream_id = 1;
   int64 term = 2;
   int64 offset = 3;
   uint32 crc32 = 5;

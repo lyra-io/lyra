@@ -22,16 +22,16 @@ pub trait Storage: Send + Sync {
 
     async fn read_events(
         &self,
-        timeline_id: i64,
+        stream_id: i64,
         start_offset: i64,
         end_offset: i64,
     ) -> Result<Vec<Event>, UnitError>;
 
-    fn check_term(&self, timeline_id: i64, request_term: i64) -> Result<(), i64>;
+    fn check_term(&self, stream_id: i64, request_term: i64) -> Result<(), i64>;
 
-    fn fence(&self, timeline_id: i64, new_term: i64) -> Result<i64, i64>;
+    fn fence(&self, stream_id: i64, new_term: i64) -> Result<i64, i64>;
 
-    fn update_lra(&self, timeline_id: i64, lra: i64);
+    fn update_lra(&self, stream_id: i64, lra: i64);
 
     async fn shutdown(&self);
 }
@@ -78,7 +78,7 @@ impl Storage for UnitStorage {
 
     async fn apply_write(&self, event: Event, truncate: bool) {
         let mut state = self.state.lock().unwrap();
-        let events = state.events.entry(event.timeline_id).or_default();
+        let events = state.events.entry(event.stream_id).or_default();
         if truncate {
             events.retain(|stored| stored.offset < event.offset);
         }
@@ -88,7 +88,7 @@ impl Storage for UnitStorage {
 
     async fn read_events(
         &self,
-        timeline_id: i64,
+        stream_id: i64,
         start_offset: i64,
         end_offset: i64,
     ) -> Result<Vec<Event>, UnitError> {
@@ -98,7 +98,7 @@ impl Storage for UnitStorage {
             .map_err(|_| UnitError::Storage("unit storage lock poisoned".into()))?;
         Ok(state
             .events
-            .get(&timeline_id)
+            .get(&stream_id)
             .map(|events| {
                 events
                     .iter()
@@ -109,9 +109,9 @@ impl Storage for UnitStorage {
             .unwrap_or_default())
     }
 
-    fn check_term(&self, timeline_id: i64, request_term: i64) -> Result<(), i64> {
+    fn check_term(&self, stream_id: i64, request_term: i64) -> Result<(), i64> {
         let state = self.state.lock().unwrap();
-        let current = state.terms.get(&timeline_id).copied().unwrap_or_default();
+        let current = state.terms.get(&stream_id).copied().unwrap_or_default();
         if request_term < current {
             Err(current)
         } else {
@@ -119,21 +119,21 @@ impl Storage for UnitStorage {
         }
     }
 
-    fn fence(&self, timeline_id: i64, new_term: i64) -> Result<i64, i64> {
+    fn fence(&self, stream_id: i64, new_term: i64) -> Result<i64, i64> {
         let mut state = self.state.lock().unwrap();
-        let current = state.terms.get(&timeline_id).copied().unwrap_or_default();
+        let current = state.terms.get(&stream_id).copied().unwrap_or_default();
         if new_term < current {
             return Err(current);
         }
-        state.terms.insert(timeline_id, new_term);
-        Ok(state.lra.get(&timeline_id).copied().unwrap_or_default())
+        state.terms.insert(stream_id, new_term);
+        Ok(state.lra.get(&stream_id).copied().unwrap_or_default())
     }
 
-    fn update_lra(&self, timeline_id: i64, lra: i64) {
+    fn update_lra(&self, stream_id: i64, lra: i64) {
         let mut state = self.state.lock().unwrap();
         state
             .lra
-            .entry(timeline_id)
+            .entry(stream_id)
             .and_modify(|current| *current = (*current).max(lra))
             .or_insert(lra);
     }

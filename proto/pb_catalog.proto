@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package io.lyra.proto.catalog.v1;
 
-message TimelineMeta {
+message StreamMeta {
   string name = 1;
-  int64 timeline_id = 2;
-  TimelineStatus status = 3;
+  int64 stream_id = 2;
+  StreamStatus status = 3;
   int64 term = 4;
   int64 version = 5;
   int64 lra = 6;
@@ -16,7 +16,7 @@ message Segment {
   int64 start_offset = 2;
 }
 
-enum TimelineStatus {
+enum StreamStatus {
   ACTIVE = 0;
   SEALED = 1;
 }

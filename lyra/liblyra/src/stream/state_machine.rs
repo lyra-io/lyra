@@ -2,12 +2,12 @@ use super::ensemble::select_ensemble;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::LyraError;
 use crate::error_inner::InnerError;
-use crate::{Event as UserEvent, Offset, TimelineOptions};
+use crate::{Event as UserEvent, Offset, StreamOptions};
 use backoff::future;
 use catalog::error::CatalogError;
 use catalog::{CatalogRef, Versioned};
 use futures_util::future::{join_all, select_all};
-use lyra_proto::pb_catalog::{Segment, TimelineMeta, UnitInfo};
+use lyra_proto::pb_catalog::{Segment, StreamMeta, UnitInfo};
 use lyra_proto::pb_ext::{RecordEventsRequest, RecordEventsRequestItem};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -28,10 +28,10 @@ struct RecordRequest {
 
 struct State {
     name: String,
-    meta: TimelineMeta,
+    meta: StreamMeta,
     catalog: CatalogRef,
     pool: Arc<ConnPool>,
-    options: TimelineOptions,
+    options: StreamOptions,
     lrs: i64,
     needs_trunc: bool,
     ensemble: Vec<UnitInfo>,
@@ -46,7 +46,7 @@ struct InflightBatch {
 }
 
 struct StateMachineInner {
-    timeline_id: i64,
+    stream_id: i64,
     record_tx: mpsc::Sender<RecordRequest>,
     cancel: CancellationToken,
     task: sync::Mutex<Option<JoinHandle<()>>>,
@@ -62,11 +62,11 @@ impl StateMachine {
         name: &str,
         catalog: CatalogRef,
         pool: Arc<ConnPool>,
-        options: &TimelineOptions,
+        options: &StreamOptions,
     ) -> Result<Self, LyraError> {
         let mut state = State {
             name: name.to_string(),
-            meta: TimelineMeta::default(),
+            meta: StreamMeta::default(),
             catalog,
             pool,
             options: options.clone(),
@@ -84,7 +84,7 @@ impl StateMachine {
         let (record_tx, record_rx) = mpsc::channel::<RecordRequest>(options.max_inflight);
 
         recover(&mut state).await?;
-        let timeline_id = state.meta.timeline_id;
+        let stream_id = state.meta.stream_id;
 
         let task = tokio::spawn(run(
             state,
@@ -96,7 +96,7 @@ impl StateMachine {
 
         Ok(Self {
             inner: Arc::new(StateMachineInner {
-                timeline_id,
+                stream_id,
                 record_tx,
                 cancel,
                 task: sync::Mutex::new(Some(task)),
@@ -104,8 +104,8 @@ impl StateMachine {
         })
     }
 
-    pub fn timeline_id(&self) -> i64 {
-        self.inner.timeline_id
+    pub fn stream_id(&self) -> i64 {
+        self.inner.stream_id
     }
 
     pub async fn record(&self, event: UserEvent) -> Result<Offset, LyraError> {
@@ -207,12 +207,12 @@ where
         state.wm_watches = subscribe_watches(
             &state.ensemble,
             &state.pool,
-            state.meta.timeline_id,
+            state.meta.stream_id,
             state.meta.lra,
         );
 
         info!(
-            timeline_id = state.meta.timeline_id,
+            stream_id = state.meta.stream_id,
             "ensemble replaced and fenced, retrying operation"
         );
     }
@@ -264,13 +264,13 @@ async fn fence_members(state: &State, members: &[UnitInfo]) -> Result<(), LyraEr
     let futs = members.iter().map(|unit| {
         let pool = state.pool.clone();
         let timeout = state.options.request_timeout;
-        let timeline_id = state.meta.timeline_id;
+        let stream_id = state.meta.stream_id;
         let term = state.meta.term;
         let unit = unit.clone();
         async move {
             let result = match pool.get_or_connect(&unit.address) {
                 Ok(conn) => conn
-                    .fence_with_retry(timeline_id, term, timeout)
+                    .fence_with_retry(stream_id, term, timeout)
                     .await
                     .map_err(|e| LyraError::Internal(e.to_string())),
                 Err(e) => Err(LyraError::Transport(e.to_string())),
@@ -291,13 +291,13 @@ async fn fence_members(state: &State, members: &[UnitInfo]) -> Result<(), LyraEr
 fn subscribe_watches(
     ensemble: &[UnitInfo],
     pool: &ConnPool,
-    timeline_id: i64,
+    stream_id: i64,
     lra: i64,
 ) -> Vec<(String, watch::Receiver<i64>)> {
     let mut watches = Vec::new();
     for unit in ensemble {
         if let Ok(conn) = pool.get_or_connect(&unit.address) {
-            let rx = conn.subscribe_watermark(timeline_id, lra);
+            let rx = conn.subscribe_watermark(stream_id, lra);
             watches.push((unit.address.clone(), rx));
         }
     }
@@ -311,7 +311,7 @@ fn subscribe_watches(
 async fn recover(state: &mut State) -> Result<(), LyraError> {
     state.meta = state
         .catalog
-        .tl_new_term(&state.name)
+        .stream_new_term(&state.name)
         .await
         .map_err(|e| LyraError::Internal(e.to_string()))?;
 
@@ -328,17 +328,17 @@ async fn recover(state: &mut State) -> Result<(), LyraError> {
     state.segment_version = writable_segment.version;
 
     info!(
-        timeline_id = state.meta.timeline_id,
+        stream_id = state.meta.stream_id,
         term = state.meta.term,
         "fencing ensemble"
     );
 
-    let timeline_id = state.meta.timeline_id;
+    let stream_id = state.meta.stream_id;
     let term = state.meta.term;
     let fence_results = broadcast(state, |pool, unit, timeout| async move {
         let result = match pool.get_or_connect(&unit.address) {
             Ok(conn) => conn
-                .fence_with_retry(timeline_id, term, timeout)
+                .fence_with_retry(stream_id, term, timeout)
                 .await
                 .map_err(|e| LyraError::Internal(e.to_string())),
             Err(e) => Err(LyraError::Transport(e.to_string())),
@@ -366,7 +366,7 @@ async fn recover(state: &mut State) -> Result<(), LyraError> {
         state.lrs = lra;
         state.meta = state
             .catalog
-            .timeline_update(&state.meta, state.meta.version)
+            .stream_update(&state.meta, state.meta.version)
             .await
             .map_err(|e| LyraError::Internal(e.to_string()))?;
     }
@@ -374,12 +374,12 @@ async fn recover(state: &mut State) -> Result<(), LyraError> {
     state.wm_watches = subscribe_watches(
         &state.ensemble,
         &state.pool,
-        state.meta.timeline_id,
+        state.meta.stream_id,
         state.meta.lra,
     );
 
     info!(
-        timeline_id = state.meta.timeline_id,
+        stream_id = state.meta.stream_id,
         term = state.meta.term,
         lra = lra,
         "init complete"
@@ -390,10 +390,10 @@ async fn recover(state: &mut State) -> Result<(), LyraError> {
 
 async fn get_or_init_last_segment(
     catalog: CatalogRef,
-    timeline_name: &str,
+    stream_name: &str,
     replication_factor: usize,
 ) -> Result<Versioned<Segment>, CatalogError> {
-    if let Some(last) = catalog.get_last_segment(timeline_name).await? {
+    if let Some(last) = catalog.get_last_segment(stream_name).await? {
         return Ok(last);
     }
 
@@ -410,10 +410,10 @@ async fn get_or_init_last_segment(
         start_offset: 1,
     };
 
-    match catalog.put_segment(timeline_name, &segment, -1).await {
+    match catalog.put_segment(stream_name, &segment, -1).await {
         Ok(segment) => Ok(segment),
         Err(CatalogError::VersionConflict { .. }) => catalog
-            .get_last_segment(timeline_name)
+            .get_last_segment(stream_name)
             .await?
             .ok_or_else(|| CatalogError::Internal("vfs vanished after conflict".into())),
         Err(error) => Err(error),
@@ -525,7 +525,7 @@ fn prepare_batch(
             .as_millis() as i64;
 
         let proto_event = lyra_proto::pb_ext::Event {
-            timeline_id: state.meta.timeline_id,
+            stream_id: state.meta.stream_id,
             term: state.meta.term,
             offset,
             payload: Some(event.payload.into()),

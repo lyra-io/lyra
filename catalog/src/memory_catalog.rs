@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lyra_proto::pb_catalog::{Segment, TimelineMeta, UnitRegistration};
+use lyra_proto::pb_catalog::{Segment, StreamMeta, UnitRegistration};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::Receiver;
@@ -192,48 +192,44 @@ impl Catalog for MemoryCatalog {
         Ok(actions)
     }
 
-    async fn get_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
+    async fn get_stream(&self, name: &str) -> Result<StreamMeta, CatalogError> {
         Err(CatalogError::Unsupported(format!(
-            "memory catalog timeline get: {}",
+            "memory catalog stream get: {}",
             name
         )))
     }
 
-    async fn timeline_update(
+    async fn stream_update(
         &self,
-        _meta: &TimelineMeta,
+        _meta: &StreamMeta,
         _expected_version: i64,
-    ) -> Result<TimelineMeta, CatalogError> {
+    ) -> Result<StreamMeta, CatalogError> {
         Err(CatalogError::Unsupported(
-            "memory catalog timeline_update".into(),
+            "memory catalog stream_update".into(),
         ))
     }
 
-    async fn create_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
+    async fn create_stream(&self, name: &str) -> Result<StreamMeta, CatalogError> {
         Err(CatalogError::Unsupported(format!(
-            "memory catalog create_timeline: {}",
+            "memory catalog create_stream: {}",
             name
         )))
     }
 
-    async fn delete_timeline(
-        &self,
-        name: &str,
-        _expected_version: i64,
-    ) -> Result<(), CatalogError> {
+    async fn delete_stream(&self, name: &str, _expected_version: i64) -> Result<(), CatalogError> {
         Err(CatalogError::Unsupported(format!(
-            "memory catalog delete_timeline: {}",
+            "memory catalog delete_stream: {}",
             name
         )))
     }
 
-    async fn list_timelines(&self) -> Result<Vec<TimelineMeta>, CatalogError> {
+    async fn list_streams(&self) -> Result<Vec<StreamMeta>, CatalogError> {
         Ok(Vec::new())
     }
 
     async fn put_segment(
         &self,
-        _timeline_name: &str,
+        _stream_name: &str,
         _segment: &Segment,
         _expected_version: i64,
     ) -> Result<Versioned<Segment>, CatalogError> {
@@ -244,32 +240,32 @@ impl Catalog for MemoryCatalog {
 
     async fn list_segments(
         &self,
-        _timeline_name: &str,
+        _stream_name: &str,
     ) -> Result<Vec<Versioned<Segment>>, CatalogError> {
         Ok(Vec::new())
     }
 
     async fn get_last_segment(
         &self,
-        _timeline_name: &str,
+        _stream_name: &str,
     ) -> Result<Option<Versioned<Segment>>, CatalogError> {
         Ok(None)
     }
 
     async fn get_segment_for_offset(
         &self,
-        _timeline_name: &str,
+        _stream_name: &str,
         _offset: i64,
     ) -> Result<Option<Versioned<Segment>>, CatalogError> {
         Ok(None)
     }
 
-    async fn tl_fetch_or_insert(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
-        self.create_timeline(name).await
+    async fn stream_fetch_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
+        self.create_stream(name).await
     }
 
-    async fn tl_new_term(&self, name: &str) -> Result<TimelineMeta, CatalogError> {
-        self.create_timeline(name).await
+    async fn stream_new_term(&self, name: &str) -> Result<StreamMeta, CatalogError> {
+        self.create_stream(name).await
     }
 
     async fn register_unit(&self, _registration: &UnitRegistration) -> Result<(), CatalogError> {
@@ -290,7 +286,7 @@ impl Catalog for MemoryCatalog {
 
     async fn subscribe_segments(
         &self,
-        _timeline_name: &str,
+        _stream_name: &str,
     ) -> Result<Receiver<String>, CatalogError> {
         Err(CatalogError::Unsupported(
             "memory catalog subscribe_segments".into(),

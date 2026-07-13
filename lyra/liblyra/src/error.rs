@@ -5,17 +5,17 @@ use thiserror::Error;
 
 #[derive(Error, Debug, Clone)]
 pub enum LyraError {
-    #[error("Timeline not found: {0}")]
-    TimelineNotFound(String),
+    #[error("Stream not found: {0}")]
+    StreamNotFound(String),
 
-    #[error("Timeline already exists: {0}")]
-    TimelineAlreadyExists(String),
+    #[error("Stream already exists: {0}")]
+    StreamAlreadyExists(String),
 
     #[error("Invalid term: current={current}, requested={requested}")]
     InvalidTerm { current: i64, requested: i64 },
 
-    #[error("Fenced: timeline_id={timeline_id}, term={term}")]
-    Fenced { timeline_id: i64, term: i64 },
+    #[error("Fenced: stream_id={stream_id}, term={term}")]
+    Fenced { stream_id: i64, term: i64 },
 
     #[error("Reconciliation failed: {0}")]
     ReconciliationFailed(String),

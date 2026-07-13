@@ -6,7 +6,7 @@ pub mod types;
 
 use async_trait::async_trait;
 use error::CatalogError;
-use lyra_proto::pb_catalog::{Segment, TimelineMeta, UnitRegistration};
+use lyra_proto::pb_catalog::{Segment, StreamMeta, UnitRegistration};
 use oxia_catalog::OxiaCatalog;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -80,46 +80,46 @@ pub trait Catalog: Send + Sync {
         Err(CatalogError::Unsupported("list_actions".into()))
     }
 
-    async fn get_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError>;
+    async fn get_stream(&self, name: &str) -> Result<StreamMeta, CatalogError>;
 
-    async fn timeline_update(
+    async fn stream_update(
         &self,
-        meta: &TimelineMeta,
+        meta: &StreamMeta,
         expected_version: i64,
-    ) -> Result<TimelineMeta, CatalogError>;
+    ) -> Result<StreamMeta, CatalogError>;
 
-    async fn create_timeline(&self, name: &str) -> Result<TimelineMeta, CatalogError>;
+    async fn create_stream(&self, name: &str) -> Result<StreamMeta, CatalogError>;
 
-    async fn delete_timeline(&self, name: &str, expected_version: i64) -> Result<(), CatalogError>;
+    async fn delete_stream(&self, name: &str, expected_version: i64) -> Result<(), CatalogError>;
 
-    async fn list_timelines(&self) -> Result<Vec<TimelineMeta>, CatalogError>;
+    async fn list_streams(&self) -> Result<Vec<StreamMeta>, CatalogError>;
 
     async fn put_segment(
         &self,
-        timeline_name: &str,
+        stream_name: &str,
         segment: &Segment,
         expected_version: i64,
     ) -> Result<Versioned<Segment>, CatalogError>;
 
     async fn list_segments(
         &self,
-        timeline_name: &str,
+        stream_name: &str,
     ) -> Result<Vec<Versioned<Segment>>, CatalogError>;
 
     async fn get_last_segment(
         &self,
-        timeline_name: &str,
+        stream_name: &str,
     ) -> Result<Option<Versioned<Segment>>, CatalogError>;
 
     async fn get_segment_for_offset(
         &self,
-        timeline_name: &str,
+        stream_name: &str,
         offset: i64,
     ) -> Result<Option<Versioned<Segment>>, CatalogError>;
 
-    async fn tl_fetch_or_insert(&self, name: &str) -> Result<TimelineMeta, CatalogError>;
+    async fn stream_fetch_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError>;
 
-    async fn tl_new_term(&self, name: &str) -> Result<TimelineMeta, CatalogError>;
+    async fn stream_new_term(&self, name: &str) -> Result<StreamMeta, CatalogError>;
 
     async fn register_unit(&self, registration: &UnitRegistration) -> Result<(), CatalogError>;
 
@@ -129,17 +129,15 @@ pub trait Catalog: Send + Sync {
 
     async fn list_writable_units(&self) -> Result<Vec<UnitRegistration>, CatalogError>;
 
-    async fn subscribe_segments(
-        &self,
-        timeline_name: &str,
-    ) -> Result<Receiver<String>, CatalogError>;
+    async fn subscribe_segments(&self, stream_name: &str)
+    -> Result<Receiver<String>, CatalogError>;
 }
 
 pub type CatalogRef = Arc<dyn Catalog>;
 
 pub fn segment_key(name: &str, start_offset: i64) -> String {
     format!(
-        "/lyra/timelines/{}/seg-{:0>width$}",
+        "/lyra/streams/{}/seg-{:0>width$}",
         name,
         start_offset,
         width = SEGMENT_KEY_PAD
@@ -147,15 +145,11 @@ pub fn segment_key(name: &str, start_offset: i64) -> String {
 }
 
 pub fn segment_key_prefix(name: &str) -> String {
-    format!("/lyra/timelines/{}/seg-", name)
+    format!("/lyra/streams/{}/seg-", name)
 }
 
 pub fn segment_key_max(name: &str) -> String {
-    format!(
-        "/lyra/timelines/{}/seg-{}",
-        name,
-        "9".repeat(SEGMENT_KEY_PAD)
-    )
+    format!("/lyra/streams/{}/seg-{}", name, "9".repeat(SEGMENT_KEY_PAD))
 }
 
 #[derive(Debug, Deserialize, Clone)]
