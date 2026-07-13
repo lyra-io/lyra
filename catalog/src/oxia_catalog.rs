@@ -434,14 +434,14 @@ impl OxiaCatalog {
             .map_err(CatalogError::from)?;
 
         let mut actions = Vec::with_capacity(result.records.len());
-        for record in &result.records {
-            if let Some(ref value) = record.value {
-                let action = Self::decode_action(value, record.version.version_id)?;
+        for entry in &result.records {
+            if let Some(ref value) = entry.value {
+                let action = Self::decode_action(value, entry.version.version_id)?;
                 if dataset
                     .map(|dataset| action.request.dataset == *dataset)
                     .unwrap_or(true)
                 {
-                    actions.push(Versioned::new(action, record.version.version_id));
+                    actions.push(Versioned::new(action, entry.version.version_id));
                 }
             }
         }
@@ -560,13 +560,13 @@ impl OxiaCatalog {
             .map_err(CatalogError::from)?;
 
         let mut streams = Vec::with_capacity(result.records.len());
-        for record in &result.records {
+        for entry in &result.records {
             // Skip vfs keys (contain /seg-)
-            if record.key.contains("/seg-") {
+            if entry.key.contains("/seg-") {
                 continue;
             }
-            if let Some(ref value) = record.value {
-                let meta = Self::decode_meta(value, record.version.version_id)?;
+            if let Some(ref value) = entry.value {
+                let meta = Self::decode_meta(value, entry.version.version_id)?;
                 streams.push(meta);
             }
         }
@@ -614,11 +614,11 @@ impl OxiaCatalog {
             .map_err(CatalogError::from)?;
 
         let mut segments = Vec::with_capacity(result.records.len());
-        for record in &result.records {
-            if let Some(ref value) = record.value {
+        for entry in &result.records {
+            if let Some(ref value) = entry.value {
                 let seg = Segment::decode(value.as_slice())
                     .map_err(|e| CatalogError::Internal(format!("failed to decode vfs: {}", e)))?;
-                segments.push(Versioned::new(seg, record.version.version_id));
+                segments.push(Versioned::new(seg, entry.version.version_id));
             }
         }
         Ok(segments)
@@ -651,13 +651,13 @@ impl OxiaCatalog {
             .await
             .map_err(CatalogError::from)?;
 
-        // Take the last record — the vfs with the largest start_offset <= offset.
-        if let Some(record) = result.records.last()
-            && let Some(ref value) = record.value
+        // Take the last entry: the vfs with the largest start_offset <= offset.
+        if let Some(entry) = result.records.last()
+            && let Some(ref value) = entry.value
         {
             let seg = Segment::decode(value.as_slice())
                 .map_err(|e| CatalogError::Internal(format!("failed to decode vfs: {}", e)))?;
-            return Ok(Some(Versioned::new(seg, record.version.version_id)));
+            return Ok(Some(Versioned::new(seg, entry.version.version_id)));
         }
         Ok(None)
     }
@@ -666,7 +666,7 @@ impl OxiaCatalog {
     ///
     /// Uses `ExpectVersionId(-1)` for creation so that concurrent callers
     /// race safely — the loser sees `AlreadyExists` and falls back to get.
-    pub async fn stream_fetch_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
+    pub async fn stream_get_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
         match self.get_stream(name).await {
             Ok(tc) => Ok(tc),
             Err(CatalogError::NotFound(_)) => match self.create_stream(name).await {
@@ -714,10 +714,10 @@ impl OxiaCatalog {
 
     /// Get or create a stream, then atomically bump its term.
     ///
-    /// Combines `stream_fetch_or_insert` + term increment in a single method
+    /// Combines `stream_get_or_insert` + term increment in a single method
     /// to avoid a redundant read. Retries on CAS conflict.
     pub async fn stream_new_term(&self, name: &str) -> Result<StreamMeta, CatalogError> {
-        let mut tc = self.stream_fetch_or_insert(name).await?;
+        let mut tc = self.stream_get_or_insert(name).await?;
         loop {
             let mut updated = tc.clone();
             updated.term = tc.term + 1;
@@ -770,8 +770,8 @@ impl OxiaCatalog {
             .map_err(CatalogError::from)?;
 
         let mut units = Vec::with_capacity(result.records.len());
-        for record in &result.records {
-            if let Some(ref value) = record.value {
+        for entry in &result.records {
+            if let Some(ref value) = entry.value {
                 let reg = UnitRegistration::decode(value.as_slice())
                     .map_err(|e| CatalogError::Internal(format!("failed to decode unit: {}", e)))?;
                 units.push(reg);
@@ -909,8 +909,8 @@ impl Catalog for OxiaCatalog {
         OxiaCatalog::get_segment_for_offset(self, stream_name, offset).await
     }
 
-    async fn stream_fetch_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
-        OxiaCatalog::stream_fetch_or_insert(self, name).await
+    async fn stream_get_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
+        OxiaCatalog::stream_get_or_insert(self, name).await
     }
 
     async fn stream_new_term(&self, name: &str) -> Result<StreamMeta, CatalogError> {

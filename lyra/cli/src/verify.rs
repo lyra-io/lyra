@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use liblyra::StreamOptions;
 use liblyra::lyra::{Lyra, LyraOptions};
-use liblyra::{Event, FetchOptions};
+use liblyra::{Event, ReadOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -58,12 +58,12 @@ impl StreamVerifier {
         }
     }
 
-    fn record_ack(&mut self, offset: i64, payload: Vec<u8>) {
+    fn append_ack(&mut self, offset: i64, payload: Vec<u8>) {
         self.acked_offsets.insert(offset);
         self.written_payloads.insert(offset, payload);
     }
 
-    fn record_read(&mut self, offset: i64, payload: &[u8], payload_size: usize) {
+    fn observe_read(&mut self, offset: i64, payload: &[u8], payload_size: usize) {
         if offset <= self.last_read_offset {
             self.violations.push(format!(
                 "[{}] ORDER: offset {} read after {} (not monotonically increasing)",
@@ -284,9 +284,9 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 payload.extend_from_slice(&seq.to_be_bytes());
                 payload.resize(payload_size, (seq % 256) as u8);
 
-                match stream.record(Event::new(payload.clone())).await {
+                match stream.append(Event::new(payload.clone())).await {
                     Ok(result) => {
-                        verifier.lock().await.record_ack(result.0, payload);
+                        verifier.lock().await.append_ack(result.0, payload);
                         stats.written.fetch_add(1, Ordering::Relaxed);
                         seq += 1;
                     }
@@ -331,7 +331,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await
                 {
-                    Ok(t) => break t.fetch(FetchOptions::earliest()).await.unwrap(),
+                    Ok(t) => break t.read(ReadOptions::earliest()).await.unwrap(),
                     Err(_) => {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         if !reading.load(Ordering::Relaxed) {
@@ -346,7 +346,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 match stream.next().await {
                     Some(Ok(event)) => {
                         stats.read.fetch_add(1, Ordering::Relaxed);
-                        verifier.lock().await.record_read(
+                        verifier.lock().await.observe_read(
                             event.offset.unwrap_or(0),
                             &event.payload,
                             payload_size,

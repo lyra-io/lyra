@@ -53,13 +53,13 @@ pub enum StartPosition {
 }
 
 #[derive(Debug, Clone)]
-pub struct FetchOptions {
+pub struct ReadOptions {
     pub(crate) start: StartPosition,
     pub(crate) limit: Option<usize>,
     pub(crate) timeout: Option<std::time::Duration>,
 }
 
-impl FetchOptions {
+impl ReadOptions {
     pub fn earliest() -> Self {
         Self {
             start: StartPosition::Earliest,

@@ -260,7 +260,7 @@ impl Catalog for MemoryCatalog {
         Ok(None)
     }
 
-    async fn stream_fetch_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
+    async fn stream_get_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError> {
         self.create_stream(name).await
     }
 

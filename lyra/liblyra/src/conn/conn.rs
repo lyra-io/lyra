@@ -5,8 +5,8 @@ use backoff::future;
 use dashmap::DashMap;
 use futures_util::Stream;
 use lyra_proto::pb_ext::{
-    FenceRequest, FenceResponse, FetchEventsRequest, FetchEventsResponse, RecordEventsRequest,
-    RecordEventsResponse, StatusCode, lyra_client::LyraClient,
+    AppendEventsRequest, AppendEventsResponse, FenceRequest, FenceResponse, ReadEventsRequest,
+    ReadEventsResponse, StatusCode, lyra_client::LyraClient,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -45,27 +45,27 @@ impl Default for ConnOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Conn — one logical connection with its own record and fetch streams
+// Conn — one logical connection with its own append and read streams
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct Conn {
     endpoint: String,
     client: LyraClient<Channel>,
-    record_stream: RecoverableStream<RecordEventsRequest>,
-    fetch_stream: RecoverableStream<FetchEventsRequest>,
+    append_stream: RecoverableStream<AppendEventsRequest>,
+    read_stream: RecoverableStream<ReadEventsRequest>,
     wm_subscribers: Arc<DashMap<i64, watch::Sender<i64>>>,
-    fetch_subscribers: Arc<DashMap<i64, mpsc::Sender<Result<FetchEventsResponse, LyraError>>>>,
+    read_subscribers: Arc<DashMap<i64, mpsc::Sender<Result<ReadEventsResponse, LyraError>>>>,
 }
 
 impl Conn {
     pub(crate) fn new(endpoint: String, client: LyraClient<Channel>) -> Self {
         let wm_subscribers = Arc::new(DashMap::new());
-        let fetch_subscribers: Arc<
-            DashMap<i64, mpsc::Sender<Result<FetchEventsResponse, LyraError>>>,
+        let read_subscribers: Arc<
+            DashMap<i64, mpsc::Sender<Result<ReadEventsResponse, LyraError>>>,
         > = Arc::new(DashMap::new());
 
-        let record_stream = {
+        let append_stream = {
             let client = client.clone();
             let ep = endpoint.clone();
             let subs = wm_subscribers.clone();
@@ -74,36 +74,36 @@ impl Conn {
                 let ep = ep.clone();
                 let subs = subs.clone();
                 Box::pin(async move {
-                    let (tx, rx) = mpsc::channel::<RecordEventsRequest>(64);
+                    let (tx, rx) = mpsc::channel::<AppendEventsRequest>(64);
                     let stream = ReceiverStream::new(rx);
                     let response = client
-                        .record(stream)
+                        .append(stream)
                         .await
                         .map_err(|e| LyraError::Transport(e.to_string()))?;
                     let handle =
-                        tokio::spawn(record_response_reader(ep, response.into_inner(), subs));
+                        tokio::spawn(append_response_reader(ep, response.into_inner(), subs));
                     Ok((tx, handle))
                 })
             }))
         };
 
-        let fetch_stream = {
+        let read_stream = {
             let client = client.clone();
             let ep = endpoint.clone();
-            let subs = fetch_subscribers.clone();
+            let subs = read_subscribers.clone();
             RecoverableStream::new(Arc::new(move || {
                 let mut client = client.clone();
                 let ep = ep.clone();
                 let subs = subs.clone();
                 Box::pin(async move {
-                    let (tx, rx) = mpsc::channel::<FetchEventsRequest>(64);
+                    let (tx, rx) = mpsc::channel::<ReadEventsRequest>(64);
                     let stream = ReceiverStream::new(rx);
                     let response = client
-                        .fetch(stream)
+                        .read(stream)
                         .await
                         .map_err(|e| LyraError::Transport(e.to_string()))?;
                     let handle =
-                        tokio::spawn(fetch_response_reader(ep, response.into_inner(), subs));
+                        tokio::spawn(read_response_reader(ep, response.into_inner(), subs));
                     Ok((tx, handle))
                 })
             }))
@@ -112,10 +112,10 @@ impl Conn {
         Self {
             endpoint,
             client,
-            record_stream,
-            fetch_stream,
+            append_stream,
+            read_stream,
             wm_subscribers,
-            fetch_subscribers,
+            read_subscribers,
         }
     }
 
@@ -140,14 +140,14 @@ impl Conn {
 
     // -- lifecycle ------------------------------------------------------------
 
-    /// Gracefully close both record and fetch streams: drop request senders
+    /// Gracefully close both append and read streams: drop request senders
     /// so servers see end-of-ss, wait for response readers to drain,
     /// then clear all subscribers.
     pub async fn close(&self) {
-        self.record_stream.close().await;
-        self.fetch_stream.close().await;
+        self.append_stream.close().await;
+        self.read_stream.close().await;
         self.wm_subscribers.clear();
-        self.fetch_subscribers.clear();
+        self.read_subscribers.clear();
     }
 
     // -- RPC ------------------------------------------------------------------
@@ -161,10 +161,10 @@ impl Conn {
         Ok(response.into_inner())
     }
 
-    /// Send a record request. The gRPC ss is lazily opened on first call
+    /// Send an append request. The gRPC ss is lazily opened on first call
     /// and automatically reconnected if the previous ss died.
-    pub async fn send_record(&self, request: RecordEventsRequest) -> Result<(), LyraError> {
-        self.record_stream.send(request).await
+    pub async fn send_append(&self, request: AppendEventsRequest) -> Result<(), LyraError> {
+        self.append_stream.send(request).await
     }
 
     pub async fn fence_with_retry(
@@ -197,9 +197,9 @@ impl Conn {
         .await
     }
 
-    pub async fn send_record_with_retry(
+    pub async fn send_append_with_retry(
         &self,
-        request: RecordEventsRequest,
+        request: AppendEventsRequest,
         timeout: Duration,
     ) -> Result<(), LyraError> {
         let backoff = backoff::ExponentialBackoffBuilder::new()
@@ -208,7 +208,7 @@ impl Conn {
         future::retry_notify(
             backoff,
             || async {
-                self.send_record(request.clone())
+                self.send_append(request.clone())
                     .await
                     .map_err(backoff::Error::transient)
             },
@@ -217,63 +217,63 @@ impl Conn {
                     endpoint = %self.endpoint,
                     error = %e,
                     retry_in = ?retry_in,
-                    "send_record failed, retrying"
+                    "send_append failed, retrying"
                 );
             },
         )
         .await
     }
 
-    /// Start a fetch. Subscribes for responses, sends the request through the
-    /// shared fetch ss, and returns a [`FetchStream`] that yields
+    /// Start a read. Subscribes for responses, sends the request through the
+    /// shared read ss, and returns a [`ReadStream`] that yields
     /// responses. Automatically unsubscribes when dropped.
-    pub async fn fetch(&self, request: FetchEventsRequest) -> Result<FetchStream, LyraError> {
+    pub async fn read(&self, request: ReadEventsRequest) -> Result<ReadStream, LyraError> {
         let stream_id = request.stream_id;
-        let (tx, rx) = mpsc::channel::<Result<FetchEventsResponse, LyraError>>(64);
-        self.fetch_subscribers.insert(stream_id, tx);
-        if let Err(error) = self.fetch_stream.send(request).await {
-            self.fetch_subscribers.remove(&stream_id);
+        let (tx, rx) = mpsc::channel::<Result<ReadEventsResponse, LyraError>>(64);
+        self.read_subscribers.insert(stream_id, tx);
+        if let Err(error) = self.read_stream.send(request).await {
+            self.read_subscribers.remove(&stream_id);
             return Err(error);
         }
-        Ok(FetchStream {
+        Ok(ReadStream {
             rx,
             stream_id,
-            subscribers: self.fetch_subscribers.clone(),
+            subscribers: self.read_subscribers.clone(),
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// FetchStream — Stream wrapper that unsubscribes on drop
+// ReadStream — Stream wrapper that unsubscribes on drop
 // ---------------------------------------------------------------------------
 
-pub struct FetchStream {
-    rx: mpsc::Receiver<Result<FetchEventsResponse, LyraError>>,
+pub struct ReadStream {
+    rx: mpsc::Receiver<Result<ReadEventsResponse, LyraError>>,
     stream_id: i64,
-    subscribers: Arc<DashMap<i64, mpsc::Sender<Result<FetchEventsResponse, LyraError>>>>,
+    subscribers: Arc<DashMap<i64, mpsc::Sender<Result<ReadEventsResponse, LyraError>>>>,
 }
 
-impl Stream for FetchStream {
-    type Item = Result<FetchEventsResponse, LyraError>;
+impl Stream for ReadStream {
+    type Item = Result<ReadEventsResponse, LyraError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }
 
-impl Drop for FetchStream {
+impl Drop for ReadStream {
     fn drop(&mut self) {
         self.subscribers.remove(&self.stream_id);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Record response reader — demuxes watermarks by stream_id to subscribers
+// Append response reader — demuxes watermarks by stream_id to subscribers
 // ---------------------------------------------------------------------------
 
-async fn record_response_reader(
+async fn append_response_reader(
     endpoint: String,
-    mut stream: tonic::Streaming<RecordEventsResponse>,
+    mut stream: tonic::Streaming<AppendEventsResponse>,
     subscribers: Arc<DashMap<i64, watch::Sender<i64>>>,
 ) {
     let reason = loop {
@@ -288,28 +288,28 @@ async fn record_response_reader(
                         endpoint = %endpoint,
                         stream_id = resp.stream_id,
                         code = resp.code,
-                        "record_response_reader: non-ok response"
+                        "append_response_reader: non-ok response"
                     );
                 }
             }
             Ok(None) => break "ss ended".to_string(),
             Err(e) => {
-                warn!(endpoint = %endpoint, error = %e, "record_response_reader: error");
+                warn!(endpoint = %endpoint, error = %e, "append_response_reader: error");
                 break e.to_string();
             }
         }
     };
-    warn!(endpoint = %endpoint, reason = %reason, "record_response_reader: ended");
+    warn!(endpoint = %endpoint, reason = %reason, "append_response_reader: ended");
 }
 
 // ---------------------------------------------------------------------------
-// Fetch response reader — demuxes fetch responses by stream_id to subscribers
+// Read response reader — demuxes read responses by stream_id to subscribers
 // ---------------------------------------------------------------------------
 
-async fn fetch_response_reader(
+async fn read_response_reader(
     endpoint: String,
-    mut stream: tonic::Streaming<FetchEventsResponse>,
-    subscribers: Arc<DashMap<i64, mpsc::Sender<Result<FetchEventsResponse, LyraError>>>>,
+    mut stream: tonic::Streaming<ReadEventsResponse>,
+    subscribers: Arc<DashMap<i64, mpsc::Sender<Result<ReadEventsResponse, LyraError>>>>,
 ) {
     let reason = loop {
         match stream.message().await {
@@ -325,7 +325,7 @@ async fn fetch_response_reader(
                             warn!(
                                 endpoint = %endpoint,
                                 stream_id = stream_id,
-                                "fetch subscriber full, dropping response"
+                                "read subscriber full, dropping response"
                             );
                         }
                     }
@@ -333,7 +333,7 @@ async fn fetch_response_reader(
             }
             Ok(None) => break "ss ended".to_string(),
             Err(e) => {
-                warn!(endpoint = %endpoint, error = %e, "fetch_response_reader: error");
+                warn!(endpoint = %endpoint, error = %e, "read_response_reader: error");
                 break e.to_string();
             }
         }
@@ -345,5 +345,5 @@ async fn fetch_response_reader(
             .try_send(Err(LyraError::Transport(reason.clone())));
     }
     subscribers.clear();
-    warn!(endpoint = %endpoint, reason = %reason, "fetch_response_reader: ended");
+    warn!(endpoint = %endpoint, reason = %reason, "read_response_reader: ended");
 }

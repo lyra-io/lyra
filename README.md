@@ -12,7 +12,7 @@
 
 ## Features
 
-- **Streaming API** - Simple `record` and `fetch` operations
+- **Streaming API** - Simple `append` and `read` operations
 - **Key-based compaction** - Retain latest value per key for changelog and state snapshot workloads
 - **Secondary offset** - Look up events by both primary offset and secondary index
 - **Transactions** - Atomic writes across multiple keys

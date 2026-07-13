@@ -8,7 +8,7 @@ use catalog::error::CatalogError;
 use catalog::{CatalogRef, Versioned};
 use futures_util::future::{join_all, select_all};
 use lyra_proto::pb_catalog::{Segment, StreamMeta, UnitInfo};
-use lyra_proto::pb_ext::{RecordEventsRequest, RecordEventsRequestItem};
+use lyra_proto::pb_ext::{AppendEventsRequest, AppendEventsRequestItem};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 const EMPTY_UNITS: VecDeque<UnitInfo> = VecDeque::new();
 
-struct RecordRequest {
+struct AppendRequest {
     event: UserEvent,
     reply: oneshot::Sender<Result<Offset, LyraError>>,
 }
@@ -47,7 +47,7 @@ struct InflightBatch {
 
 struct StateMachineInner {
     stream_id: i64,
-    record_tx: mpsc::Sender<RecordRequest>,
+    append_tx: mpsc::Sender<AppendRequest>,
     cancel: CancellationToken,
     task: sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -81,14 +81,14 @@ impl StateMachine {
         let max_batch_size = options.max_batch_size;
         let linger = options.linger;
         let cancel = CancellationToken::new();
-        let (record_tx, record_rx) = mpsc::channel::<RecordRequest>(options.max_inflight);
+        let (append_tx, append_rx) = mpsc::channel::<AppendRequest>(options.max_inflight);
 
         recover(&mut state).await?;
         let stream_id = state.meta.stream_id;
 
         let task = tokio::spawn(run(
             state,
-            record_rx,
+            append_rx,
             cancel.clone(),
             max_batch_size,
             linger,
@@ -97,7 +97,7 @@ impl StateMachine {
         Ok(Self {
             inner: Arc::new(StateMachineInner {
                 stream_id,
-                record_tx,
+                append_tx,
                 cancel,
                 task: sync::Mutex::new(Some(task)),
             }),
@@ -108,11 +108,11 @@ impl StateMachine {
         self.inner.stream_id
     }
 
-    pub async fn record(&self, event: UserEvent) -> Result<Offset, LyraError> {
+    pub async fn append(&self, event: UserEvent) -> Result<Offset, LyraError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
-            .record_tx
-            .send(RecordRequest {
+            .append_tx
+            .send(AppendRequest {
                 event,
                 reply: reply_tx,
             })
@@ -426,12 +426,12 @@ async fn get_or_init_last_segment(
 
 async fn run(
     mut state: State,
-    mut record_rx: mpsc::Receiver<RecordRequest>,
+    mut append_rx: mpsc::Receiver<AppendRequest>,
     cancel: CancellationToken,
     max_batch_size: usize,
     linger: Duration,
 ) {
-    let mut batch: Vec<RecordRequest> = Vec::with_capacity(max_batch_size);
+    let mut batch: Vec<AppendRequest> = Vec::with_capacity(max_batch_size);
     let mut inflight: VecDeque<InflightBatch> = VecDeque::new();
     let mut linger_tick = tokio::time::interval(linger);
 
@@ -455,7 +455,7 @@ async fn run(
                 handle_watermark_changed(&mut state, &mut inflight, lra);
             }
 
-            count = record_rx.recv_many(&mut batch, max_batch_size) => {
+            count = append_rx.recv_many(&mut batch, max_batch_size) => {
                 if count == 0 {
                     continue;
                 }
@@ -497,7 +497,7 @@ fn handle_watermark_changed(state: &mut State, inflight: &mut VecDeque<InflightB
         let batch = inflight.pop_front().unwrap();
         for (offset, tx) in batch.callbacks {
             if tx.send(Ok(Offset(offset))).is_err() {
-                warn!(offset = offset, "record callback failed");
+                warn!(offset = offset, "append callback failed");
             }
         }
     }
@@ -511,7 +511,7 @@ fn handle_watermark_changed(state: &mut State, inflight: &mut VecDeque<InflightB
 fn prepare_batch(
     state: &mut State,
     events: Vec<UserEvent>,
-) -> (Vec<RecordEventsRequestItem>, Vec<i64>) {
+) -> (Vec<AppendEventsRequestItem>, Vec<i64>) {
     let mut items = Vec::with_capacity(events.len());
     let mut offsets = Vec::with_capacity(events.len());
 
@@ -534,7 +534,7 @@ fn prepare_batch(
             schema_id: 0,
         };
 
-        let item = RecordEventsRequestItem {
+        let item = AppendEventsRequestItem {
             event: Some(proto_event),
             trunc: state.needs_trunc,
             lra: state.meta.lra,
@@ -550,7 +550,7 @@ fn prepare_batch(
 
 async fn flush_batch(
     state: &mut State,
-    batch: &mut Vec<RecordRequest>,
+    batch: &mut Vec<AppendRequest>,
     inflight: &mut VecDeque<InflightBatch>,
 ) {
     let mut events = Vec::with_capacity(batch.len());
@@ -562,13 +562,13 @@ async fn flush_batch(
 
     let (items, offsets) = prepare_batch(state, events);
     let max_offset = *offsets.last().unwrap();
-    let request = RecordEventsRequest { items };
+    let request = AppendEventsRequest { items };
 
     broadcast(state, |pool, unit, timeout| {
         let request = request.clone();
         async move {
             let result = match pool.get_or_connect(&unit.address) {
-                Ok(conn) => conn.send_record_with_retry(request, timeout).await,
+                Ok(conn) => conn.send_append_with_retry(request, timeout).await,
                 Err(e) => Err(LyraError::Transport(e.to_string())),
             };
             (unit, result)
@@ -588,16 +588,16 @@ async fn flush_batch(
 // ---------------------------------------------------------------------------
 
 async fn update_segment(state: &mut State, new_ensemble: &[UnitInfo]) -> Result<(), LyraError> {
-    let has_records = state.lrs >= state.segment_start_offset;
+    let has_appends = state.lrs >= state.segment_start_offset;
     let segment = Segment {
         ensemble: new_ensemble.to_vec(),
-        start_offset: if has_records {
+        start_offset: if has_appends {
             state.meta.lra + 1
         } else {
             state.segment_start_offset
         },
     };
-    let expected_version = if has_records {
+    let expected_version = if has_appends {
         -1
     } else {
         state.segment_version

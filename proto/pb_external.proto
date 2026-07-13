@@ -32,7 +32,7 @@ message Event {
   int64 schema_id = 7;
 }
 
-message FetchEventsRequest {
+message ReadEventsRequest {
   int64 stream_id = 1;
   int64 start_offset = 2;
   int64 end_offset = 3;
@@ -46,7 +46,7 @@ enum ChunkType {
 }
 
 // streaming
-message FetchEventsResponse {
+message ReadEventsResponse {
   StatusCode code = 1;
   ChunkType type = 2;
   int64 stream_id = 3;
@@ -55,17 +55,17 @@ message FetchEventsResponse {
 }
 
 // batching operations
-message RecordEventsRequest {
-  repeated RecordEventsRequestItem items = 1;
+message AppendEventsRequest {
+  repeated AppendEventsRequestItem items = 1;
 }
 
-message RecordEventsRequestItem {
+message AppendEventsRequestItem {
   Event event = 1;
   bool trunc = 2;
   int64 lra = 3;
 }
 
-message RecordEventsResponse {
+message AppendEventsResponse {
   StatusCode code = 1;
   int64 commit_offset = 2;
   int64 stream_id = 3;
@@ -73,7 +73,7 @@ message RecordEventsResponse {
 }
 
 service Lyra {
-  rpc Record(stream RecordEventsRequest) returns (stream RecordEventsResponse);
-  rpc Fetch(stream FetchEventsRequest) returns (stream FetchEventsResponse);
+  rpc Append(stream AppendEventsRequest) returns (stream AppendEventsResponse);
+  rpc Read(stream ReadEventsRequest) returns (stream ReadEventsResponse);
   rpc Fence(FenceRequest) returns (FenceResponse);
 }

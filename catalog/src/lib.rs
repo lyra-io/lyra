@@ -117,7 +117,7 @@ pub trait Catalog: Send + Sync {
         offset: i64,
     ) -> Result<Option<Versioned<Segment>>, CatalogError>;
 
-    async fn stream_fetch_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError>;
+    async fn stream_get_or_insert(&self, name: &str) -> Result<StreamMeta, CatalogError>;
 
     async fn stream_new_term(&self, name: &str) -> Result<StreamMeta, CatalogError>;
 

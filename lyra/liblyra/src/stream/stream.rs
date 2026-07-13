@@ -2,7 +2,7 @@ use super::cursor::EventStream;
 use super::state_machine::StateMachine;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::LyraError;
-use crate::{Event as UserEvent, FetchOptions, Offset, StartPosition, StreamOptions};
+use crate::{Event as UserEvent, Offset, ReadOptions, StartPosition, StreamOptions};
 use catalog::CatalogRef;
 use std::sync::Arc;
 use tracing::info;
@@ -78,16 +78,16 @@ impl Stream {
         self.inner.stream_id
     }
 
-    pub async fn record(&self, event: UserEvent) -> Result<Offset, LyraError> {
+    pub async fn append(&self, event: UserEvent) -> Result<Offset, LyraError> {
         let sm = self
             .inner
             .state_machine
             .as_ref()
             .ok_or_else(|| LyraError::Internal("stream is read-only".into()))?;
-        sm.record(event).await
+        sm.append(event).await
     }
 
-    pub async fn fetch(&self, options: FetchOptions) -> Result<EventStream, LyraError> {
+    pub async fn read(&self, options: ReadOptions) -> Result<EventStream, LyraError> {
         let start_offset = match options.start {
             StartPosition::Earliest => 1,
             StartPosition::Latest => {
@@ -102,7 +102,7 @@ impl Stream {
             StartPosition::Offset(offset) => offset,
             StartPosition::Index { .. } => {
                 return Err(LyraError::Internal(
-                    "index-based fetch not yet implemented".into(),
+                    "index-based read not yet implemented".into(),
                 ));
             }
         };

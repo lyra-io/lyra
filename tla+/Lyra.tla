@@ -43,16 +43,16 @@ Terminology:
   - Segment: A contiguous range of offsets within a stream, associated
     with a fixed ensemble of units.
   - Term: An integer epoch for fencing. Incremented on leader change.
-  - LRS: Last Record Sent - the highest offset sent by the stream client.
-  - LRA: Last Record Acked - the highest contiguous offset acknowledged
+  - LRS: Last Append Sent - the highest offset sent by the stream client.
+  - LRA: Last Append Acked - the highest contiguous offset acknowledged
     by all units in the ensemble (commit point).
 
 ***************************************************************************)
 
 CONSTANTS
     \* Message types
-    RecordEventRequest,
-    RecordEventResponse,
+    AppendEventRequest,
+    AppendEventResponse,
     FenceRequest,
     FenceResponse,
 
@@ -102,7 +102,7 @@ vars == << units, catalogs, message_channel, streams,
 \* Offset domain for events
 EventOffsets == 1..(Cardinality(Events) + Cardinality(Streams))
 
-\* A single event record
+\* A single event append
 Event == [offset: EventOffsets, data: Events]
 
 NullEvent == [offset |-> 0, data |-> Null]
@@ -153,7 +153,7 @@ StreamState == [
     term                      : Nat,
     segments                  : Seq(Segment),
     writable_segment          : Segment \cup {Null},
-    inflight_record_event_reqs : SUBSET InflightEvent,
+    inflight_append_event_reqs : SUBSET InflightEvent,
     status                    : StreamStatus,
     lrs                       : Nat,
     lra                       : Nat,
@@ -248,16 +248,16 @@ OpenNewStream(tid) ==
 
 
 (***************************************************************************)
-(* ACTION: RECORD EVENT (Write)                                            *)
+(* ACTION: APPEND EVENT (Write)                                            *)
 (*                                                                         *)
 (* The stream client sends a new event to ALL units in the current       *)
 (* ensemble. Every unit must receive and ack the event.                    *)
 (***************************************************************************)
 
-\* Construct record requests for each unit in the ensemble
-MakeRecordRequests(stream, event, ensemble, trunc) ==
+\* Construct append requests for each unit in the ensemble
+MakeAppendRequests(stream, event, ensemble, trunc) ==
     {[
-        type        |-> RecordEventRequest,
+        type        |-> AppendEventRequest,
         unit        |-> unit,
         stream_id |-> stream.id,
         event       |-> event,
@@ -266,10 +266,10 @@ MakeRecordRequests(stream, event, ensemble, trunc) ==
         trunc       |-> trunc
     ] : unit \in ensemble}
 
-\* Construct a record response
-MakeRecordResponse(req) ==
+\* Construct an append response
+MakeAppendResponse(req) ==
     [
-        type        |-> RecordEventResponse,
+        type        |-> AppendEventResponse,
         unit        |-> req.unit,
         stream_id |-> req.stream_id,
         event       |-> req.event,
@@ -277,7 +277,7 @@ MakeRecordResponse(req) ==
         code        |-> Ok
     ]
 
-StreamRecordEvent(tid) ==
+StreamAppendEvent(tid) ==
     LET stream == streams[tid]
     IN
         /\ stream.status = StreamStatusOpen
@@ -289,12 +289,12 @@ StreamRecordEvent(tid) ==
                event   == [offset |-> stream.lrs + 1, data |-> payload]
            IN
             /\ UCSendToEnsemble(
-                   MakeRecordRequests(stream, event,
+                   MakeAppendRequests(stream, event,
                        stream.writable_segment.ensemble, FALSE))
             /\ streams' = [streams EXCEPT ![tid] =
                 [@ EXCEPT
                     !.lrs = stream.lrs + 1,
-                    !.inflight_record_event_reqs = @ \cup {[
+                    !.inflight_append_event_reqs = @ \cup {[
                         event      |-> event,
                         segment_id |-> stream.writable_segment.id,
                         ensemble   |-> stream.writable_segment.ensemble
@@ -305,9 +305,9 @@ StreamRecordEvent(tid) ==
 
 
 (***************************************************************************)
-(* ACTION: UNIT HANDLES RECORD REQUEST                                     *)
+(* ACTION: UNIT HANDLES APPEND REQUEST                                     *)
 (*                                                                         *)
-(* A unit receives a record request. It checks the term: if the request    *)
+(* A unit receives a append request. It checks the term: if the request    *)
 (* term >= unit's term, it accepts and stores the event. If the request    *)
 (* has trunc=TRUE, it deletes all events with higher offsets (used during  *)
 (* reconciliation to clean up dirty entries from old terms).               *)
@@ -316,16 +316,16 @@ StreamRecordEvent(tid) ==
 \* Ensure we process the earliest pending request first (per unit/stream)
 IsEarliestRequest(message) ==
     ~\E other \in DOMAIN message_channel :
-        /\ other.type = RecordEventRequest
+        /\ other.type = AppendEventRequest
         /\ message_channel[other] >= 1
         /\ other.term = message.term
         /\ other.stream_id = message.stream_id
         /\ other.unit = message.unit
         /\ other.event.offset < message.event.offset
 
-UnitHandleRecordRequest ==
+UnitHandleAppendRequest ==
     \E message \in DOMAIN message_channel :
-        /\ message.type = RecordEventRequest
+        /\ message.type = AppendEventRequest
         /\ message_channel[message] >= 1
         /\ IsEarliestRequest(message)
         \* Term check: accept if unit's term <= request's term
@@ -353,24 +353,24 @@ UnitHandleRecordRequest ==
                     stream_term   |-> new_term,
                     stream_lra    |-> new_lra
                ]]
-            /\ UCConsumeAndSend(message, MakeRecordResponse(message))
+            /\ UCConsumeAndSend(message, MakeAppendResponse(message))
             /\ UNCHANGED << streams, catalogs, sent_events, acked_events >>
 
 
 (***************************************************************************)
-(* ACTION: STREAM HANDLES RECORD RESPONSE                                *)
+(* ACTION: STREAM HANDLES APPEND RESPONSE                                  *)
 (*                                                                         *)
 (* The stream client processes ack responses. An event is committed       *)
 (* (LRA advances) only when ALL units in the ensemble have acknowledged    *)
 (* it.                                                                     *)
 (***************************************************************************)
 
-StreamHandleRecordResponse(tid) ==
+StreamHandleAppendResponse(tid) ==
     LET stream == streams[tid]
     IN
         /\ stream.status = StreamStatusOpen
         /\ \E message \in DOMAIN message_channel :
-            /\ message.type = RecordEventResponse
+            /\ message.type = AppendEventResponse
             /\ message_channel[message] >= 1
             /\ message.stream_id = tid
             /\ message.code = Ok
@@ -378,7 +378,7 @@ StreamHandleRecordResponse(tid) ==
             /\ message.unit \in stream.writable_segment.ensemble
             \* Process responses in offset order
             /\ ~\E other \in DOMAIN message_channel :
-                /\ other.type = RecordEventResponse
+                /\ other.type = AppendEventResponse
                 /\ message_channel[other] >= 1
                 /\ other.stream_id = tid
                 /\ other.term = message.term
@@ -394,8 +394,8 @@ StreamHandleRecordResponse(tid) ==
                     [stream EXCEPT
                         !.acked = acked,
                         !.lra   = IF lra > @ THEN lra ELSE @,
-                        !.inflight_record_event_reqs =
-                            {op \in stream.inflight_record_event_reqs :
+                        !.inflight_append_event_reqs =
+                            {op \in stream.inflight_append_event_reqs :
                                  op.event.offset > lra}
                     ]]
                 /\ acked_events' =
@@ -407,19 +407,19 @@ StreamHandleRecordResponse(tid) ==
 
 
 (***************************************************************************)
-(* ACTION: RETRY INFLIGHT RECORD EVENT                                     *)
+(* ACTION: RETRY INFLIGHT APPEND EVENT                                     *)
 (*                                                                         *)
-(* Resend a record request to units that haven't acked yet. Handles        *)
+(* Resend a append request to units that haven't acked yet. Handles        *)
 (* transient message loss.                                                 *)
 (***************************************************************************)
 
-StreamRetryInflightRecordEvent(tid) ==
+StreamRetryInflightAppendEvent(tid) ==
     LET stream == streams[tid]
     IN
         /\ stream.status = StreamStatusOpen
-        /\ \E req \in stream.inflight_record_event_reqs :
+        /\ \E req \in stream.inflight_append_event_reqs :
             \* Retry the earliest inflight per segment
-            /\ ~\E other \in stream.inflight_record_event_reqs :
+            /\ ~\E other \in stream.inflight_append_event_reqs :
                 /\ other.segment_id = req.segment_id
                 /\ other.ensemble = req.ensemble
                 /\ other.event.offset < req.event.offset
@@ -435,11 +435,11 @@ StreamRetryInflightRecordEvent(tid) ==
                IN
                 /\ target_units # {}
                 /\ UCSendToEnsemble(
-                       MakeRecordRequests(stream, req.event,
+                       MakeAppendRequests(stream, req.event,
                                           target_units, FALSE))
                 /\ streams' = [streams EXCEPT ![tid] =
                     [stream EXCEPT
-                        !.inflight_record_event_reqs =
+                        !.inflight_append_event_reqs =
                             (@ \ {req}) \cup {replaced_req}
                     ]]
                 /\ UNCHANGED << units, catalogs, sent_events, acked_events >>
@@ -456,7 +456,7 @@ StreamRetryInflightRecordEvent(tid) ==
 \* Check if a message to this unit has been lost
 HasFailureMessage(stream, failure_unit) ==
     \E message \in DOMAIN message_channel :
-        /\ message.type \in {RecordEventRequest, RecordEventResponse}
+        /\ message.type \in {AppendEventRequest, AppendEventResponse}
         /\ message_channel[message] = -1
         /\ message.stream_id = stream.id
         /\ message.unit = failure_unit
@@ -465,7 +465,7 @@ HasFailureMessage(stream, failure_unit) ==
 \* Remove all messages related to failed units
 CleanupFailureMessages(stream, failure_units) ==
     LET NeedClear(m) ==
-        /\ m.type \in {RecordEventRequest, RecordEventResponse}
+        /\ m.type \in {AppendEventRequest, AppendEventResponse}
         /\ m.stream_id = stream.id
         /\ m.unit \in failure_units
         /\ m.term = stream.term
@@ -604,7 +604,7 @@ StreamStartReconciliation(tid) ==
                     !.reconciliation_ensemble = ensemble,
                     !.fenced                  = {},
                     !.reconciliation_lra      = 0,
-                    !.inflight_record_event_reqs = {},
+                    !.inflight_append_event_reqs = {},
                     !.acked                   = [offset \in EventOffsets |-> {}],
                     !.lrs                     = 0,
                     !.lra                     = 0
@@ -800,7 +800,7 @@ InitStream(tid) == [
     term                       |-> 0,
     segments                   |-> <<>>,
     writable_segment           |-> Null,
-    inflight_record_event_reqs  |-> {},
+    inflight_append_event_reqs  |-> {},
     status                     |-> Null,
     lrs                        |-> 0,
     lra                        |-> 0,
@@ -842,14 +842,14 @@ Init ==
 
 Next ==
     \* Unit-side actions
-    \/ UnitHandleRecordRequest
+    \/ UnitHandleAppendRequest
     \/ UnitHandleFenceRequest
     \* Stream-side actions
     \/ \E tid \in Streams :
         \/ OpenNewStream(tid)
-        \/ StreamRecordEvent(tid)
-        \/ StreamHandleRecordResponse(tid)
-        \/ StreamRetryInflightRecordEvent(tid)
+        \/ StreamAppendEvent(tid)
+        \/ StreamHandleAppendResponse(tid)
+        \/ StreamRetryInflightAppendEvent(tid)
         \/ StreamEnsembleChange(tid)
         \/ StreamStartReconciliation(tid)
         \/ StreamHandleFenceResponse(tid)

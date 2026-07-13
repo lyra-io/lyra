@@ -4,8 +4,8 @@ use futures_util::{Stream, StreamExt};
 use lyra_proto::pb_ext::lyra_server::Lyra;
 use lyra_proto::pb_ext::lyra_server::LyraServer;
 use lyra_proto::pb_ext::{
-    ChunkType, FenceRequest, FenceResponse, FetchEventsRequest, FetchEventsResponse,
-    RecordEventsRequest, RecordEventsResponse, StatusCode,
+    AppendEventsRequest, AppendEventsResponse, ChunkType, FenceRequest, FenceResponse,
+    ReadEventsRequest, ReadEventsResponse, StatusCode,
 };
 use prost::Message;
 use std::collections::VecDeque;
@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
 const RESPONSE_BUFFER: usize = 4;
-const FETCH_CHUNK_SIZE: usize = 1024;
+const READ_CHUNK_SIZE: usize = 1024;
 
 #[derive(Clone)]
 pub struct GrpcService {
@@ -80,16 +80,16 @@ impl GrpcService {
         self.storage.shutdown().await;
     }
 
-    fn record_stream_context(&self) -> RecordStreamContext {
-        RecordStreamContext {
+    fn append_stream_context(&self) -> AppendStreamContext {
+        AppendStreamContext {
             storage: self.storage.clone(),
             context: self.context.clone(),
             inflight_capacity: self.inflight_capacity,
         }
     }
 
-    fn fetch_stream_context(&self) -> FetchStreamContext {
-        FetchStreamContext {
+    fn read_stream_context(&self) -> ReadStreamContext {
+        ReadStreamContext {
             storage: self.storage.clone(),
             context: self.context.clone(),
         }
@@ -118,38 +118,38 @@ pub fn spawn_server(options: ServerOptions, service: GrpcService) -> JoinHandle<
 
 #[tonic::async_trait]
 impl Lyra for GrpcService {
-    type RecordStream = BoxStream<RecordEventsResponse>;
+    type AppendStream = BoxStream<AppendEventsResponse>;
 
-    async fn record(
+    async fn append(
         &self,
-        request: Request<Streaming<RecordEventsRequest>>,
-    ) -> Result<Response<Self::RecordStream>, Status> {
+        request: Request<Streaming<AppendEventsRequest>>,
+    ) -> Result<Response<Self::AppendStream>, Status> {
         let (tx, rx) = mpsc::channel(RESPONSE_BUFFER);
-        self.spawn_stream(run_record_stream(
+        self.spawn_stream(run_append_stream(
             request.into_inner(),
             tx,
-            self.record_stream_context(),
+            self.append_stream_context(),
         ));
 
         let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(output_stream) as Self::RecordStream))
+        Ok(Response::new(Box::pin(output_stream) as Self::AppendStream))
     }
 
-    type FetchStream = BoxStream<FetchEventsResponse>;
+    type ReadStream = BoxStream<ReadEventsResponse>;
 
-    async fn fetch(
+    async fn read(
         &self,
-        request: Request<Streaming<FetchEventsRequest>>,
-    ) -> Result<Response<Self::FetchStream>, Status> {
+        request: Request<Streaming<ReadEventsRequest>>,
+    ) -> Result<Response<Self::ReadStream>, Status> {
         let (tx, rx) = mpsc::channel(RESPONSE_BUFFER);
-        self.spawn_stream(run_fetch_stream(
+        self.spawn_stream(run_read_stream(
             request.into_inner(),
             tx,
-            self.fetch_stream_context(),
+            self.read_stream_context(),
         ));
 
         let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(Box::pin(output_stream) as Self::FetchStream))
+        Ok(Response::new(Box::pin(output_stream) as Self::ReadStream))
     }
 
     async fn fence(
@@ -173,7 +173,7 @@ impl Lyra for GrpcService {
 }
 
 #[derive(Clone)]
-struct RecordStreamContext {
+struct AppendStreamContext {
     storage: Arc<dyn Storage>,
     context: CancellationToken,
     inflight_capacity: usize,
@@ -187,7 +187,7 @@ struct InflightWrite {
 }
 
 struct BatchAck {
-    response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
+    response_tx: mpsc::Sender<Result<AppendEventsResponse, Status>>,
     stream_id: i64,
     term: i64,
     state: AsyncMutex<BatchAckState>,
@@ -201,7 +201,7 @@ struct BatchAckState {
 
 impl BatchAck {
     fn new(
-        response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
+        response_tx: mpsc::Sender<Result<AppendEventsResponse, Status>>,
         stream_id: i64,
         term: i64,
         item_count: usize,
@@ -228,7 +228,7 @@ impl BatchAck {
             state.remaining = state.remaining.saturating_sub(1);
             if state.remaining == 0 {
                 state.completed = true;
-                Some(Ok(RecordEventsResponse {
+                Some(Ok(AppendEventsResponse {
                     code: StatusCode::Ok.into(),
                     commit_offset: state.max_offset,
                     stream_id: self.stream_id,
@@ -255,34 +255,34 @@ impl BatchAck {
         self.send_completion(response).await;
     }
 
-    async fn send_completion(&self, response: Result<RecordEventsResponse, Status>) {
+    async fn send_completion(&self, response: Result<AppendEventsResponse, Status>) {
         let _ = self.response_tx.send(response).await;
     }
 }
 
-async fn run_record_stream<S>(
+async fn run_append_stream<S>(
     stream: S,
-    response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
-    context: RecordStreamContext,
+    response_tx: mpsc::Sender<Result<AppendEventsResponse, Status>>,
+    context: AppendStreamContext,
 ) where
-    S: Stream<Item = Result<RecordEventsRequest, Status>> + Send + Unpin + 'static,
+    S: Stream<Item = Result<AppendEventsRequest, Status>> + Send + Unpin + 'static,
 {
     let (inflight_tx, inflight_rx) = mpsc::channel(context.inflight_capacity);
     let synced_watch = context.storage.watch_synced();
     let receive_loop =
-        receive_record_requests(stream, response_tx.clone(), inflight_tx, context.clone());
+        receive_append_requests(stream, response_tx.clone(), inflight_tx, context.clone());
     let sync_loop =
-        sync_record_inflight(inflight_rx, context.storage, context.context, synced_watch);
+        sync_append_inflight(inflight_rx, context.storage, context.context, synced_watch);
     tokio::join!(receive_loop, sync_loop);
 }
 
-async fn receive_record_requests<S>(
+async fn receive_append_requests<S>(
     mut stream: S,
-    response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
+    response_tx: mpsc::Sender<Result<AppendEventsResponse, Status>>,
     inflight_tx: mpsc::Sender<InflightWrite>,
-    context: RecordStreamContext,
+    context: AppendStreamContext,
 ) where
-    S: Stream<Item = Result<RecordEventsRequest, Status>> + Unpin,
+    S: Stream<Item = Result<AppendEventsRequest, Status>> + Unpin,
 {
     loop {
         let request = tokio::select! {
@@ -295,7 +295,7 @@ async fn receive_record_requests<S>(
                 if response_tx.is_closed() {
                     break;
                 }
-                enqueue_record_batch(
+                enqueue_append_batch(
                     request,
                     response_tx.clone(),
                     inflight_tx.clone(),
@@ -312,17 +312,17 @@ async fn receive_record_requests<S>(
     }
 }
 
-async fn enqueue_record_batch(
-    request: RecordEventsRequest,
-    response_tx: mpsc::Sender<Result<RecordEventsResponse, Status>>,
+async fn enqueue_append_batch(
+    request: AppendEventsRequest,
+    response_tx: mpsc::Sender<Result<AppendEventsResponse, Status>>,
     inflight_tx: mpsc::Sender<InflightWrite>,
-    context: RecordStreamContext,
+    context: AppendStreamContext,
 ) {
     let item_count = request.items.len();
 
     if item_count == 0 {
         let _ = response_tx
-            .send(Err(Status::invalid_argument("empty record batch")))
+            .send(Err(Status::invalid_argument("empty append batch")))
             .await;
         return;
     }
@@ -336,7 +336,7 @@ async fn enqueue_record_batch(
             Some(event) => event,
             None => {
                 let _ = response_tx
-                    .send(Err(Status::invalid_argument("record item missing event")))
+                    .send(Err(Status::invalid_argument("append item missing event")))
                     .await;
                 return;
             }
@@ -346,7 +346,7 @@ async fn enqueue_record_batch(
             if stream_id != event.stream_id || batch_term != Some(event.term) {
                 let _ = response_tx
                     .send(Err(Status::invalid_argument(
-                        "record batch must contain one stream and term",
+                        "append batch must contain one stream and term",
                     )))
                     .await;
                 return;
@@ -358,7 +358,7 @@ async fn enqueue_record_batch(
 
         if let Err(current_term) = context.storage.check_term(event.stream_id, event.term) {
             let _ = response_tx
-                .send(Ok(RecordEventsResponse {
+                .send(Ok(AppendEventsResponse {
                     code: StatusCode::InvalidTerm.into(),
                     commit_offset: -1,
                     stream_id: event.stream_id,
@@ -378,13 +378,13 @@ async fn enqueue_record_batch(
     for (event, trunc) in writes {
         let permit = tokio::select! {
             _ = context.context.cancelled() => {
-                ack.fail_status(Status::cancelled("record stream cancelled")).await;
+                ack.fail_status(Status::cancelled("append stream cancelled")).await;
                 return;
             }
             permit = inflight_tx.reserve() => match permit {
                 Ok(permit) => permit,
                 Err(_) => {
-                    ack.fail_status(Status::unavailable("record stream closed")).await;
+                    ack.fail_status(Status::unavailable("append stream closed")).await;
                     return;
                 }
             },
@@ -393,7 +393,7 @@ async fn enqueue_record_batch(
         let encoded = event.encode_to_vec();
         let wal_offset = tokio::select! {
             _ = context.context.cancelled() => {
-                ack.fail_status(Status::cancelled("record stream cancelled")).await;
+                ack.fail_status(Status::cancelled("append stream cancelled")).await;
                 return;
             }
             result = context.storage.append(encoded) => match result {
@@ -414,7 +414,7 @@ async fn enqueue_record_batch(
     }
 }
 
-async fn sync_record_inflight(
+async fn sync_append_inflight(
     mut inflight_rx: mpsc::Receiver<InflightWrite>,
     storage: Arc<dyn Storage>,
     context: CancellationToken,
@@ -475,7 +475,7 @@ async fn drain_synced_writes(
         let trunc = write.trunc;
         tokio::select! {
             _ = context.cancelled() => {
-                write.ack.fail_status(Status::cancelled("record stream cancelled")).await;
+                write.ack.fail_status(Status::cancelled("append stream cancelled")).await;
                 return false;
             }
             _ = storage.apply_write(write.event, trunc) => {}
@@ -491,7 +491,7 @@ async fn fail_pending_and_close(
     inflight_rx: &mut mpsc::Receiver<InflightWrite>,
 ) {
     inflight_rx.close();
-    let status = Status::cancelled("record stream cancelled");
+    let status = Status::cancelled("append stream cancelled");
     fail_pending_writes(pending, status.clone()).await;
     while let Some(write) = inflight_rx.recv().await {
         write.ack.fail_status(status.clone()).await;
@@ -505,17 +505,17 @@ async fn fail_pending_writes(pending: &mut VecDeque<InflightWrite>, status: Stat
 }
 
 #[derive(Clone)]
-struct FetchStreamContext {
+struct ReadStreamContext {
     storage: Arc<dyn Storage>,
     context: CancellationToken,
 }
 
-async fn run_fetch_stream<S>(
+async fn run_read_stream<S>(
     mut stream: S,
-    response_tx: mpsc::Sender<Result<FetchEventsResponse, Status>>,
-    context: FetchStreamContext,
+    response_tx: mpsc::Sender<Result<ReadEventsResponse, Status>>,
+    context: ReadStreamContext,
 ) where
-    S: Stream<Item = Result<FetchEventsRequest, Status>> + Send + Unpin + 'static,
+    S: Stream<Item = Result<ReadEventsRequest, Status>> + Send + Unpin + 'static,
 {
     loop {
         let request = tokio::select! {
@@ -529,7 +529,7 @@ async fn run_fetch_stream<S>(
                     break;
                 }
                 if let Err(status) =
-                    handle_fetch_request(request, response_tx.clone(), context.clone()).await
+                    handle_read_request(request, response_tx.clone(), context.clone()).await
                 {
                     let _ = response_tx.send(Err(status)).await;
                     break;
@@ -544,14 +544,14 @@ async fn run_fetch_stream<S>(
     }
 }
 
-async fn handle_fetch_request(
-    request: FetchEventsRequest,
-    response_tx: mpsc::Sender<Result<FetchEventsResponse, Status>>,
-    context: FetchStreamContext,
+async fn handle_read_request(
+    request: ReadEventsRequest,
+    response_tx: mpsc::Sender<Result<ReadEventsResponse, Status>>,
+    context: ReadStreamContext,
 ) -> Result<(), Status> {
     if request.end_offset < request.start_offset {
         return Err(Status::invalid_argument(
-            "fetch end_offset must be greater than or equal to start_offset",
+            "read end_offset must be greater than or equal to start_offset",
         ));
     }
 
@@ -562,9 +562,9 @@ async fn handle_fetch_request(
         .map_err(|error| Status::internal(error.to_string()))?;
 
     if events.is_empty() {
-        send_fetch_response(
+        send_read_response(
             &response_tx,
-            FetchEventsResponse {
+            ReadEventsResponse {
                 code: StatusCode::Ok.into(),
                 r#type: ChunkType::Full.into(),
                 stream_id: request.stream_id,
@@ -577,8 +577,8 @@ async fn handle_fetch_request(
         return Ok(());
     }
 
-    let chunk_count = events.len().div_ceil(FETCH_CHUNK_SIZE);
-    for (index, chunk) in events.chunks(FETCH_CHUNK_SIZE).enumerate() {
+    let chunk_count = events.len().div_ceil(READ_CHUNK_SIZE);
+    for (index, chunk) in events.chunks(READ_CHUNK_SIZE).enumerate() {
         let chunk_type = if chunk_count == 1 {
             ChunkType::Full
         } else if index == 0 {
@@ -593,9 +593,9 @@ async fn handle_fetch_request(
             .map(|event| event.offset + 1)
             .unwrap_or(request.start_offset);
 
-        send_fetch_response(
+        send_read_response(
             &response_tx,
-            FetchEventsResponse {
+            ReadEventsResponse {
                 code: StatusCode::Ok.into(),
                 r#type: chunk_type.into(),
                 stream_id: request.stream_id,
@@ -610,15 +610,15 @@ async fn handle_fetch_request(
     Ok(())
 }
 
-async fn send_fetch_response(
-    response_tx: &mpsc::Sender<Result<FetchEventsResponse, Status>>,
-    response: FetchEventsResponse,
+async fn send_read_response(
+    response_tx: &mpsc::Sender<Result<ReadEventsResponse, Status>>,
+    response: ReadEventsResponse,
     context: &CancellationToken,
 ) -> Result<(), Status> {
     tokio::select! {
-        _ = context.cancelled() => Err(Status::cancelled("fetch stream cancelled")),
+        _ = context.cancelled() => Err(Status::cancelled("read stream cancelled")),
         result = response_tx.send(Ok(response)) => result
-            .map_err(|_| Status::cancelled("fetch response stream closed")),
+            .map_err(|_| Status::cancelled("read response stream closed")),
     }
 }
 
@@ -628,7 +628,7 @@ mod tests {
     use crate::storage::wal::WalOptions;
     use crate::storage::{Storage, UnitStorage};
     use futures_util::StreamExt;
-    use lyra_proto::pb_ext::{Event, RecordEventsRequestItem, lyra_client::LyraClient};
+    use lyra_proto::pb_ext::{AppendEventsRequestItem, Event, lyra_client::LyraClient};
     use tempfile::tempdir;
 
     fn event(stream_id: i64, offset: i64, payload: &[u8]) -> Event {
@@ -656,31 +656,31 @@ mod tests {
         )
     }
 
-    async fn collect_fetch(
+    async fn collect_read(
         storage: Arc<dyn Storage>,
-        requests: Vec<FetchEventsRequest>,
-    ) -> Vec<Result<FetchEventsResponse, Status>> {
+        requests: Vec<ReadEventsRequest>,
+    ) -> Vec<Result<ReadEventsResponse, Status>> {
         let (tx, rx) = mpsc::channel(RESPONSE_BUFFER);
-        let context = FetchStreamContext {
+        let context = ReadStreamContext {
             storage,
             context: CancellationToken::new(),
         };
         let request_stream = tokio_stream::iter(requests.into_iter().map(Ok));
-        run_fetch_stream(request_stream, tx, context).await;
+        run_read_stream(request_stream, tx, context).await;
         ReceiverStream::new(rx).collect().await
     }
 
     #[tokio::test]
-    async fn fetch_returns_events_in_requested_range() {
+    async fn read_returns_events_in_requested_range() {
         let storage = test_storage().await;
         storage.apply_write(event(7, 1, b"a"), false).await;
         storage.apply_write(event(7, 2, b"b"), false).await;
         storage.apply_write(event(7, 3, b"c"), false).await;
         storage.apply_write(event(8, 1, b"other"), false).await;
 
-        let responses = collect_fetch(
+        let responses = collect_read(
             storage,
-            vec![FetchEventsRequest {
+            vec![ReadEventsRequest {
                 stream_id: 7,
                 start_offset: 2,
                 end_offset: 4,
@@ -704,12 +704,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_empty_range_returns_full_empty_response() {
+    async fn read_empty_range_returns_full_empty_response() {
         let storage = test_storage().await;
 
-        let responses = collect_fetch(
+        let responses = collect_read(
             storage,
-            vec![FetchEventsRequest {
+            vec![ReadEventsRequest {
                 stream_id: 7,
                 start_offset: 10,
                 end_offset: 20,
@@ -726,12 +726,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_rejects_invalid_range() {
+    async fn read_rejects_invalid_range() {
         let storage = test_storage().await;
 
-        let responses = collect_fetch(
+        let responses = collect_read(
             storage,
-            vec![FetchEventsRequest {
+            vec![ReadEventsRequest {
                 stream_id: 7,
                 start_offset: 20,
                 end_offset: 10,
@@ -745,45 +745,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_then_fetch_round_trips_through_unit_streams() {
+    async fn append_then_read_round_trips_through_unit_streams() {
         let storage = test_storage().await;
-        let (record_tx, record_rx) = mpsc::channel(RESPONSE_BUFFER);
-        let record_cancel = CancellationToken::new();
-        let record_context = RecordStreamContext {
+        let (append_tx, append_rx) = mpsc::channel(RESPONSE_BUFFER);
+        let append_cancel = CancellationToken::new();
+        let append_context = AppendStreamContext {
             storage: storage.clone(),
-            context: record_cancel.clone(),
+            context: append_cancel.clone(),
             inflight_capacity: 16,
         };
-        let record_request = RecordEventsRequest {
-            items: vec![RecordEventsRequestItem {
+        let append_request = AppendEventsRequest {
+            items: vec![AppendEventsRequestItem {
                 event: Some(event(7, 1, b"a")),
                 trunc: false,
                 lra: 0,
             }],
         };
-        let record_stream = tokio_stream::iter(vec![Ok(record_request)]);
+        let append_stream = tokio_stream::iter(vec![Ok(append_request)]);
 
-        let record_handle =
-            tokio::spawn(run_record_stream(record_stream, record_tx, record_context));
+        let append_handle =
+            tokio::spawn(run_append_stream(append_stream, append_tx, append_context));
 
-        let mut record_responses = ReceiverStream::new(record_rx);
-        let record_response =
-            tokio::time::timeout(std::time::Duration::from_secs(5), record_responses.next())
+        let mut append_responses = ReceiverStream::new(append_rx);
+        let append_response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), append_responses.next())
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-        assert_eq!(record_response.code, StatusCode::Ok as i32);
-        assert_eq!(record_response.commit_offset, 1);
-        record_cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(5), record_handle)
+        assert_eq!(append_response.code, StatusCode::Ok as i32);
+        assert_eq!(append_response.commit_offset, 1);
+        append_cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), append_handle)
             .await
             .unwrap()
             .unwrap();
 
-        let fetch_responses = collect_fetch(
+        let read_responses = collect_read(
             storage,
-            vec![FetchEventsRequest {
+            vec![ReadEventsRequest {
                 stream_id: 7,
                 start_offset: 1,
                 end_offset: 2,
@@ -791,15 +791,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(fetch_responses.len(), 1);
-        let fetch_response = fetch_responses.into_iter().next().unwrap().unwrap();
-        assert_eq!(fetch_response.event.len(), 1);
-        assert_eq!(fetch_response.event[0].offset, 1);
-        assert_eq!(fetch_response.event[0].payload.as_deref(), Some(&b"a"[..]));
+        assert_eq!(read_responses.len(), 1);
+        let read_response = read_responses.into_iter().next().unwrap().unwrap();
+        assert_eq!(read_response.event.len(), 1);
+        assert_eq!(read_response.event[0].offset, 1);
+        assert_eq!(read_response.event[0].payload.as_deref(), Some(&b"a"[..]));
     }
 
     #[tokio::test]
-    async fn record_then_fetch_round_trips_over_tonic_service() {
+    async fn append_then_read_round_trips_over_tonic_service() {
         let storage = test_storage().await;
         let context = CancellationToken::new();
         let service = GrpcService::new(context.clone(), storage, 16);
@@ -831,15 +831,15 @@ mod tests {
             .await
             .unwrap();
 
-        let (record_tx, record_rx) = mpsc::channel(4);
-        let mut record_responses = client
-            .record(ReceiverStream::new(record_rx))
+        let (append_tx, append_rx) = mpsc::channel(4);
+        let mut append_responses = client
+            .append(ReceiverStream::new(append_rx))
             .await
             .unwrap()
             .into_inner();
-        record_tx
-            .send(RecordEventsRequest {
-                items: vec![RecordEventsRequestItem {
+        append_tx
+            .send(AppendEventsRequest {
+                items: vec![AppendEventsRequestItem {
                     event: Some(event(7, 1, b"a")),
                     trunc: false,
                     lra: 0,
@@ -848,25 +848,25 @@ mod tests {
             .await
             .unwrap();
 
-        let record_response = tokio::time::timeout(
+        let append_response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            record_responses.message(),
+            append_responses.message(),
         )
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-        assert_eq!(record_response.code, StatusCode::Ok as i32);
-        assert_eq!(record_response.commit_offset, 1);
+        assert_eq!(append_response.code, StatusCode::Ok as i32);
+        assert_eq!(append_response.commit_offset, 1);
 
-        let (fetch_tx, fetch_rx) = mpsc::channel(4);
-        let mut fetch_responses = client
-            .fetch(ReceiverStream::new(fetch_rx))
+        let (read_tx, read_rx) = mpsc::channel(4);
+        let mut read_responses = client
+            .read(ReceiverStream::new(read_rx))
             .await
             .unwrap()
             .into_inner();
-        fetch_tx
-            .send(FetchEventsRequest {
+        read_tx
+            .send(ReadEventsRequest {
                 stream_id: 7,
                 start_offset: 1,
                 end_offset: 2,
@@ -874,17 +874,17 @@ mod tests {
             .await
             .unwrap();
 
-        let fetch_response =
-            tokio::time::timeout(std::time::Duration::from_secs(5), fetch_responses.message())
+        let read_response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_responses.message())
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-        assert_eq!(fetch_response.code, StatusCode::Ok as i32);
-        assert_eq!(fetch_response.r#type, ChunkType::Full as i32);
-        assert_eq!(fetch_response.event.len(), 1);
-        assert_eq!(fetch_response.event[0].offset, 1);
-        assert_eq!(fetch_response.event[0].payload.as_deref(), Some(&b"a"[..]));
+        assert_eq!(read_response.code, StatusCode::Ok as i32);
+        assert_eq!(read_response.r#type, ChunkType::Full as i32);
+        assert_eq!(read_response.event.len(), 1);
+        assert_eq!(read_response.event[0].offset, 1);
+        assert_eq!(read_response.event[0].payload.as_deref(), Some(&b"a"[..]));
 
         service.shutdown().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), server_handle)

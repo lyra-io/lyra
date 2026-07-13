@@ -5,7 +5,7 @@ use crate::error::LyraError;
 use catalog::{Catalog, CatalogRef};
 use futures_util::{Stream, StreamExt};
 use lyra_proto::pb_catalog::Segment;
-use lyra_proto::pb_ext::{ChunkType, FetchEventsRequest};
+use lyra_proto::pb_ext::{ChunkType, ReadEventsRequest};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -105,8 +105,8 @@ impl EventStream {
 
         let conn = Self::pick_conn(pool, &segment.value)?;
 
-        let mut fetch = conn
-            .fetch(FetchEventsRequest {
+        let mut read = conn
+            .read(ReadEventsRequest {
                 stream_id,
                 start_offset: start,
                 end_offset: i64::MAX,
@@ -116,7 +116,7 @@ impl EventStream {
         let position = position.clone();
 
         let stream = async_stream::try_stream! {
-            while let Some(result) = fetch.next().await {
+            while let Some(result) = read.next().await {
                 let response = result?;
                 let is_final = matches!(
                     response.r#type(),
@@ -206,7 +206,7 @@ impl Stream for EventStream {
                     warn!(
                         error = %e,
                         retry = self.retries,
-                        "fetch ss error, reconnecting"
+                        "read ss error, reconnecting"
                     );
                     self.inner = None;
                     continue;
