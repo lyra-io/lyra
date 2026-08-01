@@ -1,2 +1,0 @@
-#[derive(Clone)]
-struct Storage {}

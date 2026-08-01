@@ -52,5 +52,6 @@ libc = "0.2"
 aws-sdk-s3 = "1.82.0"
 aws-config = { version = "1.6.3", features = ["behavior-version-latest"] }
 bytes = "1.10"
+crc32c = "0.6"
 lru = "0.14"
 sysinfo = { version = "0.34", default-features = false, features = ["system"] }
