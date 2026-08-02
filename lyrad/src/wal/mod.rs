@@ -2,6 +2,7 @@ mod error;
 mod format;
 mod options;
 mod recovery;
+mod retention;
 mod runtime;
 
 pub use crate::segment::IoMode;

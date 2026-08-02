@@ -2,6 +2,7 @@ use bytes::Bytes;
 use lyrad::wal::{IoMode, SegmentWal, Wal, WalOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -45,7 +46,8 @@ async fn run_mode(
     options.io_mode = io_mode;
     options.batch_linger = Duration::from_micros(200);
 
-    let wal = match SegmentWal::open(options).await {
+    let (_trim_tx, trim_rx) = watch::channel(None);
+    let wal = match SegmentWal::open(options, trim_rx).await {
         Ok(wal) => wal,
         Err(error) => {
             println!("{label}: SKIPPED ({error})");

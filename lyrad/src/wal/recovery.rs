@@ -1,22 +1,24 @@
 use super::Sequence;
 use super::error::WalError;
 use super::format::{FILE_HEADER_SIZE, WalSegmentScanner};
+use super::retention::{RecoveryLease, Retention, SegmentMetadata};
 use crate::segment::{IoMode, list_segment_files};
 use bytes::Bytes;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct RecoverySummary {
-    pub(crate) earliest_sequence: Option<Sequence>,
     pub(crate) last_sequence: Option<Sequence>,
     pub(crate) last_segment_number: u64,
+    pub(crate) segments: Vec<SegmentMetadata>,
 }
 
 pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoverySummary, WalError> {
     let files = list_segment_files(dir)?;
-    let mut earliest_sequence: Option<Sequence> = None;
     let mut last_sequence: Option<Sequence> = None;
     let mut last_segment_number = 0;
+    let mut segments = Vec::with_capacity(files.len());
 
     for (index, (file_number, path)) in files.iter().enumerate() {
         let is_last = index + 1 == files.len();
@@ -32,6 +34,8 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
             });
         }
 
+        let mut segment_first = None;
+        let mut segment_last = None;
         for record in scanner.by_ref() {
             let (sequence, _) = record?;
             if let Some(previous) = last_sequence {
@@ -50,10 +54,10 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
                         ),
                     });
                 }
-            } else {
-                earliest_sequence = Some(sequence);
             }
             last_sequence = Some(sequence);
+            segment_first = segment_first.or(Some(sequence));
+            segment_last = Some(sequence);
         }
 
         if is_last {
@@ -65,20 +69,27 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
                 file.sync_data()?;
             }
         }
+        segments.push(SegmentMetadata {
+            number: *file_number,
+            path: path.clone(),
+            first_sequence: segment_first,
+            last_sequence: segment_last,
+        });
         last_segment_number = last_segment_number.max(*file_number);
     }
 
     Ok(RecoverySummary {
-        earliest_sequence,
         last_sequence,
         last_segment_number,
+        segments,
     })
 }
 
 pub struct WalRecovery {
-    files: Vec<(u64, PathBuf)>,
+    files: Vec<super::retention::RecoverySegment>,
     file_index: usize,
-    scanner: Option<WalSegmentScanner>,
+    scanner: Option<(u64, WalSegmentScanner)>,
+    lease: RecoveryLease,
     io_mode: IoMode,
     from_sequence: Sequence,
     through_sequence: Option<Sequence>,
@@ -87,15 +98,17 @@ pub struct WalRecovery {
 
 impl WalRecovery {
     pub(crate) fn new(
-        dir: &Path,
+        retention: &Arc<Retention>,
         from_sequence: Sequence,
         through_sequence: Option<Sequence>,
         io_mode: IoMode,
     ) -> Result<Self, WalError> {
+        let (files, lease) = retention.lease_recovery(from_sequence, through_sequence)?;
         Ok(Self {
-            files: list_segment_files(dir)?,
+            files,
             file_index: 0,
             scanner: None,
+            lease,
             io_mode,
             from_sequence,
             through_sequence,
@@ -114,7 +127,8 @@ impl Iterator for WalRecovery {
         let through_sequence = self.through_sequence.unwrap();
 
         loop {
-            if let Some(scanner) = self.scanner.as_mut() {
+            if let Some((segment_number, scanner)) = self.scanner.as_mut() {
+                let segment_number = *segment_number;
                 match scanner.next() {
                     Some(Ok((sequence, payload))) => {
                         if sequence < self.from_sequence {
@@ -122,33 +136,37 @@ impl Iterator for WalRecovery {
                         }
                         if sequence > through_sequence {
                             self.finished = true;
+                            self.lease.release_all();
                             return None;
                         }
                         return Some(Ok((sequence, payload)));
                     }
                     Some(Err(error)) => {
                         self.finished = true;
+                        self.lease.release_all();
                         return Some(Err(error));
                     }
                     None => {
                         self.scanner = None;
+                        self.lease.release_segment(segment_number);
                         continue;
                     }
                 }
             }
 
-            let Some((_, path)) = self.files.get(self.file_index) else {
+            let Some(segment) = self.files.get(self.file_index) else {
                 self.finished = true;
+                self.lease.release_all();
                 return None;
             };
-            let is_last = self.file_index + 1 == self.files.len();
-            match WalSegmentScanner::open(path, is_last, self.io_mode) {
+            match WalSegmentScanner::open(&segment.path, segment.tolerate_tail, self.io_mode) {
                 Ok(scanner) => {
                     self.file_index += 1;
-                    self.scanner = Some(scanner);
+                    self.scanner = Some((segment.number, scanner));
                 }
                 Err(error) => {
                     self.finished = true;
+                    self.lease.release_all();
                     return Some(Err(error));
                 }
             }
