@@ -11,6 +11,7 @@ crc32c = { workspace = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

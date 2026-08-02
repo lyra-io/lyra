@@ -1,27 +1,29 @@
 use super::error::WalError;
 use super::format::{FILE_HEADER_SIZE, encode_batch};
-use super::io::{AlignedBuffer, SegmentFile, list_segment_files, sync_directory};
 use super::options::WalOptions;
-use super::reader::{SegmentWalReader, recover_directory};
+use super::recovery::{WalRecovery, recover_directory};
 use super::{Sequence, Wal};
+use crate::segment::{AlignedBuffer, SegmentFile, sync_directory};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const NO_SEQUENCE: u64 = u64::MAX;
 
 pub struct SegmentWal {
     options: WalOptions,
-    ingress_tx: mpsc::Sender<IngressCommand>,
+    ingress_tx: mpsc::Sender<AppendRequest>,
+    shutdown: CancellationToken,
     durable_sequence: Arc<AtomicU64>,
     earliest_sequence: Arc<AtomicU64>,
     poison: Arc<Mutex<Option<WalError>>>,
-    closed: AtomicBool,
     lifecycle: tokio::sync::RwLock<()>,
     shutdown_lock: tokio::sync::Mutex<()>,
     handles: tokio::sync::Mutex<Option<WorkerHandles>>,
@@ -39,29 +41,11 @@ struct AppendRequest {
     response: oneshot::Sender<Result<Sequence, WalError>>,
 }
 
-enum IngressCommand {
-    Append(AppendRequest),
-    Shutdown(oneshot::Sender<Result<(), WalError>>),
-}
-
-enum WriterCommand {
-    Batch(Vec<AppendRequest>),
-    Shutdown(oneshot::Sender<Result<(), WalError>>),
-}
-
 struct SyncPoint {
     files: Vec<Arc<SegmentFile>>,
     sync_directory: bool,
     through_sequence: Option<Sequence>,
     waiters: Vec<(Sequence, oneshot::Sender<Result<Sequence, WalError>>)>,
-}
-
-enum SyncCommand {
-    Sync(SyncPoint),
-    Shutdown {
-        point: SyncPoint,
-        response: oneshot::Sender<Result<(), WalError>>,
-    },
 }
 
 struct ActiveSegment {
@@ -90,9 +74,11 @@ impl SegmentWal {
         tokio::fs::create_dir_all(&options.dir).await?;
 
         let recovery_dir = options.dir.clone();
-        let recovery = tokio::task::spawn_blocking(move || recover_directory(&recovery_dir))
-            .await
-            .map_err(|error| WalError::Worker(error.to_string()))??;
+        let recovery_io_mode = options.io_mode;
+        let recovery =
+            tokio::task::spawn_blocking(move || recover_directory(&recovery_dir, recovery_io_mode))
+                .await
+                .map_err(|error| WalError::Worker(error.to_string()))??;
         let next_sequence = match recovery.last_sequence {
             Some(sequence) => sequence
                 .checked_add(1)
@@ -105,6 +91,10 @@ impl SegmentWal {
         let durable_sequence = Arc::new(AtomicU64::new(durable));
         let earliest_sequence = Arc::new(AtomicU64::new(earliest));
         let poison = Arc::new(Mutex::new(None));
+        let shutdown = CancellationToken::new();
+        let writer_shutdown = CancellationToken::new();
+        let sync_shutdown = CancellationToken::new();
+        let runtime = Handle::current();
 
         let (ingress_tx, ingress_rx) = mpsc::channel(options.queue_capacity);
         let (writer_tx, writer_rx) = mpsc::channel(8);
@@ -114,7 +104,18 @@ impl SegmentWal {
             let dir = options.dir.clone();
             let durable_sequence = durable_sequence.clone();
             let poison = poison.clone();
-            move || sync_loop(sync_rx, dir, durable_sequence, poison)
+            let sync_shutdown = sync_shutdown.clone();
+            let runtime = runtime.clone();
+            move || {
+                sync_loop(
+                    sync_rx,
+                    dir,
+                    durable_sequence,
+                    poison,
+                    sync_shutdown,
+                    runtime,
+                )
+            }
         });
 
         let writer = tokio::task::spawn_blocking({
@@ -129,12 +130,26 @@ impl SegmentWal {
                 earliest_sequence: earliest_sequence.clone(),
                 poison: poison.clone(),
             };
-            move || writer_loop(writer_rx, sync_tx, state)
+            let writer_shutdown = writer_shutdown.clone();
+            let sync_shutdown = sync_shutdown.clone();
+            let runtime = runtime.clone();
+            move || {
+                writer_loop(
+                    writer_rx,
+                    sync_tx,
+                    state,
+                    writer_shutdown,
+                    sync_shutdown,
+                    runtime,
+                )
+            }
         });
 
         let batcher = tokio::spawn(batcher_loop(
             ingress_rx,
             writer_tx,
+            shutdown.clone(),
+            writer_shutdown,
             options.batch_max_records,
             options.batch_max_bytes,
             options.batch_linger,
@@ -143,10 +158,10 @@ impl SegmentWal {
         Ok(Arc::new(Self {
             options,
             ingress_tx,
+            shutdown,
             durable_sequence,
             earliest_sequence,
             poison,
-            closed: AtomicBool::new(false),
             lifecycle: tokio::sync::RwLock::new(()),
             shutdown_lock: tokio::sync::Mutex::new(()),
             handles: tokio::sync::Mutex::new(Some(WorkerHandles {
@@ -164,17 +179,11 @@ impl SegmentWal {
 
 #[async_trait]
 impl Wal for SegmentWal {
-    type Reader = SegmentWalReader;
+    type Recovery = WalRecovery;
 
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let lifecycle = self.lifecycle.read().await;
-        if payload.len() > self.options.max_record_size {
-            return Err(WalError::PayloadTooLarge {
-                actual: payload.len(),
-                maximum: self.options.max_record_size,
-            });
-        }
-        if self.closed.load(Ordering::Acquire) {
+        if self.shutdown.is_cancelled() {
             return Err(WalError::Closed);
         }
         if let Some(error) = self.current_error() {
@@ -183,22 +192,18 @@ impl Wal for SegmentWal {
 
         let (response, receiver) = oneshot::channel();
         self.ingress_tx
-            .send(IngressCommand::Append(AppendRequest {
+            .send(AppendRequest {
                 payload,
                 sync,
                 response,
-            }))
+            })
             .await
             .map_err(|_| WalError::Closed)?;
         drop(lifecycle);
         receiver.await.map_err(|_| WalError::Closed)?
     }
 
-    async fn new_reader(&self, from_sequence: Sequence) -> Result<Self::Reader, WalError> {
-        if let Some(error) = self.current_error() {
-            return Err(error);
-        }
-
+    fn recover(&self, from_sequence: Sequence) -> Result<Self::Recovery, WalError> {
         let durable = decode_optional_sequence(self.durable_sequence.load(Ordering::Acquire));
         let earliest = decode_optional_sequence(self.earliest_sequence.load(Ordering::Acquire));
         if let Some(earliest) = earliest
@@ -210,11 +215,12 @@ impl Wal for SegmentWal {
             });
         }
 
-        let dir = self.options.dir.clone();
-        let files = tokio::task::spawn_blocking(move || list_segment_files(&dir))
-            .await
-            .map_err(|error| WalError::Worker(error.to_string()))??;
-        Ok(SegmentWalReader::new(files, from_sequence, durable))
+        WalRecovery::new(
+            &self.options.dir,
+            from_sequence,
+            durable,
+            self.options.io_mode,
+        )
     }
 
     async fn shutdown(&self) -> Result<(), WalError> {
@@ -223,130 +229,163 @@ impl Wal for SegmentWal {
         let Some(handles) = handles_guard.take() else {
             return Ok(());
         };
+        drop(handles_guard);
 
         let lifecycle = self.lifecycle.write().await;
-        self.closed.store(true, Ordering::Release);
-        let (response, receiver) = oneshot::channel();
-        let send_result = self
-            .ingress_tx
-            .send(IngressCommand::Shutdown(response))
-            .await;
+        self.shutdown.cancel();
         drop(lifecycle);
-        let result = if send_result.is_err() {
-            Err(WalError::Closed)
-        } else {
-            receiver.await.unwrap_or(Err(WalError::Closed))
-        };
 
+        let mut join_error = None;
         for handle in [handles.batcher, handles.writer, handles.syncer] {
-            handle
-                .await
-                .map_err(|error| WalError::Worker(error.to_string()))?;
+            if let Err(error) = handle.await
+                && join_error.is_none()
+            {
+                join_error = Some(WalError::Worker(error.to_string()));
+            }
         }
-        result
+        if let Some(error) = self.current_error() {
+            return Err(error);
+        }
+        join_error.map_or(Ok(()), Err)
     }
 }
 
 async fn batcher_loop(
-    mut ingress_rx: mpsc::Receiver<IngressCommand>,
-    writer_tx: mpsc::Sender<WriterCommand>,
+    mut ingress_rx: mpsc::Receiver<AppendRequest>,
+    writer_tx: mpsc::Sender<Vec<AppendRequest>>,
+    shutdown: CancellationToken,
+    writer_shutdown: CancellationToken,
     max_records: usize,
     max_bytes: usize,
     linger: std::time::Duration,
 ) {
     let mut pending = None;
+    let mut stopping = false;
     loop {
-        let command = match pending.take() {
-            Some(command) => command,
-            None => match ingress_rx.recv().await {
-                Some(command) => command,
-                None => {
-                    send_internal_shutdown(&writer_tx).await;
-                    return;
+        let first = match pending.take() {
+            Some(request) => Some(request),
+            None if stopping => ingress_rx.recv().await,
+            None => {
+                tokio::select! {
+                    request = ingress_rx.recv() => request,
+                    _ = shutdown.cancelled() => {
+                        stopping = true;
+                        ingress_rx.close();
+                        ingress_rx.recv().await
+                    }
                 }
-            },
-        };
-        let IngressCommand::Append(first) = command else {
-            if let IngressCommand::Shutdown(response) = command {
-                let _ = writer_tx.send(WriterCommand::Shutdown(response)).await;
             }
-            return;
+        };
+        let Some(first) = first else {
+            break;
         };
 
         let mut bytes = first.payload.len();
         let mut batch = vec![first];
         let deadline = tokio::time::Instant::now() + linger;
-        let mut shutdown = None;
-        let mut ingress_closed = false;
 
         while batch.len() < max_records && bytes < max_bytes {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                command = ingress_rx.recv() => {
-                    match command {
-                        Some(IngressCommand::Append(request)) => {
-                            if !batch.is_empty() && bytes + request.payload.len() > max_bytes {
-                                pending = Some(IngressCommand::Append(request));
-                                break;
-                            }
-                            bytes += request.payload.len();
-                            batch.push(request);
-                        }
-                        Some(IngressCommand::Shutdown(response)) => {
-                            shutdown = Some(response);
-                            break;
-                        }
-                        None => {
-                            ingress_closed = true;
-                            break;
-                        },
-                    }
+            let request = if stopping {
+                match ingress_rx.try_recv() {
+                    Ok(request) => Some(request),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = shutdown.cancelled() => {
+                        stopping = true;
+                        ingress_rx.close();
+                        continue;
+                    }
+                    request = ingress_rx.recv() => request,
+                }
+            };
+            let Some(request) = request else {
+                break;
+            };
+            if bytes.saturating_add(request.payload.len()) > max_bytes {
+                pending = Some(request);
+                break;
             }
+            bytes = bytes.saturating_add(request.payload.len());
+            batch.push(request);
         }
 
-        if let Err(error) = writer_tx.send(WriterCommand::Batch(batch)).await {
-            fail_writer_command(error.0, WalError::Worker("WAL writer stopped".into()));
-            if let Some(response) = shutdown {
-                let _ = response.send(Err(WalError::Worker("WAL writer stopped".into())));
+        if let Err(send_error) = writer_tx.send(batch).await {
+            let error = WalError::Worker("WAL writer stopped".into());
+            fail_batch(send_error.0, error.clone());
+            if let Some(request) = pending.take() {
+                let _ = request.response.send(Err(error.clone()));
             }
-            return;
+            ingress_rx.close();
+            while let Some(request) = ingress_rx.recv().await {
+                let _ = request.response.send(Err(error.clone()));
+            }
+            break;
         }
 
-        if let Some(response) = shutdown {
-            let _ = writer_tx.send(WriterCommand::Shutdown(response)).await;
-            return;
-        }
-        if ingress_closed {
-            send_internal_shutdown(&writer_tx).await;
-            return;
+        if stopping && pending.is_none() && ingress_rx.is_empty() {
+            break;
         }
     }
+    writer_shutdown.cancel();
 }
 
-async fn send_internal_shutdown(writer_tx: &mpsc::Sender<WriterCommand>) {
-    let (response, _receiver) = oneshot::channel();
-    let _ = writer_tx.send(WriterCommand::Shutdown(response)).await;
+enum StageEvent<T> {
+    Message(Option<T>),
+    Cancelled,
+}
+
+fn wait_for_stage<T>(
+    runtime: &Handle,
+    receiver: &mut mpsc::Receiver<T>,
+    shutdown: &CancellationToken,
+) -> StageEvent<T> {
+    runtime.block_on(async {
+        tokio::select! {
+            _ = shutdown.cancelled() => StageEvent::Cancelled,
+            message = receiver.recv() => StageEvent::Message(message),
+        }
+    })
 }
 
 fn writer_loop(
-    mut writer_rx: mpsc::Receiver<WriterCommand>,
-    sync_tx: mpsc::Sender<SyncCommand>,
+    mut writer_rx: mpsc::Receiver<Vec<AppendRequest>>,
+    sync_tx: mpsc::Sender<SyncPoint>,
     mut state: WriterState,
+    shutdown: CancellationToken,
+    sync_shutdown: CancellationToken,
+    runtime: Handle,
 ) {
-    while let Some(command) = writer_rx.blocking_recv() {
-        match command {
-            WriterCommand::Batch(batch) => state.write_batch(batch, &sync_tx),
-            WriterCommand::Shutdown(response) => {
-                state.send_shutdown(response, &sync_tx);
-                return;
+    let mut stopping = false;
+    loop {
+        let batch = if stopping {
+            match writer_rx.try_recv() {
+                Ok(batch) => batch,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
-        }
+        } else {
+            match wait_for_stage(&runtime, &mut writer_rx, &shutdown) {
+                StageEvent::Message(Some(batch)) => batch,
+                StageEvent::Message(None) => break,
+                StageEvent::Cancelled => {
+                    stopping = true;
+                    writer_rx.close();
+                    continue;
+                }
+            }
+        };
+        state.write_batch(batch, &sync_tx);
     }
+    state.finish(&sync_tx);
+    sync_shutdown.cancel();
 }
 
 impl WriterState {
-    fn write_batch(&mut self, batch: Vec<AppendRequest>, sync_tx: &mpsc::Sender<SyncCommand>) {
+    fn write_batch(&mut self, batch: Vec<AppendRequest>, sync_tx: &mpsc::Sender<SyncPoint>) {
         if let Some(error) = locked_error(&self.poison) {
             fail_batch(batch, error);
             return;
@@ -400,11 +439,9 @@ impl WriterState {
         }
 
         let point = self.take_sync_point(synced_waiters);
-        if let Err(error) = sync_tx.blocking_send(SyncCommand::Sync(point)) {
+        if let Err(error) = sync_tx.blocking_send(point) {
             let wal_error = WalError::Worker("WAL sync worker stopped".into());
-            if let SyncCommand::Sync(point) = error.0 {
-                fail_waiters(point.waiters, wal_error.clone());
-            }
+            fail_waiters(error.0.waiters, wal_error.clone());
             set_poison(&self.poison, wal_error);
         }
     }
@@ -419,7 +456,8 @@ impl WriterState {
         let should_rotate = {
             let active = self.active.as_ref().unwrap();
             active.offset > FILE_HEADER_SIZE as u64
-                && active.offset + encoded.len() as u64 > self.options.max_segment_size
+                && active.offset.saturating_add(encoded.len() as u64)
+                    > self.options.max_segment_size
         };
         if should_rotate {
             self.active = None;
@@ -472,54 +510,48 @@ impl WriterState {
         }
     }
 
-    fn send_shutdown(
-        &mut self,
-        response: oneshot::Sender<Result<(), WalError>>,
-        sync_tx: &mpsc::Sender<SyncCommand>,
-    ) {
+    fn finish(&mut self, sync_tx: &mpsc::Sender<SyncPoint>) {
         let point = self.take_sync_point(Vec::new());
-        if let Err(error) = sync_tx.blocking_send(SyncCommand::Shutdown { point, response })
-            && let SyncCommand::Shutdown { response, .. } = error.0
-        {
-            let _ = response.send(Err(WalError::Worker("WAL sync worker stopped".into())));
+        if let Err(error) = sync_tx.blocking_send(point) {
+            let wal_error = WalError::Worker("WAL sync worker stopped".into());
+            fail_waiters(error.0.waiters, wal_error.clone());
+            set_poison(&self.poison, wal_error);
         }
     }
 }
 
 fn sync_loop(
-    mut sync_rx: mpsc::Receiver<SyncCommand>,
+    mut sync_rx: mpsc::Receiver<SyncPoint>,
     dir: PathBuf,
     durable_sequence: Arc<AtomicU64>,
     poison: Arc<Mutex<Option<WalError>>>,
+    shutdown: CancellationToken,
+    runtime: Handle,
 ) {
-    while let Some(command) = sync_rx.blocking_recv() {
-        let mut point;
-        let mut shutdown_response = None;
-        match command {
-            SyncCommand::Sync(sync_point) => point = sync_point,
-            SyncCommand::Shutdown {
-                point: sync_point,
-                response,
-            } => {
-                point = sync_point;
-                shutdown_response = Some(response);
+    let mut stopping = false;
+    loop {
+        let mut point = if stopping {
+            match sync_rx.try_recv() {
+                Ok(point) => point,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
-        }
-
-        while shutdown_response.is_none() {
-            let Ok(command) = sync_rx.try_recv() else {
-                break;
-            };
-            match command {
-                SyncCommand::Sync(next) => merge_sync_points(&mut point, next),
-                SyncCommand::Shutdown {
-                    point: next,
-                    response,
-                } => {
-                    merge_sync_points(&mut point, next);
-                    shutdown_response = Some(response);
+        } else {
+            match wait_for_stage(&runtime, &mut sync_rx, &shutdown) {
+                StageEvent::Message(Some(point)) => point,
+                StageEvent::Message(None) => break,
+                StageEvent::Cancelled => {
+                    stopping = true;
+                    sync_rx.close();
+                    continue;
                 }
             }
+        };
+        loop {
+            let Ok(next) = sync_rx.try_recv() else {
+                break;
+            };
+            merge_sync_points(&mut point, next);
         }
 
         let result = if let Some(error) = locked_error(&poison) {
@@ -536,18 +568,10 @@ fn sync_loop(
                 for (sequence, waiter) in point.waiters {
                     let _ = waiter.send(Ok(sequence));
                 }
-                if let Some(response) = shutdown_response {
-                    let _ = response.send(Ok(()));
-                    return;
-                }
             }
             Err(error) => {
                 set_poison(&poison, error.clone());
-                fail_waiters(point.waiters, error.clone());
-                if let Some(response) = shutdown_response {
-                    let _ = response.send(Err(error));
-                    return;
-                }
+                fail_waiters(point.waiters, error);
             }
         }
     }
@@ -574,15 +598,6 @@ fn merge_sync_points(target: &mut SyncPoint, mut next: SyncPoint) {
         (left, right) => left.or(right),
     };
     target.waiters.append(&mut next.waiters);
-}
-
-fn fail_writer_command(command: WriterCommand, error: WalError) {
-    match command {
-        WriterCommand::Batch(batch) => fail_batch(batch, error),
-        WriterCommand::Shutdown(response) => {
-            let _ = response.send(Err(error));
-        }
-    }
 }
 
 fn fail_batch(batch: Vec<AppendRequest>, error: WalError) {

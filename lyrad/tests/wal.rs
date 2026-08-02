@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lyrad::wal::{IoMode, SegmentWal, Wal, WalOptions, WalReader};
+use lyrad::wal::{IoMode, SegmentWal, Wal, WalOptions};
 use std::collections::BTreeSet;
 use std::io::{Seek, Write};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ fn standard_options(path: &std::path::Path) -> WalOptions {
 }
 
 #[tokio::test]
-async fn appends_and_reads_opaque_payloads_by_sequence() {
+async fn appends_and_recovers_opaque_payloads_by_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let wal = SegmentWal::open(standard_options(dir.path()))
         .await
@@ -31,18 +31,21 @@ async fn appends_and_reads_opaque_payloads_by_sequence() {
         2
     );
 
-    let mut reader = wal.new_reader(1).await.unwrap();
-    assert_eq!(reader.read_next().await.unwrap(), Some((1, Bytes::new())));
+    let mut recovery = wal.recover(1).unwrap();
     assert_eq!(
-        reader.read_next().await.unwrap(),
+        recovery.next().transpose().unwrap(),
+        Some((1, Bytes::new()))
+    );
+    assert_eq!(
+        recovery.next().transpose().unwrap(),
         Some((2, Bytes::from_static(b"three")))
     );
-    assert_eq!(reader.read_next().await.unwrap(), None);
+    assert_eq!(recovery.next().transpose().unwrap(), None);
     wal.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn reader_is_a_durable_snapshot() {
+async fn recovery_is_a_durable_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let wal = SegmentWal::open(standard_options(dir.path()))
         .await
@@ -51,24 +54,24 @@ async fn reader_is_a_durable_snapshot() {
     wal.append(Bytes::from_static(b"written"), false)
         .await
         .unwrap();
-    let mut before_sync = wal.new_reader(0).await.unwrap();
-    assert_eq!(before_sync.read_next().await.unwrap(), None);
+    let mut before_sync = wal.recover(0).unwrap();
+    assert_eq!(before_sync.next().transpose().unwrap(), None);
 
     wal.append(Bytes::from_static(b"synced"), true)
         .await
         .unwrap();
-    assert_eq!(before_sync.read_next().await.unwrap(), None);
+    assert_eq!(before_sync.next().transpose().unwrap(), None);
 
-    let mut after_sync = wal.new_reader(0).await.unwrap();
+    let mut after_sync = wal.recover(0).unwrap();
     assert_eq!(
-        after_sync.read_next().await.unwrap(),
+        after_sync.next().transpose().unwrap(),
         Some((0, Bytes::from_static(b"written")))
     );
     assert_eq!(
-        after_sync.read_next().await.unwrap(),
+        after_sync.next().transpose().unwrap(),
         Some((1, Bytes::from_static(b"synced")))
     );
-    assert_eq!(after_sync.read_next().await.unwrap(), None);
+    assert_eq!(after_sync.next().transpose().unwrap(), None);
     wal.shutdown().await.unwrap();
 }
 
@@ -89,13 +92,13 @@ async fn restart_recovers_records_and_continues_sequence() {
             .unwrap(),
         1
     );
-    let mut reader = wal.new_reader(0).await.unwrap();
+    let mut recovery = wal.recover(0).unwrap();
     assert_eq!(
-        reader.read_next().await.unwrap(),
+        recovery.next().transpose().unwrap(),
         Some((0, Bytes::from_static(b"before")))
     );
     assert_eq!(
-        reader.read_next().await.unwrap(),
+        recovery.next().transpose().unwrap(),
         Some((1, Bytes::from_static(b"after")))
     );
     wal.shutdown().await.unwrap();
@@ -125,8 +128,8 @@ async fn restart_discards_an_incomplete_final_record() {
         .unwrap();
 
     let wal = SegmentWal::open(options).await.unwrap();
-    let mut reader = wal.new_reader(0).await.unwrap();
-    assert_eq!(reader.read_next().await.unwrap(), None);
+    let mut recovery = wal.recover(0).unwrap();
+    assert_eq!(recovery.next().transpose().unwrap(), None);
     assert_eq!(
         wal.append(Bytes::from_static(b"replacement"), true)
             .await
@@ -195,10 +198,10 @@ async fn rotates_segment_files_without_changing_sequence_order() {
         .count();
     assert_eq!(segment_count, 4);
 
-    let mut reader = wal.new_reader(0).await.unwrap();
+    let mut recovery = wal.recover(0).unwrap();
     for value in 0..4u8 {
         assert_eq!(
-            reader.read_next().await.unwrap(),
+            recovery.next().transpose().unwrap(),
             Some((value as u64, Bytes::from(vec![value; 128])))
         );
     }
@@ -226,17 +229,17 @@ async fn concurrent_callers_receive_unique_ordered_sequences() {
     }
     assert_eq!(sequences, (0..100).collect());
 
-    let mut reader = wal.new_reader(0).await.unwrap();
+    let mut recovery = wal.recover(0).unwrap();
     for expected in 0..100 {
-        let (sequence, _) = reader.read_next().await.unwrap().unwrap();
+        let (sequence, _) = recovery.next().transpose().unwrap().unwrap();
         assert_eq!(sequence, expected);
     }
-    assert_eq!(reader.read_next().await.unwrap(), None);
+    assert_eq!(recovery.next().transpose().unwrap(), None);
     wal.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn direct_preferred_appends_and_reads_with_fallback() {
+async fn direct_preferred_appends_and_recovers_with_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = standard_options(dir.path());
     options.io_mode = IoMode::DirectPreferred;
@@ -245,9 +248,9 @@ async fn direct_preferred_appends_and_reads_with_fallback() {
     wal.append(Bytes::from_static(b"direct-or-standard"), true)
         .await
         .unwrap();
-    let mut reader = wal.new_reader(0).await.unwrap();
+    let mut recovery = wal.recover(0).unwrap();
     assert_eq!(
-        reader.read_next().await.unwrap(),
+        recovery.next().transpose().unwrap(),
         Some((0, Bytes::from_static(b"direct-or-standard")))
     );
     wal.shutdown().await.unwrap();
@@ -265,17 +268,19 @@ async fn shutdown_is_idempotent_and_rejects_new_appends() {
 }
 
 #[tokio::test]
-async fn oversized_payload_is_rejected_without_consuming_sequence() {
+async fn large_payload_is_fragmented_without_a_record_size_limit() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = standard_options(dir.path());
-    options.max_record_size = 3;
-    let wal = SegmentWal::open(options).await.unwrap();
+    options.max_segment_size = 64 * 1024;
+    let wal = SegmentWal::open(options.clone()).await.unwrap();
+    let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
 
-    assert!(wal.append(Bytes::from_static(b"four"), true).await.is_err());
-    assert_eq!(
-        wal.append(Bytes::from_static(b"ok"), true).await.unwrap(),
-        0
-    );
+    assert_eq!(wal.append(payload.clone(), true).await.unwrap(), 0);
+    wal.shutdown().await.unwrap();
+
+    let wal = SegmentWal::open(options).await.unwrap();
+    let mut recovery = wal.recover(0).unwrap();
+    assert_eq!(recovery.next().transpose().unwrap(), Some((0, payload)));
     wal.shutdown().await.unwrap();
 }
 
@@ -290,9 +295,9 @@ async fn shutdown_syncs_records_requested_as_written() {
     wal.shutdown().await.unwrap();
 
     let wal = SegmentWal::open(options).await.unwrap();
-    let mut reader = wal.new_reader(0).await.unwrap();
+    let mut recovery = wal.recover(0).unwrap();
     assert_eq!(
-        reader.read_next().await.unwrap(),
+        recovery.next().transpose().unwrap(),
         Some((0, Bytes::from_static(b"written")))
     );
     wal.shutdown().await.unwrap();
@@ -308,7 +313,7 @@ async fn racing_appends_and_shutdown_never_strands_a_caller() {
     for value in 0..100u8 {
         let wal = Arc::clone(&wal);
         appends.push(tokio::spawn(async move {
-            wal.append(Bytes::from(vec![value]), false).await
+            wal.append(Bytes::from(vec![value]), true).await
         }));
     }
 
@@ -317,12 +322,22 @@ async fn racing_appends_and_shutdown_never_strands_a_caller() {
         tokio::spawn(async move { wal.shutdown().await })
     };
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let successful = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut successful = BTreeSet::new();
         for append in appends {
-            let _ = append.await.unwrap();
+            if let Ok(sequence) = append.await.unwrap() {
+                successful.insert(sequence);
+            }
         }
         shutdown.await.unwrap().unwrap();
+        successful
     })
     .await
     .expect("append/shutdown race timed out");
+
+    let mut recovered = BTreeSet::new();
+    for (sequence, _) in wal.recover(0).unwrap().map(Result::unwrap) {
+        recovered.insert(sequence);
+    }
+    assert_eq!(recovered, successful);
 }
