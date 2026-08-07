@@ -2,7 +2,7 @@ use super::Sequence;
 use super::error::WalError;
 use super::format::{FILE_HEADER_SIZE, WalSegmentScanner};
 use super::retention::{RecoveryLease, Retention, SegmentMetadata};
-use crate::segment::{IoMode, list_segment_files};
+use crate::segment::{IoMode, list_segment_files, sync_directory};
 use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +22,19 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
 
     for (index, (file_number, path)) in files.iter().enumerate() {
         let is_last = index + 1 == files.len();
-        let mut scanner = WalSegmentScanner::open(path, is_last, io_mode)?;
+        let mut scanner = match WalSegmentScanner::open(path, is_last, io_mode) {
+            Ok(scanner) => scanner,
+            Err(error) if is_last && matches!(error, WalError::Corruption { .. }) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "discarding torn WAL tail segment header; the segment was never durably linked"
+                );
+                remove_uncommitted_tail(dir, path)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if scanner.segment_number() != *file_number {
             return Err(WalError::Corruption {
                 path: path.clone(),
@@ -83,6 +95,21 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
         last_segment_number,
         segments,
     })
+}
+
+fn remove_uncommitted_tail(dir: &Path, path: &Path) -> Result<(), WalError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(WalError::Io(format!(
+                "failed to remove torn WAL tail segment {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    sync_directory(dir)?;
+    Ok(())
 }
 
 pub struct WalRecovery {

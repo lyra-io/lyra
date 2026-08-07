@@ -168,6 +168,78 @@ async fn restart_discards_an_incomplete_final_record() {
 }
 
 #[tokio::test]
+async fn restart_discards_a_torn_tail_segment_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let wal = open_wal(options.clone()).await.unwrap();
+    wal.append(Bytes::from_static(b"committed"), true)
+        .await
+        .unwrap();
+    wal.shutdown().await.unwrap();
+    assert_eq!(segment_count(dir.path()), 1);
+
+    // Simulate a crash that left a never-synced tail segment with a torn header.
+    let torn = dir.path().join("0000000002.seg");
+    std::fs::write(&torn, b"LYRASEG\0").unwrap();
+
+    let wal = open_wal(options).await.unwrap();
+    assert!(
+        !torn.exists(),
+        "torn tail segment header should be discarded on recovery"
+    );
+    assert_eq!(
+        wal.append(Bytes::from_static(b"after"), true)
+            .await
+            .unwrap(),
+        1
+    );
+    let mut recovery = wal.recover(0).unwrap();
+    assert_eq!(
+        recovery.next().transpose().unwrap(),
+        Some((0, Bytes::from_static(b"committed")))
+    );
+    assert_eq!(
+        recovery.next().transpose().unwrap(),
+        Some((1, Bytes::from_static(b"after")))
+    );
+    assert_eq!(recovery.next().transpose().unwrap(), None);
+    wal.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn torn_header_in_a_non_final_segment_is_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = standard_options(dir.path());
+    options.max_segment_size = 8192;
+    let wal = open_wal(options.clone()).await.unwrap();
+    wal.append(Bytes::from(vec![0x11; 128]), true)
+        .await
+        .unwrap();
+    wal.append(Bytes::from(vec![0x22; 128]), true)
+        .await
+        .unwrap();
+    wal.shutdown().await.unwrap();
+
+    let mut files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 2);
+    let mut first = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&files[0])
+        .unwrap();
+    first.write_all(b"GARBAGE!!").unwrap();
+    first.sync_data().unwrap();
+
+    match open_wal(options).await {
+        Ok(_) => panic!("torn non-final segment header unexpectedly opened"),
+        Err(error) => assert!(error.to_string().contains("magic")),
+    }
+}
+
+#[tokio::test]
 async fn corruption_in_a_non_final_segment_is_fatal() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = standard_options(dir.path());
