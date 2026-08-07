@@ -13,7 +13,11 @@ pub(crate) use format::encode_file_header;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
+    /// Prefer unbuffered direct I/O, falling back to standard I/O when the
+    /// platform or filesystem does not support it.
     DirectPreferred,
+    /// Require unbuffered direct I/O; opening fails when unsupported.
     DirectRequired,
+    /// Use the operating system page cache for all I/O.
     Standard,
 }

@@ -112,6 +112,12 @@ fn remove_uncommitted_tail(dir: &Path, path: &Path) -> Result<(), WalError> {
     Ok(())
 }
 
+/// Streaming iterator over durable WAL records returned by
+/// [`Wal::recover`](super::Wal::recover).
+///
+/// While it exists, it holds retention leases on the segments it may still
+/// read, so concurrent trimming defers deletion until iteration finishes or
+/// the iterator is dropped.
 pub struct WalRecovery {
     files: Vec<super::retention::RecoverySegment>,
     file_index: usize,

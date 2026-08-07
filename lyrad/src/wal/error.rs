@@ -2,21 +2,27 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum WalError {
+    /// The supplied [`WalOptions`](super::WalOptions) failed validation.
     #[error("invalid WAL options: {0}")]
     InvalidOptions(String),
 
+    /// The WAL was shut down or is no longer accepting appends.
     #[error("WAL is closed")]
     Closed,
 
+    /// An operating-system level I/O failure.
     #[error("WAL I/O error: {0}")]
     Io(String),
 
+    /// On-disk data failed validation and cannot be safely recovered.
     #[error("WAL corruption in {path}: {message}")]
     Corruption { path: PathBuf, message: String },
 
+    /// `requested` has been trimmed; only `earliest` and later are available.
     #[error("WAL sequence {requested} has expired; earliest available sequence is {earliest}")]
     SequenceExpired { requested: u64, earliest: u64 },
 
+    /// An internal background worker failed.
     #[error("WAL worker failed: {0}")]
     Worker(String),
 }

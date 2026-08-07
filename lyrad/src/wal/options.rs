@@ -4,14 +4,23 @@ use std::time::Duration;
 
 const MIB: u64 = 1024 * 1024;
 
+/// Configuration for opening a [`SegmentWal`](super::SegmentWal).
 #[derive(Debug, Clone)]
 pub struct WalOptions {
+    /// Directory where segment files are stored and recovered from.
     pub dir: PathBuf,
+    /// I/O mode used for segment reads and writes.
     pub io_mode: IoMode,
+    /// Maximum size in bytes of a segment file before the WAL rotates to a
+    /// new one. A single record may exceed this limit.
     pub max_segment_size: u64,
+    /// Maximum number of appends coalesced into one batch write.
     pub batch_max_records: usize,
+    /// Maximum payload bytes coalesced into one batch write.
     pub batch_max_bytes: usize,
+    /// How long the batcher waits to coalesce more appends before flushing.
     pub batch_linger: Duration,
+    /// Capacity of the inbound append queue; bounds memory under bursts.
     pub queue_capacity: usize,
 }
 

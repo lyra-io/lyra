@@ -18,6 +18,18 @@ use tokio_util::sync::CancellationToken;
 
 const NO_SEQUENCE: u64 = u64::MAX;
 
+/// A segmented, batching write-ahead log backed by `lyra`'s segment format.
+///
+/// Appends flow through a small pipeline: a tokio task batches them by count,
+/// size, and linger; a blocking writer assigns sequences and writes them to
+/// aligned segment files; a blocking syncer flushes files and directories and
+/// completes sync appends; and a blocking trimmer removes segments that are
+/// fully durable and no longer needed per the trim watch.
+///
+/// Recovery is performed synchronously in [`SegmentWal::open`]: segment
+/// headers and record checksums are validated, torn tails are truncated or
+/// discarded, and sequence continuity is verified before the WAL accepts new
+/// appends.
 pub struct SegmentWal {
     options: WalOptions,
     ingress_tx: mpsc::Sender<AppendRequest>,
@@ -69,6 +81,12 @@ struct WriterState {
 }
 
 impl SegmentWal {
+    /// Opens (or recovers) the WAL at `options.dir`.
+    ///
+    /// `trim_rx` carries the largest sequence the caller is willing to lose to
+    /// trimming; segments whose records are all durable and at or below that
+    /// sequence are removed. The current value is applied on open, and every
+    /// update triggers a trim pass.
     pub async fn open(
         options: WalOptions,
         mut trim_rx: watch::Receiver<Option<Sequence>>,
