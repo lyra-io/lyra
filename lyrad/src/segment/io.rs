@@ -356,15 +356,8 @@ fn read_exact_at(file: &File, mut bytes: &mut [u8], mut position: u64) -> std::i
 }
 
 fn cleanup_failed_create(path: &Path) -> Result<(), SegmentError> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.len() == 0 => {
-            std::fs::remove_file(path)?;
-            Ok(())
-        }
-        Ok(_) => Err(SegmentError::Io(format!(
-            "direct I/O probe left non-empty file {}",
-            path.display()
-        ))),
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
