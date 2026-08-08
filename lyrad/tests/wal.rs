@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lyrad::wal::{IoMode, Wal, WalError, WalOptions, WalWriter};
+use lyrad::wal::{IoMode, Log, Wal, WalError, WalOptions};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +10,8 @@ fn standard_options(path: &std::path::Path) -> WalOptions {
     options
 }
 
-async fn open_wal(options: WalOptions) -> Result<Arc<WalWriter>, WalError> {
-    WalWriter::open(options).await
+async fn open_wal(options: WalOptions) -> Result<Arc<Log>, WalError> {
+    Log::open(options).await
 }
 
 fn segment_count(path: &std::path::Path) -> usize {

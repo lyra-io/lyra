@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 /// the writer channel is busy; a blocking writer assigns sequences and writes
 /// them to aligned segment files; a blocking syncer flushes files and
 /// directories and completes sync appends.
-pub struct WalWriter {
+pub struct Log {
     ingress_tx: mpsc::Sender<AppendRequest>,
     shutdown: CancellationToken,
     poison: Arc<Mutex<Option<WalError>>>,
@@ -63,7 +63,7 @@ struct WriterState {
     poison: Arc<Mutex<Option<WalError>>>,
 }
 
-impl WalWriter {
+impl Log {
     /// Opens the WAL at `options.dir`.
     ///
     /// The directory must be empty: segment files from a previous run are not
@@ -149,7 +149,7 @@ impl WalWriter {
 }
 
 #[async_trait]
-impl Wal for WalWriter {
+impl Wal for Log {
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let lifecycle = self.lifecycle.read().await;
         if self.shutdown.is_cancelled() {

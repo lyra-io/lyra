@@ -5,7 +5,7 @@ mod runtime;
 pub use crate::segment::IoMode;
 pub use error::WalError;
 pub use options::WalOptions;
-pub use runtime::WalWriter;
+pub use runtime::Log;
 
 use async_trait::async_trait;
 use bytes::Bytes;
