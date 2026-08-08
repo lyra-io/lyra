@@ -1,8 +1,9 @@
 use super::error::WalError;
-use super::format::{FILE_HEADER_SIZE, encode_batch};
 use super::options::WalOptions;
 use super::{Sequence, Wal};
-use crate::segment::{AlignedBuffer, SegmentFile, list_segment_files, sync_directory};
+use crate::segment::{
+    AlignedBuffer, FILE_HEADER_SIZE, SegmentFile, SegmentRecord, list_segment_files, sync_directory,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -459,6 +460,23 @@ impl WriterState {
             set_poison(&self.poison, wal_error);
         }
     }
+}
+
+fn encode_batch(
+    segment_number: u64,
+    start_offset: u64,
+    records: &[(Sequence, Bytes)],
+) -> Result<Vec<u8>, WalError> {
+    let prefixes: Vec<_> = records
+        .iter()
+        .map(|(sequence, _)| sequence.to_le_bytes())
+        .collect();
+    let records: Vec<_> = records
+        .iter()
+        .zip(&prefixes)
+        .map(|((_, payload), prefix)| SegmentRecord { prefix, payload })
+        .collect();
+    crate::segment::encode_batch(segment_number, start_offset, &records).map_err(Into::into)
 }
 
 fn sync_loop(
