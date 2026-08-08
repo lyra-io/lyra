@@ -13,6 +13,16 @@ use bytes::Bytes;
 /// A monotonically increasing WAL record identifier.
 pub type Sequence = u64;
 
+/// Shared WAL runtime state, kept behind a lock on [`Log`].
+///
+/// Internal: appends take a read lock to judge whether the log is still
+/// healthy before enqueuing, and the background worker takes a write lock to
+/// record the first fatal error.
+#[derive(Default)]
+pub(crate) struct WalState {
+    pub(crate) error: Option<WalError>,
+}
+
 /// A write-ahead log that assigns an ordered [`Sequence`] to every appended
 /// payload.
 #[async_trait]
