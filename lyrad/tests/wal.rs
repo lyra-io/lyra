@@ -7,7 +7,6 @@ use std::time::Duration;
 fn standard_options(path: &std::path::Path) -> WalOptions {
     let mut options = WalOptions::new(path);
     options.io_mode = IoMode::Standard;
-    options.batch_linger = Duration::from_millis(1);
     options
 }
 

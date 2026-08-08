@@ -43,7 +43,6 @@ async fn run_mode(
     let dir = tempfile::tempdir().expect("create benchmark directory");
     let mut options = WalOptions::new(dir.path());
     options.io_mode = io_mode;
-    options.batch_linger = Duration::from_micros(200);
 
     let wal = match SegmentWal::open(options).await {
         Ok(wal) => wal,

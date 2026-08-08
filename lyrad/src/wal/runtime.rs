@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 /// A segmented, batching write-ahead log backed by `lyra`'s segment format.
 ///
-/// Appends flow through a small pipeline: a tokio task batches them by count,
-/// size, and linger; a blocking writer assigns sequences and writes them to
-/// aligned segment files; a blocking syncer flushes files and directories and
-/// completes sync appends.
+/// Appends flow through a small pipeline: a tokio task coalesces them while
+/// the writer channel is busy; a blocking writer assigns sequences and writes
+/// them to aligned segment files; a blocking syncer flushes files and
+/// directories and completes sync appends.
 pub struct SegmentWal {
     ingress_tx: mpsc::Sender<AppendRequest>,
     shutdown: CancellationToken,
@@ -127,9 +127,6 @@ impl SegmentWal {
             writer_tx,
             shutdown.clone(),
             writer_shutdown,
-            options.batch_max_records,
-            options.batch_max_bytes,
-            options.batch_linger,
         ));
 
         Ok(Arc::new(Self {
@@ -207,24 +204,18 @@ async fn batcher_loop(
     writer_tx: mpsc::Sender<Vec<AppendRequest>>,
     shutdown: CancellationToken,
     writer_shutdown: CancellationToken,
-    max_records: usize,
-    max_bytes: usize,
-    linger: std::time::Duration,
 ) {
-    let mut pending = None;
     let mut stopping = false;
     loop {
-        let first = match pending.take() {
-            Some(request) => Some(request),
-            None if stopping => ingress_rx.recv().await,
-            None => {
-                tokio::select! {
-                    request = ingress_rx.recv() => request,
-                    _ = shutdown.cancelled() => {
-                        stopping = true;
-                        ingress_rx.close();
-                        ingress_rx.recv().await
-                    }
+        let first = if stopping {
+            ingress_rx.recv().await
+        } else {
+            tokio::select! {
+                request = ingress_rx.recv() => request,
+                _ = shutdown.cancelled() => {
+                    stopping = true;
+                    ingress_rx.close();
+                    ingress_rx.recv().await
                 }
             }
         };
@@ -232,45 +223,26 @@ async fn batcher_loop(
             break;
         };
 
-        let mut bytes = first.payload.len();
         let mut batch = vec![first];
-        let deadline = tokio::time::Instant::now() + linger;
-
-        while batch.len() < max_records && bytes < max_bytes {
-            let request = if stopping {
-                match ingress_rx.try_recv() {
-                    Ok(request) => Some(request),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+        loop {
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    stopping = true;
+                    ingress_rx.close();
+                    break;
                 }
-            } else {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    _ = shutdown.cancelled() => {
-                        stopping = true;
-                        ingress_rx.close();
-                        continue;
-                    }
-                    request = ingress_rx.recv() => request,
-                }
+                _ = writer_tx.reserve() => break,
+                request = ingress_rx.recv() => request,
             };
-            let Some(request) = request else {
+            let Some(request) = result else {
                 break;
             };
-            if bytes.saturating_add(request.payload.len()) > max_bytes {
-                pending = Some(request);
-                break;
-            }
-            bytes = bytes.saturating_add(request.payload.len());
             batch.push(request);
         }
 
         if let Err(send_error) = writer_tx.send(batch).await {
             let error = WalError::Worker("WAL writer stopped".into());
             fail_batch(send_error.0, error.clone());
-            if let Some(request) = pending.take() {
-                let _ = request.response.send(Err(error.clone()));
-            }
             ingress_rx.close();
             while let Some(request) = ingress_rx.recv().await {
                 let _ = request.response.send(Err(error.clone()));
@@ -278,7 +250,7 @@ async fn batcher_loop(
             break;
         }
 
-        if stopping && pending.is_none() && ingress_rx.is_empty() {
+        if stopping && ingress_rx.is_empty() {
             break;
         }
     }

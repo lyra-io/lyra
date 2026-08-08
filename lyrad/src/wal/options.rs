@@ -1,6 +1,5 @@
 use crate::segment::IoMode;
 use std::path::PathBuf;
-use std::time::Duration;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -14,12 +13,6 @@ pub struct WalOptions {
     /// Maximum size in bytes of a segment file before the WAL rotates to a
     /// new one. A single record may exceed this limit.
     pub max_segment_size: u64,
-    /// Maximum number of appends coalesced into one batch write.
-    pub batch_max_records: usize,
-    /// Maximum payload bytes coalesced into one batch write.
-    pub batch_max_bytes: usize,
-    /// How long the batcher waits to coalesce more appends before flushing.
-    pub batch_linger: Duration,
     /// Capacity of the inbound append queue; bounds memory under bursts.
     pub queue_capacity: usize,
 }
@@ -36,12 +29,6 @@ impl WalOptions {
         if self.max_segment_size == 0 {
             return Err("max_segment_size must be greater than zero");
         }
-        if self.batch_max_records == 0 {
-            return Err("batch_max_records must be greater than zero");
-        }
-        if self.batch_max_bytes == 0 {
-            return Err("batch_max_bytes must be greater than zero");
-        }
         if self.queue_capacity == 0 {
             return Err("queue_capacity must be greater than zero");
         }
@@ -55,9 +42,6 @@ impl Default for WalOptions {
             dir: PathBuf::from("/tmp/lyra-wal"),
             io_mode: IoMode::DirectPreferred,
             max_segment_size: 64 * MIB,
-            batch_max_records: 1024,
-            batch_max_bytes: MIB as usize,
-            batch_linger: Duration::from_micros(200),
             queue_capacity: 4096,
         }
     }
