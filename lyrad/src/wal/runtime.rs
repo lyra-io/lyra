@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 /// appends into batches and writes them to aligned segment files; a blocking
 /// syncer flushes files and directories and completes sync appends.
 pub struct Log {
-    ingress_tx: mpsc::Sender<AppendRequest>,
-    shutdown: CancellationToken,
+    inflight_tx: mpsc::Sender<AppendRequest>,
+    context: CancellationToken,
     poison: Arc<Mutex<Option<WalError>>>,
     lifecycle: tokio::sync::RwLock<()>,
     shutdown_lock: tokio::sync::Mutex<()>,
@@ -78,19 +78,19 @@ impl Log {
             });
         }
         let poison = Arc::new(Mutex::new(None));
-        let shutdown = CancellationToken::new();
-        let sync_shutdown = CancellationToken::new();
+        let context = CancellationToken::new();
+        let sync_context = CancellationToken::new();
         let runtime = Handle::current();
 
-        let (ingress_tx, ingress_rx) = mpsc::channel(options.queue_capacity);
+        let (inflight_tx, inflight_rx) = mpsc::channel(options.queue_capacity);
         let (sync_tx, sync_rx) = mpsc::channel(8);
 
         let syncer = tokio::task::spawn_blocking({
             let dir = options.dir.clone();
             let poison = poison.clone();
-            let sync_shutdown = sync_shutdown.clone();
+            let sync_context = sync_context.clone();
             let runtime = runtime.clone();
-            move || sync_loop(sync_rx, dir, poison, sync_shutdown, runtime)
+            move || sync_loop(sync_rx, dir, poison, sync_context, runtime)
         });
 
         let writer = tokio::task::spawn_blocking({
@@ -103,24 +103,24 @@ impl Log {
                 directory_dirty: false,
                 poison: poison.clone(),
             };
-            let writer_shutdown = shutdown.clone();
-            let sync_shutdown = sync_shutdown.clone();
+            let writer_context = context.clone();
+            let sync_context = sync_context.clone();
             let runtime = runtime.clone();
             move || {
                 writer_loop(
-                    ingress_rx,
+                    inflight_rx,
                     sync_tx,
                     state,
-                    writer_shutdown,
-                    sync_shutdown,
+                    writer_context,
+                    sync_context,
                     runtime,
                 )
             }
         });
 
         Ok(Arc::new(Self {
-            ingress_tx,
-            shutdown,
+            inflight_tx,
+            context,
             poison,
             lifecycle: tokio::sync::RwLock::new(()),
             shutdown_lock: tokio::sync::Mutex::new(()),
@@ -137,7 +137,7 @@ impl Log {
 impl Wal for Log {
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let lifecycle = self.lifecycle.read().await;
-        if self.shutdown.is_cancelled() {
+        if self.context.is_cancelled() {
             return Err(WalError::Closed);
         }
         if let Some(error) = self.current_error() {
@@ -145,7 +145,7 @@ impl Wal for Log {
         }
 
         let (response, receiver) = oneshot::channel();
-        self.ingress_tx
+        self.inflight_tx
             .send(AppendRequest {
                 payload,
                 sync,
@@ -166,7 +166,7 @@ impl Wal for Log {
         drop(handles_guard);
 
         let lifecycle = self.lifecycle.write().await;
-        self.shutdown.cancel();
+        self.context.cancel();
         drop(lifecycle);
 
         let mut join_error = None;
@@ -197,11 +197,11 @@ enum WriterEvent {
 fn wait_for_stage<T>(
     runtime: &Handle,
     receiver: &mut mpsc::Receiver<T>,
-    shutdown: &CancellationToken,
+    context: &CancellationToken,
 ) -> StageEvent<T> {
     runtime.block_on(async {
         tokio::select! {
-            _ = shutdown.cancelled() => StageEvent::Cancelled,
+            _ = context.cancelled() => StageEvent::Cancelled,
             message = receiver.recv() => StageEvent::Message(message),
         }
     })
@@ -212,22 +212,22 @@ fn wait_for_writer_event(
     receiver: &mut mpsc::Receiver<AppendRequest>,
     batch: &mut Vec<AppendRequest>,
     max: usize,
-    shutdown: &CancellationToken,
+    context: &CancellationToken,
 ) -> WriterEvent {
     runtime.block_on(async {
         tokio::select! {
-            _ = shutdown.cancelled() => WriterEvent::Cancelled,
+            _ = context.cancelled() => WriterEvent::Cancelled,
             received = receiver.recv_many(batch, max) => WriterEvent::Batch(received),
         }
     })
 }
 
 fn writer_loop(
-    mut ingress_rx: mpsc::Receiver<AppendRequest>,
+    mut inflight_rx: mpsc::Receiver<AppendRequest>,
     sync_tx: mpsc::Sender<SyncPoint>,
     mut state: WriterState,
-    shutdown: CancellationToken,
-    sync_shutdown: CancellationToken,
+    context: CancellationToken,
+    sync_context: CancellationToken,
     runtime: Handle,
 ) {
     let max_batch = state.options.queue_capacity;
@@ -235,14 +235,14 @@ fn writer_loop(
     loop {
         let mut batch = Vec::new();
         let received = if stopping {
-            runtime.block_on(async { ingress_rx.recv_many(&mut batch, max_batch).await })
+            runtime.block_on(async { inflight_rx.recv_many(&mut batch, max_batch).await })
         } else {
-            match wait_for_writer_event(&runtime, &mut ingress_rx, &mut batch, max_batch, &shutdown)
+            match wait_for_writer_event(&runtime, &mut inflight_rx, &mut batch, max_batch, &context)
             {
                 WriterEvent::Batch(received) => received,
                 WriterEvent::Cancelled => {
                     stopping = true;
-                    ingress_rx.close();
+                    inflight_rx.close();
                     continue;
                 }
             }
@@ -253,7 +253,7 @@ fn writer_loop(
         state.write_batch(batch, &sync_tx);
     }
     state.finish(&sync_tx);
-    sync_shutdown.cancel();
+    sync_context.cancel();
 }
 
 impl WriterState {
@@ -403,7 +403,7 @@ fn sync_loop(
     mut sync_rx: mpsc::Receiver<SyncPoint>,
     dir: PathBuf,
     poison: Arc<Mutex<Option<WalError>>>,
-    shutdown: CancellationToken,
+    context: CancellationToken,
     runtime: Handle,
 ) {
     let mut stopping = false;
@@ -415,7 +415,7 @@ fn sync_loop(
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         } else {
-            match wait_for_stage(&runtime, &mut sync_rx, &shutdown) {
+            match wait_for_stage(&runtime, &mut sync_rx, &context) {
                 StageEvent::Message(Some(point)) => point,
                 StageEvent::Message(None) => break,
                 StageEvent::Cancelled => {
