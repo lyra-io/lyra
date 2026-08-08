@@ -1,21 +1,17 @@
 use super::error::WalError;
 use super::format::{FILE_HEADER_SIZE, encode_batch};
 use super::options::WalOptions;
-use super::recovery::{WalRecovery, recover_directory};
 use super::{Sequence, Wal};
-use crate::segment::{AlignedBuffer, SegmentFile, sync_directory};
+use crate::segment::{AlignedBuffer, SegmentFile, list_segment_files, sync_directory};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-const NO_SEQUENCE: u64 = u64::MAX;
 
 /// A segmented, batching write-ahead log backed by `lyra`'s segment format.
 ///
@@ -23,16 +19,9 @@ const NO_SEQUENCE: u64 = u64::MAX;
 /// size, and linger; a blocking writer assigns sequences and writes them to
 /// aligned segment files; a blocking syncer flushes files and directories and
 /// completes sync appends.
-///
-/// Recovery is performed synchronously in [`SegmentWal::open`]: segment
-/// headers and record checksums are validated, torn tails are truncated or
-/// discarded, and sequence continuity is verified before the WAL accepts new
-/// appends.
 pub struct SegmentWal {
-    options: WalOptions,
     ingress_tx: mpsc::Sender<AppendRequest>,
     shutdown: CancellationToken,
-    durable_sequence: Arc<AtomicU64>,
     poison: Arc<Mutex<Option<WalError>>>,
     lifecycle: tokio::sync::RwLock<()>,
     shutdown_lock: tokio::sync::Mutex<()>,
@@ -54,7 +43,6 @@ struct AppendRequest {
 struct SyncPoint {
     files: Vec<Arc<SegmentFile>>,
     sync_directory: bool,
-    through_sequence: Option<Sequence>,
     waiters: Vec<(Sequence, oneshot::Sender<Result<Sequence, WalError>>)>,
 }
 
@@ -68,7 +56,6 @@ struct WriterState {
     options: WalOptions,
     next_sequence: Sequence,
     next_segment_number: u64,
-    last_written_sequence: Option<Sequence>,
     active: Option<ActiveSegment>,
     dirty_files: Vec<Arc<SegmentFile>>,
     directory_dirty: bool,
@@ -76,28 +63,21 @@ struct WriterState {
 }
 
 impl SegmentWal {
-    /// Opens (or recovers) the WAL at `options.dir`.
+    /// Opens the WAL at `options.dir`.
+    ///
+    /// The directory must be empty: segment files from a previous run are not
+    /// recovered, so opening a non-empty directory fails with
+    /// [`WalError::ExistingSegments`].
     pub async fn open(options: WalOptions) -> Result<Arc<Self>, WalError> {
         options
             .validate()
             .map_err(|message| WalError::InvalidOptions(message.into()))?;
         tokio::fs::create_dir_all(&options.dir).await?;
-
-        let recovery_dir = options.dir.clone();
-        let recovery_io_mode = options.io_mode;
-        let recovery =
-            tokio::task::spawn_blocking(move || recover_directory(&recovery_dir, recovery_io_mode))
-                .await
-                .map_err(|error| WalError::Worker(error.to_string()))??;
-        let next_sequence = match recovery.last_sequence {
-            Some(sequence) => sequence
-                .checked_add(1)
-                .ok_or_else(|| WalError::Worker("WAL sequence exhausted".into()))?,
-            None => 0,
-        };
-        let durable = recovery.last_sequence.unwrap_or(NO_SEQUENCE);
-
-        let durable_sequence = Arc::new(AtomicU64::new(durable));
+        if !list_segment_files(&options.dir)?.is_empty() {
+            return Err(WalError::ExistingSegments {
+                path: options.dir.clone(),
+            });
+        }
         let poison = Arc::new(Mutex::new(None));
         let shutdown = CancellationToken::new();
         let writer_shutdown = CancellationToken::new();
@@ -110,28 +90,17 @@ impl SegmentWal {
 
         let syncer = tokio::task::spawn_blocking({
             let dir = options.dir.clone();
-            let durable_sequence = durable_sequence.clone();
             let poison = poison.clone();
             let sync_shutdown = sync_shutdown.clone();
             let runtime = runtime.clone();
-            move || {
-                sync_loop(
-                    sync_rx,
-                    dir,
-                    durable_sequence,
-                    poison,
-                    sync_shutdown,
-                    runtime,
-                )
-            }
+            move || sync_loop(sync_rx, dir, poison, sync_shutdown, runtime)
         });
 
         let writer = tokio::task::spawn_blocking({
             let state = WriterState {
                 options: options.clone(),
-                next_sequence,
-                next_segment_number: recovery.last_segment_number.saturating_add(1).max(1),
-                last_written_sequence: recovery.last_sequence,
+                next_sequence: 0,
+                next_segment_number: 1,
                 active: None,
                 dirty_files: Vec::new(),
                 directory_dirty: false,
@@ -163,10 +132,8 @@ impl SegmentWal {
         ));
 
         Ok(Arc::new(Self {
-            options,
             ingress_tx,
             shutdown,
-            durable_sequence,
             poison,
             lifecycle: tokio::sync::RwLock::new(()),
             shutdown_lock: tokio::sync::Mutex::new(()),
@@ -185,8 +152,6 @@ impl SegmentWal {
 
 #[async_trait]
 impl Wal for SegmentWal {
-    type Recovery = WalRecovery;
-
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let lifecycle = self.lifecycle.read().await;
         if self.shutdown.is_cancelled() {
@@ -209,11 +174,6 @@ impl Wal for SegmentWal {
         receiver.await.map_err(|_| WalError::Closed)?
     }
 
-    fn recover(&self, from_sequence: Sequence) -> Result<Self::Recovery, WalError> {
-        let durable = decode_optional_sequence(self.durable_sequence.load(Ordering::Acquire));
-        WalRecovery::new(&self.options.dir, from_sequence, durable, self.options.io_mode)
-    }
-
     async fn shutdown(&self) -> Result<(), WalError> {
         let _shutdown_guard = self.shutdown_lock.lock().await;
         let mut handles_guard = self.handles.lock().await;
@@ -227,11 +187,7 @@ impl Wal for SegmentWal {
         drop(lifecycle);
 
         let mut join_error = None;
-        for handle in [
-            handles.batcher,
-            handles.writer,
-            handles.syncer,
-        ] {
+        for handle in [handles.batcher, handles.writer, handles.syncer] {
             if let Err(error) = handle.await
                 && join_error.is_none()
             {
@@ -409,9 +365,7 @@ impl WriterState {
             return;
         }
 
-        let last_sequence = records.last().unwrap().0;
         self.next_sequence = next;
-        self.last_written_sequence = Some(last_sequence);
 
         let mut synced_waiters = Vec::new();
         for (request, (sequence, _)) in batch.into_iter().zip(records) {
@@ -493,7 +447,6 @@ impl WriterState {
         SyncPoint {
             files: std::mem::take(&mut self.dirty_files),
             sync_directory: std::mem::take(&mut self.directory_dirty),
-            through_sequence: self.last_written_sequence,
             waiters,
         }
     }
@@ -511,7 +464,6 @@ impl WriterState {
 fn sync_loop(
     mut sync_rx: mpsc::Receiver<SyncPoint>,
     dir: PathBuf,
-    durable_sequence: Arc<AtomicU64>,
     poison: Arc<Mutex<Option<WalError>>>,
     shutdown: CancellationToken,
     runtime: Handle,
@@ -550,9 +502,6 @@ fn sync_loop(
 
         match result {
             Ok(()) => {
-                if let Some(sequence) = point.through_sequence {
-                    durable_sequence.store(sequence, Ordering::Release);
-                }
                 for (sequence, waiter) in point.waiters {
                     let _ = waiter.send(Ok(sequence));
                 }
@@ -581,10 +530,6 @@ fn perform_sync(point: &SyncPoint, dir: &std::path::Path) -> std::io::Result<()>
 fn merge_sync_points(target: &mut SyncPoint, mut next: SyncPoint) {
     target.files.append(&mut next.files);
     target.sync_directory |= next.sync_directory;
-    target.through_sequence = match (target.through_sequence, next.through_sequence) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (left, right) => left.or(right),
-    };
     target.waiters.append(&mut next.waiters);
 }
 
@@ -613,8 +558,4 @@ fn set_poison(poison: &Mutex<Option<WalError>>, error: WalError) {
     {
         *current = Some(error);
     }
-}
-
-fn decode_optional_sequence(sequence: u64) -> Option<u64> {
-    (sequence != NO_SEQUENCE).then_some(sequence)
 }

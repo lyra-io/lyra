@@ -1,6 +1,11 @@
+#[cfg(test)]
+use super::IoMode;
+use super::SegmentError;
+#[cfg(test)]
 use super::io::SegmentFile;
-use super::{IoMode, SegmentError};
+#[cfg(test)]
 use bytes::Bytes;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 pub(crate) const ALIGNMENT: usize = 4096;
@@ -22,6 +27,7 @@ enum RecordType {
 }
 
 impl RecordType {
+    #[cfg(test)]
     fn decode(value: u8) -> Result<Self, String> {
         match value {
             5 => Ok(Self::Full),
@@ -171,6 +177,10 @@ fn encode_physical_record(
     output[header_start + 7..header_start + 11].copy_from_slice(&log_number.to_le_bytes());
 }
 
+/// Streaming reader for segment files. Only compiled in tests for now: the
+/// WAL no longer replays records, and consumers of the on-disk format are
+/// expected to drive their own read path.
+#[cfg(test)]
 pub(crate) struct SegmentScanner {
     path: PathBuf,
     file: SegmentFile,
@@ -187,6 +197,7 @@ pub(crate) struct SegmentScanner {
     finished: bool,
 }
 
+#[cfg(test)]
 impl SegmentScanner {
     pub(crate) fn open(
         path: &Path,
@@ -265,6 +276,7 @@ impl SegmentScanner {
     }
 }
 
+#[cfg(test)]
 impl Iterator for SegmentScanner {
     type Item = Result<Bytes, SegmentError>;
 
@@ -428,6 +440,7 @@ pub(crate) fn scan_segment(path: &Path, tolerate_tail: bool) -> Result<SegmentSc
     })
 }
 
+#[cfg(test)]
 fn decode_file_header(path: &Path, bytes: &[u8]) -> Result<u64, SegmentError> {
     if bytes.len() < FILE_HEADER_SIZE {
         return corruption(path, "truncated segment file header");
@@ -467,6 +480,7 @@ fn mask_crc(crc: u32) -> u32 {
     crc.rotate_right(15).wrapping_add(CRC_MASK_DELTA)
 }
 
+#[cfg(test)]
 fn corruption<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
     Err(SegmentError::Corruption {
         path: path.to_path_buf(),
@@ -474,6 +488,7 @@ fn corruption<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
     })
 }
 
+#[cfg(test)]
 fn all_zero(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }

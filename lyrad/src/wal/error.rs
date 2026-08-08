@@ -18,6 +18,11 @@ pub enum WalError {
     #[error("WAL corruption in {path}: {message}")]
     Corruption { path: PathBuf, message: String },
 
+    /// The WAL directory already contains segment files from a previous run,
+    /// which this build does not recover.
+    #[error("WAL directory {path} already contains segments; recovery is not supported")]
+    ExistingSegments { path: PathBuf },
+
     /// An internal background worker failed.
     #[error("WAL worker failed: {0}")]
     Worker(String),
