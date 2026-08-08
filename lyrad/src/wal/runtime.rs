@@ -16,10 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 /// A batching write-ahead log backed by `lyra`'s segment format.
 ///
-/// Appends flow through a small pipeline: a tokio task coalesces them while
-/// the writer channel is busy; a blocking writer assigns sequences and writes
-/// them to aligned segment files; a blocking syncer flushes files and
-/// directories and completes sync appends.
+/// Appends flow through a small pipeline: a blocking writer drains queued
+/// appends into batches and writes them to aligned segment files; a blocking
+/// syncer flushes files and directories and completes sync appends.
 pub struct Log {
     ingress_tx: mpsc::Sender<AppendRequest>,
     shutdown: CancellationToken,
@@ -30,7 +29,6 @@ pub struct Log {
 }
 
 struct WorkerHandles {
-    batcher: JoinHandle<()>,
     writer: JoinHandle<()>,
     syncer: JoinHandle<()>,
 }
@@ -81,12 +79,10 @@ impl Log {
         }
         let poison = Arc::new(Mutex::new(None));
         let shutdown = CancellationToken::new();
-        let writer_shutdown = CancellationToken::new();
         let sync_shutdown = CancellationToken::new();
         let runtime = Handle::current();
 
         let (ingress_tx, ingress_rx) = mpsc::channel(options.queue_capacity);
-        let (writer_tx, writer_rx) = mpsc::channel(8);
         let (sync_tx, sync_rx) = mpsc::channel(8);
 
         let syncer = tokio::task::spawn_blocking({
@@ -107,12 +103,12 @@ impl Log {
                 directory_dirty: false,
                 poison: poison.clone(),
             };
-            let writer_shutdown = writer_shutdown.clone();
+            let writer_shutdown = shutdown.clone();
             let sync_shutdown = sync_shutdown.clone();
             let runtime = runtime.clone();
             move || {
                 writer_loop(
-                    writer_rx,
+                    ingress_rx,
                     sync_tx,
                     state,
                     writer_shutdown,
@@ -122,24 +118,13 @@ impl Log {
             }
         });
 
-        let batcher = tokio::spawn(batcher_loop(
-            ingress_rx,
-            writer_tx,
-            shutdown.clone(),
-            writer_shutdown,
-        ));
-
         Ok(Arc::new(Self {
             ingress_tx,
             shutdown,
             poison,
             lifecycle: tokio::sync::RwLock::new(()),
             shutdown_lock: tokio::sync::Mutex::new(()),
-            handles: tokio::sync::Mutex::new(Some(WorkerHandles {
-                batcher,
-                writer,
-                syncer,
-            })),
+            handles: tokio::sync::Mutex::new(Some(WorkerHandles { writer, syncer })),
         }))
     }
 
@@ -185,7 +170,7 @@ impl Wal for Log {
         drop(lifecycle);
 
         let mut join_error = None;
-        for handle in [handles.batcher, handles.writer, handles.syncer] {
+        for handle in [handles.writer, handles.syncer] {
             if let Err(error) = handle.await
                 && join_error.is_none()
             {
@@ -199,66 +184,13 @@ impl Wal for Log {
     }
 }
 
-async fn batcher_loop(
-    mut ingress_rx: mpsc::Receiver<AppendRequest>,
-    writer_tx: mpsc::Sender<Vec<AppendRequest>>,
-    shutdown: CancellationToken,
-    writer_shutdown: CancellationToken,
-) {
-    let mut stopping = false;
-    loop {
-        let first = if stopping {
-            ingress_rx.recv().await
-        } else {
-            tokio::select! {
-                request = ingress_rx.recv() => request,
-                _ = shutdown.cancelled() => {
-                    stopping = true;
-                    ingress_rx.close();
-                    ingress_rx.recv().await
-                }
-            }
-        };
-        let Some(first) = first else {
-            break;
-        };
-
-        let mut batch = vec![first];
-        loop {
-            let result = tokio::select! {
-                _ = shutdown.cancelled() => {
-                    stopping = true;
-                    ingress_rx.close();
-                    break;
-                }
-                _ = writer_tx.reserve() => break,
-                request = ingress_rx.recv() => request,
-            };
-            let Some(request) = result else {
-                break;
-            };
-            batch.push(request);
-        }
-
-        if let Err(send_error) = writer_tx.send(batch).await {
-            let error = WalError::Worker("WAL writer stopped".into());
-            fail_batch(send_error.0, error.clone());
-            ingress_rx.close();
-            while let Some(request) = ingress_rx.recv().await {
-                let _ = request.response.send(Err(error.clone()));
-            }
-            break;
-        }
-
-        if stopping && ingress_rx.is_empty() {
-            break;
-        }
-    }
-    writer_shutdown.cancel();
-}
-
 enum StageEvent<T> {
     Message(Option<T>),
+    Cancelled,
+}
+
+enum WriterEvent {
+    Batch(usize),
     Cancelled,
 }
 
@@ -275,33 +207,49 @@ fn wait_for_stage<T>(
     })
 }
 
+fn wait_for_writer_event(
+    runtime: &Handle,
+    receiver: &mut mpsc::Receiver<AppendRequest>,
+    batch: &mut Vec<AppendRequest>,
+    max: usize,
+    shutdown: &CancellationToken,
+) -> WriterEvent {
+    runtime.block_on(async {
+        tokio::select! {
+            _ = shutdown.cancelled() => WriterEvent::Cancelled,
+            received = receiver.recv_many(batch, max) => WriterEvent::Batch(received),
+        }
+    })
+}
+
 fn writer_loop(
-    mut writer_rx: mpsc::Receiver<Vec<AppendRequest>>,
+    mut ingress_rx: mpsc::Receiver<AppendRequest>,
     sync_tx: mpsc::Sender<SyncPoint>,
     mut state: WriterState,
     shutdown: CancellationToken,
     sync_shutdown: CancellationToken,
     runtime: Handle,
 ) {
+    let max_batch = state.options.queue_capacity;
     let mut stopping = false;
     loop {
-        let batch = if stopping {
-            match writer_rx.try_recv() {
-                Ok(batch) => batch,
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
+        let mut batch = Vec::new();
+        let received = if stopping {
+            runtime.block_on(async { ingress_rx.recv_many(&mut batch, max_batch).await })
         } else {
-            match wait_for_stage(&runtime, &mut writer_rx, &shutdown) {
-                StageEvent::Message(Some(batch)) => batch,
-                StageEvent::Message(None) => break,
-                StageEvent::Cancelled => {
+            match wait_for_writer_event(&runtime, &mut ingress_rx, &mut batch, max_batch, &shutdown)
+            {
+                WriterEvent::Batch(received) => received,
+                WriterEvent::Cancelled => {
                     stopping = true;
-                    writer_rx.close();
+                    ingress_rx.close();
                     continue;
                 }
             }
         };
+        if received == 0 {
+            break;
+        }
         state.write_batch(batch, &sync_tx);
     }
     state.finish(&sync_tx);
