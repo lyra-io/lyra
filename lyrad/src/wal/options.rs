@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 const MIB: u64 = 1024 * 1024;
 
-/// Configuration for opening a [`SegmentWal`](super::SegmentWal).
+/// Configuration for opening a [`WalWriter`](super::WalWriter).
 #[derive(Debug, Clone)]
 pub struct WalOptions {
     /// Directory where segment files are stored and recovered from.

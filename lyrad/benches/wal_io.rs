@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lyrad::wal::{IoMode, SegmentWal, Wal, WalOptions};
+use lyrad::wal::{IoMode, Wal, WalOptions, WalWriter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,7 @@ async fn run_mode(
     let mut options = WalOptions::new(dir.path());
     options.io_mode = io_mode;
 
-    let wal = match SegmentWal::open(options).await {
+    let wal = match WalWriter::open(options).await {
         Ok(wal) => wal,
         Err(error) => {
             println!("{label}: SKIPPED ({error})");

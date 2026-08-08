@@ -14,13 +14,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// A segmented, batching write-ahead log backed by `lyra`'s segment format.
+/// A batching write-ahead log backed by `lyra`'s segment format.
 ///
 /// Appends flow through a small pipeline: a tokio task coalesces them while
 /// the writer channel is busy; a blocking writer assigns sequences and writes
 /// them to aligned segment files; a blocking syncer flushes files and
 /// directories and completes sync appends.
-pub struct SegmentWal {
+pub struct WalWriter {
     ingress_tx: mpsc::Sender<AppendRequest>,
     shutdown: CancellationToken,
     poison: Arc<Mutex<Option<WalError>>>,
@@ -63,7 +63,7 @@ struct WriterState {
     poison: Arc<Mutex<Option<WalError>>>,
 }
 
-impl SegmentWal {
+impl WalWriter {
     /// Opens the WAL at `options.dir`.
     ///
     /// The directory must be empty: segment files from a previous run are not
@@ -149,7 +149,7 @@ impl SegmentWal {
 }
 
 #[async_trait]
-impl Wal for SegmentWal {
+impl Wal for WalWriter {
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let lifecycle = self.lifecycle.read().await;
         if self.shutdown.is_cancelled() {
