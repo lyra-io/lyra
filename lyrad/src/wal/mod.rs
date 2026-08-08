@@ -2,7 +2,6 @@ mod error;
 mod format;
 mod options;
 mod recovery;
-mod retention;
 mod runtime;
 
 pub use crate::segment::IoMode;
@@ -41,9 +40,8 @@ pub trait Wal: Send + Sync + 'static {
 
     /// Replays records with sequence greater than or equal to `from_sequence`.
     ///
-    /// Fails with [`WalError::SequenceExpired`] if `from_sequence` has already
-    /// been trimmed. The returned iterator only contains records durable at
-    /// the time of this call.
+    /// The returned iterator only contains records durable at the time of this
+    /// call.
     fn recover(&self, from_sequence: Sequence) -> Result<Self::Recovery, WalError>;
 
     /// Drains pending appends, flushes them to stable storage, and stops all

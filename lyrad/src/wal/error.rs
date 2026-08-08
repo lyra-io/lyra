@@ -18,10 +18,6 @@ pub enum WalError {
     #[error("WAL corruption in {path}: {message}")]
     Corruption { path: PathBuf, message: String },
 
-    /// `requested` has been trimmed; only `earliest` and later are available.
-    #[error("WAL sequence {requested} has expired; earliest available sequence is {earliest}")]
-    SequenceExpired { requested: u64, earliest: u64 },
-
     /// An internal background worker failed.
     #[error("WAL worker failed: {0}")]
     Worker(String),

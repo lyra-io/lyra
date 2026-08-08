@@ -2,7 +2,6 @@ use super::error::WalError;
 use super::format::{FILE_HEADER_SIZE, encode_batch};
 use super::options::WalOptions;
 use super::recovery::{WalRecovery, recover_directory};
-use super::retention::Retention;
 use super::{Sequence, Wal};
 use crate::segment::{AlignedBuffer, SegmentFile, sync_directory};
 use async_trait::async_trait;
@@ -12,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +22,7 @@ const NO_SEQUENCE: u64 = u64::MAX;
 /// Appends flow through a small pipeline: a tokio task batches them by count,
 /// size, and linger; a blocking writer assigns sequences and writes them to
 /// aligned segment files; a blocking syncer flushes files and directories and
-/// completes sync appends; and a blocking trimmer removes segments that are
-/// fully durable and no longer needed per the trim watch.
+/// completes sync appends.
 ///
 /// Recovery is performed synchronously in [`SegmentWal::open`]: segment
 /// headers and record checksums are validated, torn tails are truncated or
@@ -35,7 +33,6 @@ pub struct SegmentWal {
     ingress_tx: mpsc::Sender<AppendRequest>,
     shutdown: CancellationToken,
     durable_sequence: Arc<AtomicU64>,
-    retention: Arc<Retention>,
     poison: Arc<Mutex<Option<WalError>>>,
     lifecycle: tokio::sync::RwLock<()>,
     shutdown_lock: tokio::sync::Mutex<()>,
@@ -46,7 +43,6 @@ struct WorkerHandles {
     batcher: JoinHandle<()>,
     writer: JoinHandle<()>,
     syncer: JoinHandle<()>,
-    trimmer: JoinHandle<()>,
 }
 
 struct AppendRequest {
@@ -76,21 +72,12 @@ struct WriterState {
     active: Option<ActiveSegment>,
     dirty_files: Vec<Arc<SegmentFile>>,
     directory_dirty: bool,
-    retention: Arc<Retention>,
     poison: Arc<Mutex<Option<WalError>>>,
 }
 
 impl SegmentWal {
     /// Opens (or recovers) the WAL at `options.dir`.
-    ///
-    /// `trim_rx` carries the largest sequence the caller is willing to lose to
-    /// trimming; segments whose records are all durable and at or below that
-    /// sequence are removed. The current value is applied on open, and every
-    /// update triggers a trim pass.
-    pub async fn open(
-        options: WalOptions,
-        mut trim_rx: watch::Receiver<Option<Sequence>>,
-    ) -> Result<Arc<Self>, WalError> {
+    pub async fn open(options: WalOptions) -> Result<Arc<Self>, WalError> {
         options
             .validate()
             .map_err(|message| WalError::InvalidOptions(message.into()))?;
@@ -111,17 +98,6 @@ impl SegmentWal {
         let durable = recovery.last_sequence.unwrap_or(NO_SEQUENCE);
 
         let durable_sequence = Arc::new(AtomicU64::new(durable));
-        let retention = Arc::new(Retention::new(options.dir.clone(), recovery.segments));
-        retention.observe_trim(*trim_rx.borrow_and_update());
-        let initial_retention = Arc::clone(&retention);
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            initial_retention.trim(decode_optional_sequence(durable))
-        })
-        .await
-        .map_err(|error| WalError::Worker(error.to_string()))?
-        {
-            tracing::warn!(error = %error, "initial WAL trim failed; it will be retried");
-        }
         let poison = Arc::new(Mutex::new(None));
         let shutdown = CancellationToken::new();
         let writer_shutdown = CancellationToken::new();
@@ -132,20 +108,11 @@ impl SegmentWal {
         let (writer_tx, writer_rx) = mpsc::channel(8);
         let (sync_tx, sync_rx) = mpsc::channel(8);
 
-        let trimmer = tokio::task::spawn_blocking({
-            let retention = Arc::clone(&retention);
-            let durable_sequence = Arc::clone(&durable_sequence);
-            let shutdown = shutdown.clone();
-            let runtime = runtime.clone();
-            move || trim_loop(&mut trim_rx, retention, durable_sequence, shutdown, runtime)
-        });
-
         let syncer = tokio::task::spawn_blocking({
             let dir = options.dir.clone();
             let durable_sequence = durable_sequence.clone();
             let poison = poison.clone();
             let sync_shutdown = sync_shutdown.clone();
-            let retention = Arc::clone(&retention);
             let runtime = runtime.clone();
             move || {
                 sync_loop(
@@ -153,7 +120,6 @@ impl SegmentWal {
                     dir,
                     durable_sequence,
                     poison,
-                    retention,
                     sync_shutdown,
                     runtime,
                 )
@@ -169,7 +135,6 @@ impl SegmentWal {
                 active: None,
                 dirty_files: Vec::new(),
                 directory_dirty: false,
-                retention: Arc::clone(&retention),
                 poison: poison.clone(),
             };
             let writer_shutdown = writer_shutdown.clone();
@@ -202,7 +167,6 @@ impl SegmentWal {
             ingress_tx,
             shutdown,
             durable_sequence,
-            retention,
             poison,
             lifecycle: tokio::sync::RwLock::new(()),
             shutdown_lock: tokio::sync::Mutex::new(()),
@@ -210,7 +174,6 @@ impl SegmentWal {
                 batcher,
                 writer,
                 syncer,
-                trimmer,
             })),
         }))
     }
@@ -248,12 +211,7 @@ impl Wal for SegmentWal {
 
     fn recover(&self, from_sequence: Sequence) -> Result<Self::Recovery, WalError> {
         let durable = decode_optional_sequence(self.durable_sequence.load(Ordering::Acquire));
-        WalRecovery::new(
-            &self.retention,
-            from_sequence,
-            durable,
-            self.options.io_mode,
-        )
+        WalRecovery::new(&self.options.dir, from_sequence, durable, self.options.io_mode)
     }
 
     async fn shutdown(&self) -> Result<(), WalError> {
@@ -273,7 +231,6 @@ impl Wal for SegmentWal {
             handles.batcher,
             handles.writer,
             handles.syncer,
-            handles.trimmer,
         ] {
             if let Err(error) = handle.await
                 && join_error.is_none()
@@ -374,73 +331,6 @@ async fn batcher_loop(
 enum StageEvent<T> {
     Message(Option<T>),
     Cancelled,
-}
-
-enum TrimEvent {
-    Changed(Result<(), watch::error::RecvError>),
-    Progress,
-    Retry,
-    Cancelled,
-}
-
-fn trim_loop(
-    trim_rx: &mut watch::Receiver<Option<Sequence>>,
-    retention: Arc<Retention>,
-    durable_sequence: Arc<AtomicU64>,
-    shutdown: CancellationToken,
-    runtime: Handle,
-) {
-    let mut watch_open = true;
-    loop {
-        let retry = match retention.trim(decode_optional_sequence(
-            durable_sequence.load(Ordering::Acquire),
-        )) {
-            Ok(()) => false,
-            Err(error) => {
-                tracing::warn!(error = %error, "WAL trim failed; it will be retried");
-                true
-            }
-        };
-
-        match wait_for_trim_event(&runtime, trim_rx, &retention, &shutdown, watch_open, retry) {
-            TrimEvent::Changed(Ok(())) => retention.observe_trim(*trim_rx.borrow_and_update()),
-            TrimEvent::Changed(Err(_)) => watch_open = false,
-            TrimEvent::Progress | TrimEvent::Retry => {}
-            TrimEvent::Cancelled => return,
-        }
-    }
-}
-
-fn wait_for_trim_event(
-    runtime: &Handle,
-    trim_rx: &mut watch::Receiver<Option<Sequence>>,
-    retention: &Retention,
-    shutdown: &CancellationToken,
-    watch_open: bool,
-    retry: bool,
-) -> TrimEvent {
-    runtime.block_on(async {
-        let changed = async {
-            if watch_open {
-                trim_rx.changed().await
-            } else {
-                std::future::pending::<Result<(), watch::error::RecvError>>().await
-            }
-        };
-        let retry_delay = async {
-            if retry {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-        tokio::select! {
-            result = changed => TrimEvent::Changed(result),
-            _ = retention.changed() => TrimEvent::Progress,
-            _ = retry_delay => TrimEvent::Retry,
-            _ = shutdown.cancelled() => TrimEvent::Cancelled,
-        }
-    })
 }
 
 fn wait_for_stage<T>(
@@ -568,7 +458,6 @@ impl WriterState {
         let active = self.active.as_mut().unwrap();
         active.file.write_aligned(&buffer, active.offset)?;
         active.offset += encoded.len() as u64;
-        let segment_number = active.number;
         if !self
             .dirty_files
             .iter()
@@ -576,11 +465,6 @@ impl WriterState {
         {
             self.dirty_files.push(active.file.clone());
         }
-        self.retention.record_write(
-            segment_number,
-            records.first().unwrap().0,
-            records.last().unwrap().0,
-        )?;
         Ok(())
     }
 
@@ -590,8 +474,6 @@ impl WriterState {
         }
         let number = self.next_segment_number;
         let file = SegmentFile::create(&self.options.dir, number, self.options.io_mode)?;
-        self.retention
-            .register_active(number, file.path().to_path_buf())?;
         self.next_segment_number = number
             .checked_add(1)
             .ok_or_else(|| WalError::Worker("segment number exhausted".into()))?;
@@ -631,7 +513,6 @@ fn sync_loop(
     dir: PathBuf,
     durable_sequence: Arc<AtomicU64>,
     poison: Arc<Mutex<Option<WalError>>>,
-    retention: Arc<Retention>,
     shutdown: CancellationToken,
     runtime: Handle,
 ) {
@@ -671,7 +552,6 @@ fn sync_loop(
             Ok(()) => {
                 if let Some(sequence) = point.through_sequence {
                     durable_sequence.store(sequence, Ordering::Release);
-                    retention.notify_progress();
                 }
                 for (sequence, waiter) in point.waiters {
                     let _ = waiter.send(Ok(sequence));

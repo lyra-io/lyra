@@ -1,24 +1,20 @@
 use super::Sequence;
 use super::error::WalError;
 use super::format::{FILE_HEADER_SIZE, WalSegmentScanner};
-use super::retention::{RecoveryLease, Retention, SegmentMetadata};
 use crate::segment::{IoMode, list_segment_files, sync_directory};
 use bytes::Bytes;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub(crate) struct RecoverySummary {
     pub(crate) last_sequence: Option<Sequence>,
     pub(crate) last_segment_number: u64,
-    pub(crate) segments: Vec<SegmentMetadata>,
 }
 
 pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoverySummary, WalError> {
     let files = list_segment_files(dir)?;
     let mut last_sequence: Option<Sequence> = None;
     let mut last_segment_number = 0;
-    let mut segments = Vec::with_capacity(files.len());
 
     for (index, (file_number, path)) in files.iter().enumerate() {
         let is_last = index + 1 == files.len();
@@ -46,8 +42,6 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
             });
         }
 
-        let mut segment_first = None;
-        let mut segment_last = None;
         for record in scanner.by_ref() {
             let (sequence, _) = record?;
             if let Some(previous) = last_sequence {
@@ -68,8 +62,6 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
                 }
             }
             last_sequence = Some(sequence);
-            segment_first = segment_first.or(Some(sequence));
-            segment_last = Some(sequence);
         }
 
         if is_last {
@@ -81,19 +73,12 @@ pub(crate) fn recover_directory(dir: &Path, io_mode: IoMode) -> Result<RecoveryS
                 file.sync_data()?;
             }
         }
-        segments.push(SegmentMetadata {
-            number: *file_number,
-            path: path.clone(),
-            first_sequence: segment_first,
-            last_sequence: segment_last,
-        });
         last_segment_number = last_segment_number.max(*file_number);
     }
 
     Ok(RecoverySummary {
         last_sequence,
         last_segment_number,
-        segments,
     })
 }
 
@@ -115,33 +100,45 @@ fn remove_uncommitted_tail(dir: &Path, path: &Path) -> Result<(), WalError> {
 /// Streaming iterator over durable WAL records returned by
 /// [`Wal::recover`](super::Wal::recover).
 ///
-/// While it exists, it holds retention leases on the segments it may still
-/// read, so concurrent trimming defers deletion until iteration finishes or
-/// the iterator is dropped.
+/// The segment files are listed when the iterator is created, so it reads a
+/// stable snapshot of the WAL as of the call; segments rotated in afterwards
+/// do not appear.
 pub struct WalRecovery {
-    files: Vec<super::retention::RecoverySegment>,
+    files: Vec<RecoverySegment>,
     file_index: usize,
-    scanner: Option<(u64, WalSegmentScanner)>,
-    lease: RecoveryLease,
+    scanner: Option<WalSegmentScanner>,
     io_mode: IoMode,
     from_sequence: Sequence,
     through_sequence: Option<Sequence>,
     finished: bool,
 }
 
+struct RecoverySegment {
+    path: PathBuf,
+    tolerate_tail: bool,
+}
+
 impl WalRecovery {
     pub(crate) fn new(
-        retention: &Arc<Retention>,
+        dir: &Path,
         from_sequence: Sequence,
         through_sequence: Option<Sequence>,
         io_mode: IoMode,
     ) -> Result<Self, WalError> {
-        let (files, lease) = retention.lease_recovery(from_sequence, through_sequence)?;
+        let listed = list_segment_files(dir)?;
+        let total = listed.len();
+        let files = listed
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, path))| RecoverySegment {
+                path,
+                tolerate_tail: index + 1 == total,
+            })
+            .collect();
         Ok(Self {
             files,
             file_index: 0,
             scanner: None,
-            lease,
             io_mode,
             from_sequence,
             through_sequence,
@@ -160,8 +157,7 @@ impl Iterator for WalRecovery {
         let through_sequence = self.through_sequence.unwrap();
 
         loop {
-            if let Some((segment_number, scanner)) = self.scanner.as_mut() {
-                let segment_number = *segment_number;
+            if let Some(scanner) = self.scanner.as_mut() {
                 match scanner.next() {
                     Some(Ok((sequence, payload))) => {
                         if sequence < self.from_sequence {
@@ -169,19 +165,16 @@ impl Iterator for WalRecovery {
                         }
                         if sequence > through_sequence {
                             self.finished = true;
-                            self.lease.release_all();
                             return None;
                         }
                         return Some(Ok((sequence, payload)));
                     }
                     Some(Err(error)) => {
                         self.finished = true;
-                        self.lease.release_all();
                         return Some(Err(error));
                     }
                     None => {
                         self.scanner = None;
-                        self.lease.release_segment(segment_number);
                         continue;
                     }
                 }
@@ -189,17 +182,15 @@ impl Iterator for WalRecovery {
 
             let Some(segment) = self.files.get(self.file_index) else {
                 self.finished = true;
-                self.lease.release_all();
                 return None;
             };
             match WalSegmentScanner::open(&segment.path, segment.tolerate_tail, self.io_mode) {
                 Ok(scanner) => {
                     self.file_index += 1;
-                    self.scanner = Some((segment.number, scanner));
+                    self.scanner = Some(scanner);
                 }
                 Err(error) => {
                     self.finished = true;
-                    self.lease.release_all();
                     return Some(Err(error));
                 }
             }
