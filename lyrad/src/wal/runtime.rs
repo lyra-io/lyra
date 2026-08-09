@@ -1,6 +1,6 @@
 use super::error::WalError;
 use super::options::WalOptions;
-use super::{Lifecycle, Sequence, Wal, WalState};
+use super::{Lifecycle, Sequence, Wal};
 use crate::segment::{
     AlignedBuffer, FILE_HEADER_SIZE, SegmentFile, SegmentRecord, list_segment_files, sync_directory,
 };
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Log {
     inflight_tx: mpsc::Sender<AppendRequest>,
     context: CancellationToken,
-    state: Arc<RwLock<WalState>>,
+    state: Arc<RwLock<Lifecycle>>,
     tasks: Mutex<Option<JoinSet<()>>>,
 }
 
@@ -54,7 +54,7 @@ impl Log {
             });
         }
 
-        let state = Arc::new(RwLock::new(WalState::default()));
+        let state = Arc::new(RwLock::new(Lifecycle::default()));
         let context = CancellationToken::new();
         let runtime = Handle::current();
         let (inflight_tx, inflight_rx) = mpsc::channel(options.queue_capacity);
@@ -80,7 +80,7 @@ impl Log {
 impl Wal for Log {
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let state = self.state.read().await;
-        if state.lifecycle != Lifecycle::Running {
+        if *state != Lifecycle::Running {
             return Err(WalError::Closed);
         }
 
@@ -106,7 +106,7 @@ impl Wal for Log {
 
         {
             let mut state = self.state.write().await;
-            state.lifecycle = Lifecycle::Draining;
+            *state = Lifecycle::Draining;
             self.context.cancel();
         }
 
@@ -120,7 +120,7 @@ impl Wal for Log {
         }
         {
             let mut state = self.state.write().await;
-            state.lifecycle = Lifecycle::Closed;
+            *state = Lifecycle::Closed;
         }
         join_error.map_or(Ok(()), Err)
     }
