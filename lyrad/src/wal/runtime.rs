@@ -64,7 +64,7 @@ impl Log {
             let context = context.clone();
             let runtime = runtime.clone();
             let options = options.clone();
-            move || writer_loop(inflight_rx, options, context, runtime)
+            move || writer_loop(context, inflight_rx, options, runtime)
         });
 
         Ok(Arc::new(Self {
@@ -132,11 +132,11 @@ enum WriterEvent {
 }
 
 fn wait_for_writer_event(
+    context: &CancellationToken,
     runtime: &Handle,
     receiver: &mut mpsc::Receiver<AppendRequest>,
     batch: &mut Vec<AppendRequest>,
     max: usize,
-    context: &CancellationToken,
 ) -> WriterEvent {
     runtime.block_on(async {
         tokio::select! {
@@ -147,9 +147,9 @@ fn wait_for_writer_event(
 }
 
 fn writer_loop(
+    context: CancellationToken,
     mut inflight_rx: mpsc::Receiver<AppendRequest>,
     options: WalOptions,
-    context: CancellationToken,
     runtime: Handle,
 ) {
     let max_batch = options.queue_capacity;
@@ -166,7 +166,7 @@ fn writer_loop(
         let received = if stopping {
             runtime.block_on(async { inflight_rx.recv_many(&mut batch, max_batch).await })
         } else {
-            match wait_for_writer_event(&runtime, &mut inflight_rx, &mut batch, max_batch, &context)
+            match wait_for_writer_event(&context, &runtime, &mut inflight_rx, &mut batch, max_batch)
             {
                 WriterEvent::Batch(received) => received,
                 WriterEvent::Cancelled => {
@@ -181,6 +181,7 @@ fn writer_loop(
         }
         let records = assign_records(&batch, &mut next_sequence);
         if !retry_until(
+            &context,
             || {
                 write_records(
                     &records,
@@ -191,7 +192,6 @@ fn writer_loop(
                     &options,
                 )
             },
-            &context,
             &runtime,
         ) {
             // Shutdown arrived while retrying; drop the batch. Its callers
@@ -212,8 +212,8 @@ fn writer_loop(
         }
 
         if !retry_until(
-            || perform_sync(&dirty_files, directory_dirty, &options.dir).map_err(WalError::from),
             &context,
+            || perform_sync(&dirty_files, directory_dirty, &options.dir).map_err(WalError::from),
             &runtime,
         ) {
             continue;
@@ -244,8 +244,8 @@ fn assign_records(batch: &[AppendRequest], next_sequence: &mut Sequence) -> Vec<
 }
 
 fn retry_until<E: std::fmt::Display>(
-    mut attempt: impl FnMut() -> Result<(), E>,
     context: &CancellationToken,
+    mut attempt: impl FnMut() -> Result<(), E>,
     runtime: &Handle,
 ) -> bool {
     loop {
