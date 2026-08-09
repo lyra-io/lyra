@@ -1,6 +1,6 @@
 use super::error::WalError;
 use super::options::WalOptions;
-use super::{Sequence, Wal, WalState};
+use super::{Lifecycle, Sequence, Wal, WalState};
 use crate::segment::{
     AlignedBuffer, FILE_HEADER_SIZE, SegmentFile, SegmentRecord, list_segment_files, sync_directory,
 };
@@ -9,6 +9,7 @@ use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -19,13 +20,16 @@ use tokio_util::sync::CancellationToken;
 /// Appends are queued into an in-memory channel and drained by a single
 /// blocking worker that batches them with `recv_many`, writes them to aligned
 /// segment files, and flushes them to stable storage whenever a sync append
-/// requires it or the log shuts down.
+/// requires it or the log shuts down. I/O failures are retried until the
+/// context is closed, so shutdown is the only thing that stops the worker.
 pub struct Log {
     inflight_tx: mpsc::Sender<AppendRequest>,
     context: CancellationToken,
     state: Arc<RwLock<WalState>>,
     tasks: Mutex<Option<JoinSet<()>>>,
 }
+
+const RETRY_DELAY: Duration = Duration::from_millis(10);
 
 struct AppendRequest {
     payload: Bytes,
@@ -57,11 +61,10 @@ impl Log {
 
         let mut tasks = JoinSet::new();
         tasks.spawn_blocking({
-            let state = state.clone();
             let context = context.clone();
             let runtime = runtime.clone();
             let options = options.clone();
-            move || writer_loop(inflight_rx, state, options, context, runtime)
+            move || writer_loop(inflight_rx, options, context, runtime)
         });
 
         Ok(Arc::new(Self {
@@ -77,11 +80,8 @@ impl Log {
 impl Wal for Log {
     async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let state = self.state.read().await;
-        if self.context.is_cancelled() {
+        if state.lifecycle != Lifecycle::Running {
             return Err(WalError::Closed);
-        }
-        if let Some(error) = state.error.clone() {
-            return Err(error);
         }
 
         let (response, receiver) = oneshot::channel();
@@ -104,9 +104,11 @@ impl Wal for Log {
         };
         drop(tasks_guard);
 
-        let state = self.state.write().await;
-        self.context.cancel();
-        drop(state);
+        {
+            let mut state = self.state.write().await;
+            state.lifecycle = Lifecycle::Draining;
+            self.context.cancel();
+        }
 
         let mut join_error = None;
         while let Some(result) = tasks.join_next().await {
@@ -116,8 +118,9 @@ impl Wal for Log {
                 join_error = Some(WalError::Worker(error.to_string()));
             }
         }
-        if let Some(error) = self.state.read().await.error.clone() {
-            return Err(error);
+        {
+            let mut state = self.state.write().await;
+            state.lifecycle = Lifecycle::Closed;
         }
         join_error.map_or(Ok(()), Err)
     }
@@ -145,7 +148,6 @@ fn wait_for_writer_event(
 
 fn writer_loop(
     mut inflight_rx: mpsc::Receiver<AppendRequest>,
-    state: Arc<RwLock<WalState>>,
     options: WalOptions,
     context: CancellationToken,
     runtime: Handle,
@@ -177,28 +179,23 @@ fn writer_loop(
         if received == 0 {
             break;
         }
-        if let Some(error) = locked_error(&state) {
-            fail_batch(batch, error);
-            continue;
-        }
-        let records = match assign_records(&batch, &mut next_sequence) {
-            Ok(records) => records,
-            Err(error) => {
-                set_poison(&state, error.clone());
-                fail_batch(batch, error);
-                continue;
-            }
-        };
-        if let Err(error) = write_records(
-            &records,
-            &mut next_segment_number,
-            &mut active,
-            &mut dirty_files,
-            &mut directory_dirty,
-            &options,
+        let records = assign_records(&batch, &mut next_sequence);
+        if !retry_until(
+            || {
+                write_records(
+                    &records,
+                    &mut next_segment_number,
+                    &mut active,
+                    &mut dirty_files,
+                    &mut directory_dirty,
+                    &options,
+                )
+            },
+            &context,
+            &runtime,
         ) {
-            set_poison(&state, error.clone());
-            fail_batch(batch, error);
+            // Shutdown arrived while retrying; drop the batch. Its callers
+            // observe Closed because the response channels are dropped.
             continue;
         }
 
@@ -214,41 +211,55 @@ fn writer_loop(
             continue;
         }
 
-        match perform_sync(&dirty_files, directory_dirty, &options.dir) {
-            Ok(()) => {
-                dirty_files.clear();
-                directory_dirty = false;
-                for (sequence, waiter) in synced_waiters {
-                    let _ = waiter.send(Ok(sequence));
-                }
-            }
-            Err(error) => {
-                let error = WalError::from(error);
-                set_poison(&state, error.clone());
-                fail_waiters(synced_waiters, error);
-            }
+        if !retry_until(
+            || perform_sync(&dirty_files, directory_dirty, &options.dir).map_err(WalError::from),
+            &context,
+            &runtime,
+        ) {
+            continue;
+        }
+        dirty_files.clear();
+        directory_dirty = false;
+        for (sequence, waiter) in synced_waiters {
+            let _ = waiter.send(Ok(sequence));
         }
     }
 
-    if let Err(error) = perform_sync(&dirty_files, directory_dirty, &options.dir) {
-        set_poison(&state, WalError::from(error));
-    }
+    // Final flush of anything still dirty; all callers have already been
+    // answered or dropped, so a failure here is only a lost final flush.
+    let _ = perform_sync(&dirty_files, directory_dirty, &options.dir);
 }
 
-fn assign_records(
-    batch: &[AppendRequest],
-    next_sequence: &mut Sequence,
-) -> Result<Vec<(Sequence, Bytes)>, WalError> {
+fn assign_records(batch: &[AppendRequest], next_sequence: &mut Sequence) -> Vec<(Sequence, Bytes)> {
     let mut records = Vec::with_capacity(batch.len());
     for request in batch {
         let sequence = *next_sequence;
         records.push((sequence, request.payload.clone()));
-        let Some(incremented) = sequence.checked_add(1) else {
-            return Err(WalError::Worker("WAL sequence exhausted".into()));
-        };
+        let incremented = sequence
+            .checked_add(1)
+            .unwrap_or_else(|| unreachable!("WAL sequence space exhausted"));
         *next_sequence = incremented;
     }
-    Ok(records)
+    records
+}
+
+fn retry_until<E: std::fmt::Display>(
+    mut attempt: impl FnMut() -> Result<(), E>,
+    context: &CancellationToken,
+    runtime: &Handle,
+) -> bool {
+    loop {
+        if context.is_cancelled() {
+            return false;
+        }
+        match attempt() {
+            Ok(()) => return true,
+            Err(error) => {
+                tracing::warn!(error = %error, "WAL operation failed; it will be retried");
+                runtime.block_on(tokio::time::sleep(RETRY_DELAY));
+            }
+        }
+    }
 }
 
 fn write_records(
@@ -337,30 +348,4 @@ fn perform_sync(files: &[Arc<SegmentFile>], sync_dir: bool, dir: &Path) -> std::
         sync_directory(dir)?;
     }
     Ok(())
-}
-
-fn fail_batch(batch: Vec<AppendRequest>, error: WalError) {
-    for request in batch {
-        let _ = request.response.send(Err(error.clone()));
-    }
-}
-
-fn fail_waiters(
-    waiters: Vec<(Sequence, oneshot::Sender<Result<Sequence, WalError>>)>,
-    error: WalError,
-) {
-    for (_, waiter) in waiters {
-        let _ = waiter.send(Err(error.clone()));
-    }
-}
-
-fn locked_error(state: &RwLock<WalState>) -> Option<WalError> {
-    state.blocking_read().error.clone()
-}
-
-fn set_poison(state: &RwLock<WalState>, error: WalError) {
-    let mut guard = state.blocking_write();
-    if guard.error.is_none() {
-        guard.error = Some(error);
-    }
 }

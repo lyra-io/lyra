@@ -13,14 +13,26 @@ use bytes::Bytes;
 /// A monotonically increasing WAL record identifier.
 pub type Sequence = u64;
 
+/// Lifecycle of the log, consulted by appends before enqueuing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Lifecycle {
+    /// The log is open and accepts appends.
+    #[default]
+    Running,
+    /// Shutdown has begun; new appends are rejected while pending ones drain.
+    Draining,
+    /// All background workers have stopped.
+    Closed,
+}
+
 /// Shared WAL runtime state, kept behind a lock on [`Log`].
 ///
 /// Internal: appends take a read lock to judge whether the log is still
-/// healthy before enqueuing, and the background worker takes a write lock to
-/// record the first fatal error.
+/// healthy before enqueuing, and shutdown takes a write lock to transition
+/// the lifecycle.
 #[derive(Default)]
 pub(crate) struct WalState {
-    pub(crate) error: Option<WalError>,
+    pub(crate) lifecycle: Lifecycle,
 }
 
 /// A write-ahead log that assigns an ordered [`Sequence`] to every appended
