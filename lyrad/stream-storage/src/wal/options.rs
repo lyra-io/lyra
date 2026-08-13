@@ -1,3 +1,5 @@
+//! Write-ahead log configuration.
+
 use crate::segment::IoMode;
 use std::path::PathBuf;
 

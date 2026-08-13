@@ -1,3 +1,5 @@
+//! Local file operations for stream storage segments.
+
 use super::IoMode;
 use super::error::SegmentError;
 use super::format::{ALIGNMENT, encode_file_header};

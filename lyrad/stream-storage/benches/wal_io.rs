@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lyrad::wal::{IoMode, Log, Wal, WalOptions};
+use lyra_stream_storage::{IoMode, Log, Wal, WalOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,7 +65,7 @@ async fn run_mode(
                 wal.append(payload.clone(), true).await?;
                 latencies.push(append_started.elapsed());
             }
-            Ok::<_, lyrad::wal::WalError>(latencies)
+            Ok::<_, lyra_stream_storage::WalError>(latencies)
         }));
     }
 

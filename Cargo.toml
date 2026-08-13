@@ -4,6 +4,8 @@ members = [
     "proto",
     "catalog",
     "lyrad",
+    "lyrad/stream-storage",
+    "lyrad/tiered-storage",
     "lyra/liblyra",
     "lyra/cli",
 ]

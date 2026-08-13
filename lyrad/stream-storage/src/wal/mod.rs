@@ -1,3 +1,5 @@
+//! Stateful write-ahead log API.
+
 mod error;
 mod options;
 mod runtime;

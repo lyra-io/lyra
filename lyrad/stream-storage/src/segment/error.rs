@@ -1,3 +1,5 @@
+//! Errors produced by stream storage segments.
+
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]

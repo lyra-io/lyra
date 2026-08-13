@@ -1,3 +1,5 @@
+//! Stateful write-ahead log runtime.
+
 use super::error::WalError;
 use super::options::WalOptions;
 use super::{Lifecycle, Sequence, Wal};

@@ -1,3 +1,5 @@
+//! Physical segment format and local I/O used by stream storage.
+
 mod error;
 mod format;
 mod io;

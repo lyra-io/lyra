@@ -5,18 +5,5 @@ edition = "2024"
 resolver = "3"
 
 [dependencies]
-async-trait = { workspace = true }
-bytes = { workspace = true }
-crc32c = { workspace = true }
-libc = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3.8"
-
-[[bench]]
-name = "wal_io"
-harness = false
+lyra-stream-storage = { path = "stream-storage" }
+lyra-tiered-storage = { path = "tiered-storage" }

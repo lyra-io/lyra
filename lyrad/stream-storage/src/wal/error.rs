@@ -1,3 +1,5 @@
+//! Errors produced by the stream storage write-ahead log.
+
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]

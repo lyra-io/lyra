@@ -1144,7 +1144,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lyrad"
+name = "lyra-stream-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1156,6 +1156,18 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "lyra-tiered-storage"
+version = "0.1.0"
+
+[[package]]
+name = "lyrad"
+version = "0.1.0"
+dependencies = [
+ "lyra-stream-storage",
+ "lyra-tiered-storage",
 ]
 
 [[package]]

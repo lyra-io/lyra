@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lyrad::wal::{IoMode, Log, Wal, WalError, WalOptions};
+use lyra_stream_storage::{IoMode, Log, Wal, WalError, WalOptions};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;

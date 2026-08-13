@@ -1,3 +1,5 @@
+//! Encoding and scanning for stream storage segment files.
+
 #[cfg(test)]
 use super::IoMode;
 use super::SegmentError;
