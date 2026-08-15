@@ -1,0 +1,26 @@
+# (*************************************************************************
+#  LYRA: UNIT CONFIGURATION
+#
+#  The unit is split by component type: liblyra (client-facing unit settings)
+#  and stream (local WAL and segments). Each component carries a `meta` block
+#  for its connection to the metadata service.
+# *************************************************************************)
+
+# (*************************************************************************
+#  liblyra - client library and unit settings
+# *************************************************************************)
+[liblyra]
+server = "127.0.0.1:7070"
+log_level = "info"
+meta.service_address = "localhost:6648"
+meta.namespace = "default"
+
+# (*************************************************************************
+#  stream - local stream storage (WAL and segments)
+# *************************************************************************)
+[stream]
+wal_dir = "/tmp/lyra-wal"
+io_mode = "standard"
+segments_dir = "/tmp/lyra-segments"
+meta.service_address = "localhost:6648"
+meta.namespace = "default"

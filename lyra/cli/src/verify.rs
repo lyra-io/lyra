@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 #[derive(clap::Args)]
 pub struct VerifyArgs {
     #[arg(long, default_value = "localhost:6648")]
-    pub catalog: String,
+    pub metadata: String,
 
     #[arg(long)]
     pub units: Option<String>,
@@ -178,15 +178,15 @@ impl Stats {
 }
 
 pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let catalog_opts = catalog::CatalogOptions {
-        service_address: args.catalog.clone(),
+    let metadata_opts = meta::MetadataOptions {
+        service_address: args.metadata.clone(),
         ..Default::default()
     };
-    let catalog = catalog::build_catalog(&catalog_opts).await?;
+    let metadata = meta::build_metadata(&metadata_opts).await?;
 
-    match catalog.list_units().await {
+    match metadata.list_units().await {
         Ok(units) => {
-            info!(count = units.len(), "units found in catalog");
+            info!(count = units.len(), "units found in metadata");
             for u in &units {
                 let addr = u
                     .unit
@@ -196,15 +196,15 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 info!(address = %addr, status = ?u.status(), "unit");
             }
         }
-        Err(e) => warn!(error = %e, "failed to list units from catalog (non-fatal)"),
+        Err(e) => warn!(error = %e, "failed to list units from metadata (non-fatal)"),
     }
 
-    match catalog.list_streams().await {
-        Ok(streams) => info!(count = streams.len(), "streams found in catalog"),
-        Err(e) => warn!(error = %e, "failed to list streams from catalog (non-fatal)"),
+    match metadata.list_streams().await {
+        Ok(streams) => info!(count = streams.len(), "streams found in metadata"),
+        Err(e) => warn!(error = %e, "failed to list streams from metadata (non-fatal)"),
     }
 
-    let lyra = Arc::new(Lyra::new(catalog, LyraOptions::new()));
+    let lyra = Arc::new(Lyra::new(metadata, LyraOptions::new()));
 
     info!(
         streams = args.streams,

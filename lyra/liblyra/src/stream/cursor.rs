@@ -2,10 +2,10 @@ use crate::Event;
 use crate::conn::Conn;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::LyraError;
-use catalog::{Catalog, CatalogRef};
+use meta::{Metadata, MetadataRef};
 use futures_util::{Stream, StreamExt};
-use lyra_proto::pb_catalog::Segment;
-use lyra_proto::pb_ext::{ChunkType, ReadEventsRequest};
+use meta::proto::pb_catalog::Segment;
+use meta::proto::pb_ext::{ChunkType, ReadEventsRequest};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -21,7 +21,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub struct EventStream {
     stream_id: i64,
     stream_name: String,
-    catalog: CatalogRef,
+    metadata: MetadataRef,
     pool: Arc<ConnPool>,
     position: Arc<AtomicI64>,
     inner: Option<InnerStream>,
@@ -39,14 +39,14 @@ impl EventStream {
     pub(crate) fn new(
         stream_id: i64,
         stream_name: String,
-        catalog: CatalogRef,
+        metadata: MetadataRef,
         pool: Arc<ConnPool>,
         start_offset: i64,
     ) -> Self {
         Self {
             stream_id,
             stream_name,
-            catalog,
+            metadata,
             pool,
             position: Arc::new(AtomicI64::new(start_offset)),
             inner: None,
@@ -91,13 +91,13 @@ impl EventStream {
     async fn open_inner(
         stream_id: i64,
         stream_name: &str,
-        catalog: &dyn Catalog,
+        metadata: &dyn Metadata,
         pool: &ConnPool,
         position: &Arc<AtomicI64>,
     ) -> Result<InnerStream, LyraError> {
         let start = position.load(Ordering::Relaxed);
 
-        let segment = catalog
+        let segment = metadata
             .get_segment_for_offset(stream_name, start)
             .await
             .map_err(|e| LyraError::Internal(format!("vfs lookup failed: {}", e)))?
@@ -171,12 +171,12 @@ impl Stream for EventStream {
             if self.inner.is_none() {
                 let stream_id = self.stream_id;
                 let stream_name = self.stream_name.clone();
-                let catalog = self.catalog.clone();
+                let metadata = self.metadata.clone();
                 let pool = self.pool.clone();
                 let position = self.position.clone();
 
                 let mut fut = Box::pin(async move {
-                    Self::open_inner(stream_id, &stream_name, catalog.as_ref(), &pool, &position)
+                    Self::open_inner(stream_id, &stream_name, metadata.as_ref(), &pool, &position)
                         .await
                 });
                 match fut.as_mut().poll(cx) {

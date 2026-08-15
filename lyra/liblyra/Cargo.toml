@@ -5,8 +5,7 @@ edition = "2024"
 resolver = "3"
 
 [dependencies]
-lyra-proto = { workspace = true }
-catalog = { path = "../../catalog" }
+meta = { path = "../../lyrad/meta" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }

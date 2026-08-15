@@ -1,7 +1,7 @@
 use super::{Conn, ConnOptions};
 use crate::error_inner::InnerError;
 use dashmap::DashMap;
-use lyra_proto::pb_ext::lyra_client::LyraClient;
+use meta::proto::pb_ext::lyra_client::LyraClient;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tonic::transport::{Channel, Endpoint};
 use tracing::info;

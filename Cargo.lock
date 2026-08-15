@@ -403,22 +403,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
-name = "catalog"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "liboxia",
- "lyra-proto",
- "prost 0.13.5",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tonic",
- "tracing",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,11 +1030,10 @@ dependencies = [
  "async-trait",
  "backoff",
  "base64",
- "catalog",
  "dashmap",
  "futures-util",
  "log",
- "lyra-proto",
+ "meta",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost 0.13.5",
@@ -1118,56 +1101,17 @@ dependencies = [
  "arrow-array",
  "arrow-flight",
  "arrow-schema",
- "catalog",
  "clap",
  "futures-util",
  "libc",
  "liblyra",
- "lyrad",
+ "meta",
  "serde",
  "tokio",
  "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "lyra-proto"
-version = "0.1.0"
-dependencies = [
- "prost 0.13.5",
- "prost-build",
- "prost-types 0.14.1",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
-name = "lyra-stream-storage"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "crc32c",
- "libc",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "lyra-tiered-storage"
-version = "0.1.0"
-
-[[package]]
-name = "lyrad"
-version = "0.1.0"
-dependencies = [
- "lyra-stream-storage",
- "lyra-tiered-storage",
 ]
 
 [[package]]
@@ -1190,6 +1134,24 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+
+[[package]]
+name = "meta"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "liboxia",
+ "prost 0.13.5",
+ "prost-build",
+ "prost-types 0.14.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tracing",
+]
 
 [[package]]
 name = "mime"
@@ -1803,6 +1765,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "stream"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "crc32c",
+ "libc",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1866,6 +1843,10 @@ checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "tiered"
+version = "0.1.0"
 
 [[package]]
 name = "tiny-keccak"

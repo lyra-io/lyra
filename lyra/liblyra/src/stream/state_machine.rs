@@ -4,11 +4,11 @@ use crate::error::LyraError;
 use crate::error_inner::InnerError;
 use crate::{Event as UserEvent, Offset, StreamOptions};
 use backoff::future;
-use catalog::error::CatalogError;
-use catalog::{CatalogRef, Versioned};
+use meta::error::MetadataError;
+use meta::{MetadataRef, Versioned};
 use futures_util::future::{join_all, select_all};
-use lyra_proto::pb_catalog::{Segment, StreamMeta, UnitInfo};
-use lyra_proto::pb_ext::{AppendEventsRequest, AppendEventsRequestItem};
+use meta::proto::pb_catalog::{Segment, StreamMeta, UnitInfo};
+use meta::proto::pb_ext::{AppendEventsRequest, AppendEventsRequestItem};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ struct AppendRequest {
 struct State {
     name: String,
     meta: StreamMeta,
-    catalog: CatalogRef,
+    metadata: MetadataRef,
     pool: Arc<ConnPool>,
     options: StreamOptions,
     lrs: i64,
@@ -60,14 +60,14 @@ pub(crate) struct StateMachine {
 impl StateMachine {
     pub async fn start(
         name: &str,
-        catalog: CatalogRef,
+        metadata: MetadataRef,
         pool: Arc<ConnPool>,
         options: &StreamOptions,
     ) -> Result<Self, LyraError> {
         let mut state = State {
             name: name.to_string(),
             meta: StreamMeta::default(),
-            catalog,
+            metadata,
             pool,
             options: options.clone(),
             lrs: 0,
@@ -184,7 +184,7 @@ where
             .collect();
 
         let new_ensemble =
-            find_replacement_ensemble(&state.catalog, &healthy, &mut quarantined).await;
+            find_replacement_ensemble(&state.metadata, &healthy, &mut quarantined).await;
 
         if let Err(e) = update_segment(state, &new_ensemble).await {
             warn!(error = %e, "failed to update vfs during recovery");
@@ -219,7 +219,7 @@ where
 }
 
 async fn find_replacement_ensemble(
-    catalog: &CatalogRef,
+    metadata: &MetadataRef,
     healthy: &VecDeque<UnitInfo>,
     quarantined: &mut VecDeque<UnitInfo>,
 ) -> Vec<UnitInfo> {
@@ -231,10 +231,10 @@ async fn find_replacement_ensemble(
         backoff,
         || async {
             loop {
-                let candidates = catalog
+                let candidates = metadata
                     .list_writable_units()
                     .await
-                    .map_err(|e| backoff::Error::transient(InnerError::Catalog(e)))?;
+                    .map_err(|e| backoff::Error::transient(InnerError::Metadata(e)))?;
                 let q = quarantined_mu.lock().unwrap();
                 match select_ensemble(&candidates, healthy, &q) {
                     Some(ensemble) => return Ok(ensemble),
@@ -310,13 +310,13 @@ fn subscribe_watches(
 
 async fn recover(state: &mut State) -> Result<(), LyraError> {
     state.meta = state
-        .catalog
+        .metadata
         .stream_new_term(&state.name)
         .await
         .map_err(|e| LyraError::Internal(e.to_string()))?;
 
     let writable_segment = get_or_init_last_segment(
-        state.catalog.clone(),
+        state.metadata.clone(),
         &state.meta.name,
         state.options.replication_factor,
     )
@@ -365,7 +365,7 @@ async fn recover(state: &mut State) -> Result<(), LyraError> {
         state.meta.lra = lra;
         state.lrs = lra;
         state.meta = state
-            .catalog
+            .metadata
             .stream_update(&state.meta, state.meta.version)
             .await
             .map_err(|e| LyraError::Internal(e.to_string()))?;
@@ -389,17 +389,17 @@ async fn recover(state: &mut State) -> Result<(), LyraError> {
 }
 
 async fn get_or_init_last_segment(
-    catalog: CatalogRef,
+    metadata: MetadataRef,
     stream_name: &str,
     replication_factor: usize,
-) -> Result<Versioned<Segment>, CatalogError> {
-    if let Some(last) = catalog.get_last_segment(stream_name).await? {
+) -> Result<Versioned<Segment>, MetadataError> {
+    if let Some(last) = metadata.get_last_segment(stream_name).await? {
         return Ok(last);
     }
 
-    let units = catalog.list_writable_units().await?;
+    let units = metadata.list_writable_units().await?;
     let ensemble = select_ensemble(&units, &EMPTY_UNITS, &EMPTY_UNITS).ok_or_else(|| {
-        CatalogError::NotFound(format!(
+        MetadataError::NotFound(format!(
             "need {} writable units, have {}",
             replication_factor,
             units.len()
@@ -410,12 +410,12 @@ async fn get_or_init_last_segment(
         start_offset: 1,
     };
 
-    match catalog.put_segment(stream_name, &segment, -1).await {
+    match metadata.put_segment(stream_name, &segment, -1).await {
         Ok(segment) => Ok(segment),
-        Err(CatalogError::VersionConflict { .. }) => catalog
+        Err(MetadataError::VersionConflict { .. }) => metadata
             .get_last_segment(stream_name)
             .await?
-            .ok_or_else(|| CatalogError::Internal("vfs vanished after conflict".into())),
+            .ok_or_else(|| MetadataError::Internal("vfs vanished after conflict".into())),
         Err(error) => Err(error),
     }
 }
@@ -524,7 +524,7 @@ fn prepare_batch(
             .unwrap()
             .as_millis() as i64;
 
-        let proto_event = lyra_proto::pb_ext::Event {
+        let proto_event = meta::proto::pb_ext::Event {
             stream_id: state.meta.stream_id,
             term: state.meta.term,
             offset,
@@ -604,7 +604,7 @@ async fn update_segment(state: &mut State, new_ensemble: &[UnitInfo]) -> Result<
     };
 
     let versioned = state
-        .catalog
+        .metadata
         .put_segment(&state.name, &segment, expected_version)
         .await
         .map_err(|e| LyraError::Internal(e.to_string()))?;

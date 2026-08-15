@@ -1,4 +1,4 @@
-use lyra_proto::pb_catalog::{UnitInfo, UnitRegistration, UnitStatus};
+use meta::proto::pb_catalog::{UnitInfo, UnitRegistration, UnitStatus};
 use std::collections::{HashMap, VecDeque};
 
 fn unit_info(u: &UnitRegistration) -> UnitInfo {

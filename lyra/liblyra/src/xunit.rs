@@ -1,7 +1,7 @@
 pub mod error;
 
 use async_trait::async_trait;
-use catalog::{
+use meta::{
     Action, ActionRequest, DatasetName, Offset, OffsetRange, PartitionId, SchemaId, SnapshotId,
     Versioned,
 };

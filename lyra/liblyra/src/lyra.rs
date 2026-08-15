@@ -4,7 +4,7 @@ use crate::error::LyraError;
 use crate::stream::Stream;
 use crate::xunit::{AppendRowsRequest, RowData, ScanRequest, XunitClient};
 use crate::{Event, Offset, StreamOptions};
-use catalog::{CatalogRef, Dataset, OffsetRange, Versioned};
+use meta::{MetadataRef, Dataset, OffsetRange, Versioned};
 use opentelemetry::metrics::Meter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -53,38 +53,38 @@ impl LyraOptions {
 }
 
 pub struct Lyra {
-    catalog: CatalogRef,
+    metadata: MetadataRef,
     pool: Arc<ConnPool>,
     xunit: Option<Arc<dyn XunitClient>>,
 }
 
 impl Lyra {
-    pub fn new(catalog: CatalogRef, options: LyraOptions) -> Self {
+    pub fn new(metadata: MetadataRef, options: LyraOptions) -> Self {
         Self {
             pool: Arc::new(ConnPool::new(options.conn_opts.clone())),
-            catalog,
+            metadata,
             xunit: None,
         }
     }
 
     pub fn with_xunit(
-        catalog: CatalogRef,
+        metadata: MetadataRef,
         options: LyraOptions,
         xunit: Arc<dyn XunitClient>,
     ) -> Self {
         Self {
             pool: Arc::new(ConnPool::new(options.conn_opts.clone())),
-            catalog,
+            metadata,
             xunit: Some(xunit),
         }
     }
 
     pub async fn create_dataset(&self, dataset: Dataset) -> Result<Versioned<Dataset>, LyraError> {
-        Ok(self.catalog.create_dataset(dataset).await?)
+        Ok(self.metadata.create_dataset(dataset).await?)
     }
 
     pub async fn open_dataset(&self, name: &str) -> Result<DatasetClient, LyraError> {
-        let dataset = self.catalog.get_dataset(name).await?;
+        let dataset = self.metadata.get_dataset(name).await?;
         let xunit = self.xunit.clone().ok_or_else(|| {
             LyraError::Internal("xunit client is required for dataset read/write in the MVP".into())
         })?;
@@ -103,7 +103,7 @@ impl Lyra {
         name: &str,
         options: StreamOptions,
     ) -> Result<Stream, LyraError> {
-        Stream::open(self.catalog.clone(), self.pool.clone(), name, options).await
+        Stream::open(self.metadata.clone(), self.pool.clone(), name, options).await
     }
 
     pub async fn open_readonly_stream(
@@ -111,12 +111,12 @@ impl Lyra {
         name: &str,
         options: StreamOptions,
     ) -> Result<Stream, LyraError> {
-        Stream::open_readonly(self.catalog.clone(), self.pool.clone(), name, options).await
+        Stream::open_readonly(self.metadata.clone(), self.pool.clone(), name, options).await
     }
 
     pub async fn drop_stream(&self, name: &str) -> Result<(), LyraError> {
-        let tc = self.catalog.get_stream(name).await?;
-        self.catalog.delete_stream(name, tc.version).await?;
+        let tc = self.metadata.get_stream(name).await?;
+        self.metadata.delete_stream(name, tc.version).await?;
         Ok(())
     }
 }
@@ -188,8 +188,8 @@ async fn next_dataset_offset(xunit: &dyn XunitClient, dataset: &str) -> Result<i
 mod tests {
     use super::*;
     use crate::xunit::{AppendRowsResponse, RowBatch, ScanResponse, error::XunitClientError};
-    use catalog::{
-        Action, ActionRequest, DataType, DatasetField, DatasetSchema, build_memory_catalog,
+    use meta::{
+        Action, ActionRequest, DataType, DatasetField, DatasetSchema, build_memory_metadata,
     };
     use std::sync::Mutex;
 
@@ -229,9 +229,9 @@ mod tests {
 
     #[tokio::test]
     async fn dataset_create_write_and_read_round_trip() {
-        let catalog = build_memory_catalog();
+        let metadata = build_memory_metadata();
         let xunit = Arc::new(TestXunit::default());
-        let lyra = Lyra::with_xunit(catalog, LyraOptions::new(), xunit);
+        let lyra = Lyra::with_xunit(metadata, LyraOptions::new(), xunit);
 
         lyra.create_dataset(Dataset::new(
             "events",

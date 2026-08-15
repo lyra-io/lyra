@@ -1,4 +1,4 @@
-use catalog::error::CatalogError;
+use meta::error::MetadataError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -12,8 +12,8 @@ pub enum InnerError {
     #[error("Invalid term: {expect} (actual: {actual})")]
     InvalidTerm { expect: i64, actual: i64 },
 
-    #[error("Catalog error: {0}")]
-    Catalog(#[from] CatalogError),
+    #[error("Metadata error: {0}")]
+    Metadata(#[from] MetadataError),
 
     #[error("Unit not enough: {0}")]
     UnitNotEnough(String),

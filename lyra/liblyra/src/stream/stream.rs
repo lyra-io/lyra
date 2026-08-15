@@ -3,14 +3,14 @@ use super::state_machine::StateMachine;
 use crate::conn::conn_pool::ConnPool;
 use crate::error::LyraError;
 use crate::{Event as UserEvent, Offset, ReadOptions, StartPosition, StreamOptions};
-use catalog::CatalogRef;
+use meta::MetadataRef;
 use std::sync::Arc;
 use tracing::info;
 
 struct StreamInner {
     stream_id: i64,
     stream_name: String,
-    catalog: CatalogRef,
+    metadata: MetadataRef,
     pool: Arc<ConnPool>,
     state_machine: Option<StateMachine>,
 }
@@ -22,12 +22,12 @@ pub struct Stream {
 
 impl Stream {
     pub async fn open(
-        catalog: CatalogRef,
+        metadata: MetadataRef,
         pool: Arc<ConnPool>,
         name: &str,
         options: StreamOptions,
     ) -> Result<Self, LyraError> {
-        let sm = StateMachine::start(name, catalog.clone(), pool.clone(), &options).await?;
+        let sm = StateMachine::start(name, metadata.clone(), pool.clone(), &options).await?;
 
         info!(
             stream_id = sm.stream_id(),
@@ -39,7 +39,7 @@ impl Stream {
             inner: Arc::new(StreamInner {
                 stream_id: sm.stream_id(),
                 stream_name: name.to_string(),
-                catalog,
+                metadata,
                 pool,
                 state_machine: Some(sm),
             }),
@@ -47,12 +47,12 @@ impl Stream {
     }
 
     pub async fn open_readonly(
-        catalog: CatalogRef,
+        metadata: MetadataRef,
         pool: Arc<ConnPool>,
         name: &str,
         _options: StreamOptions,
     ) -> Result<Self, LyraError> {
-        let tc = catalog
+        let tc = metadata
             .get_stream(name)
             .await
             .map_err(|_| LyraError::StreamNotFound(name.to_string()))?;
@@ -67,7 +67,7 @@ impl Stream {
             inner: Arc::new(StreamInner {
                 stream_id: tc.stream_id,
                 stream_name: name.to_string(),
-                catalog,
+                metadata,
                 pool,
                 state_machine: None,
             }),
@@ -93,7 +93,7 @@ impl Stream {
             StartPosition::Latest => {
                 let tc = self
                     .inner
-                    .catalog
+                    .metadata
                     .get_stream(&self.inner.stream_name)
                     .await
                     .map_err(|e| LyraError::Internal(format!("failed to get stream: {}", e)))?;
@@ -110,7 +110,7 @@ impl Stream {
         let mut stream = EventStream::new(
             self.inner.stream_id,
             self.inner.stream_name.clone(),
-            self.inner.catalog.clone(),
+            self.inner.metadata.clone(),
             self.inner.pool.clone(),
             start_offset,
         );

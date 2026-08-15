@@ -3,8 +3,8 @@ use liblyra::{Event, StreamOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = catalog::build_catalog(&catalog::CatalogOptions::default()).await?;
-    let lyra = Lyra::new(catalog, LyraOptions::new());
+    let metadata = meta::build_metadata(&meta::MetadataOptions::default()).await?;
+    let lyra = Lyra::new(metadata, LyraOptions::new());
     let stream = lyra
         .open_stream("append-example", StreamOptions::new().replication_factor(1))
         .await?;

@@ -1,14 +1,35 @@
 use crate::banner;
+use crate::options::UnitOptions;
 use crate::process;
-use lyrad::option::unit_options::UnitOptions;
-use lyrad::unit::Unit;
 use std::io::IsTerminal;
 use std::path::Path;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/lyra/conf/unit.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/lyra/options/lyra.toml";
 const DEFAULT_PID_FILE: &str = "lyra-unit.pid";
+
+/// Placeholder for the unit runtime.
+///
+/// The original `Unit` (gRPC service over storage) lived in the monolithic
+/// `lyrad` crate and was removed when storage split into the `meta`/`stream`/
+/// `tiered` crates. It has not been ported yet, so startup fails fast with a
+/// clear message instead of silently doing nothing.
+pub struct Unit;
+
+impl Unit {
+    pub async fn new(_options: UnitOptions) -> Result<Self, Box<dyn std::error::Error>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the unit runtime has not been ported yet after the lyrad storage split",
+        )
+        .into())
+    }
+
+    pub async fn stop(self) {
+        info!("unit stopped");
+    }
+}
 
 #[derive(clap::Subcommand)]
 pub enum UnitAction {
@@ -37,7 +58,7 @@ pub async fn run(action: UnitAction) -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(&options.log.level)),
+                        .unwrap_or_else(|_| EnvFilter::new(&options.liblyra.log_level)),
                 )
                 .with_ansi(std::io::stderr().is_terminal())
                 .with_target(false)

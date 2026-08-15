@@ -12,7 +12,7 @@ use tonic::transport::{Channel, Endpoint};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/lyra/conf/sql.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/lyra/options/sql.toml";
 
 #[derive(Debug, Args)]
 pub struct SqlArgs {

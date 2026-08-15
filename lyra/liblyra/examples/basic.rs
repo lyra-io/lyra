@@ -3,9 +3,9 @@ use liblyra::{Event, StreamOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = catalog::build_catalog(&catalog::CatalogOptions::default()).await?;
+    let metadata = meta::build_metadata(&meta::MetadataOptions::default()).await?;
 
-    let lyra = Lyra::new(catalog, LyraOptions::new());
+    let lyra = Lyra::new(metadata, LyraOptions::new());
 
     let stream = lyra
         .open_stream("example-stream", StreamOptions::new().replication_factor(1))
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("batch offsets: {}, {}, {}", r1?.0, r2?.0, r3?.0);
 
-    // TODO: read will be reimplemented with catalog-based reader
+    // TODO: read will be reimplemented with metadata-based reader
 
     stream.close().await;
 
