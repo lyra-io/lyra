@@ -9,18 +9,12 @@ meta = { path = "../../lyrad/meta" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
-async-stream = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
-prost = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-base64 = "0.22"
 backoff = { version = "0.4", features = ["tokio"] }
-log = "0.4.28"

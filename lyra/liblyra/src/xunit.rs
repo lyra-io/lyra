@@ -1,13 +1,27 @@
 pub mod error;
 
+use crate::Offset;
 use async_trait::async_trait;
-use meta::{
-    Action, ActionRequest, DatasetName, Offset, OffsetRange, PartitionId, SchemaId, SnapshotId,
-    Versioned,
-};
 use serde::{Deserialize, Serialize};
 
 pub use error::XunitClientError;
+
+pub type DatasetName = String;
+pub type PartitionId = String;
+pub type SchemaId = i64;
+pub type SnapshotId = String;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffsetRange {
+    pub start: Offset,
+    pub end: Offset,
+}
+
+impl OffsetRange {
+    pub fn new(start: Offset, end: Offset) -> Self {
+        Self { start, end }
+    }
+}
 
 #[async_trait]
 pub trait XunitClient: Send + Sync {
@@ -17,11 +31,6 @@ pub trait XunitClient: Send + Sync {
     ) -> Result<AppendRowsResponse, XunitClientError>;
 
     async fn scan(&self, request: ScanRequest) -> Result<ScanResponse, XunitClientError>;
-
-    async fn submit_action(
-        &self,
-        request: ActionRequest,
-    ) -> Result<Versioned<Action>, XunitClientError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

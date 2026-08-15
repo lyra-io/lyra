@@ -9,8 +9,6 @@ name = "lyra"
 path = "src/main.rs"
 
 [dependencies]
-liblyra = { path = "../liblyra" }
-meta = { path = "../../lyrad/meta" }
 arrow-array = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }

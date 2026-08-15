@@ -1,6 +1,5 @@
 use crate::error_inner::InnerError;
 use crate::xunit::error::XunitClientError;
-use meta::error::MetadataError;
 use thiserror::Error;
 
 #[derive(Error, Debug, Clone)]
@@ -22,9 +21,6 @@ pub enum LyraError {
 
     #[error("Unit not enough: {0}")]
     UnitNotEnough(String),
-
-    #[error("Metadata error: {0}")]
-    Metadata(#[from] MetadataError),
 
     #[error("XUnit error: {0}")]
     Xunit(#[from] XunitClientError),
@@ -54,7 +50,6 @@ impl From<InnerError> for LyraError {
                 current: actual,
                 requested: expect,
             },
-            InnerError::Metadata(error) => LyraError::Metadata(error),
             InnerError::UnitNotEnough(message) => LyraError::UnitNotEnough(message),
             InnerError::Canceled => LyraError::Canceled,
         }
