@@ -6,4 +6,4 @@
 pub mod segment;
 pub mod wal;
 
-pub use wal::{IoMode, Log, Sequence, Wal, WalError, WalOptions};
+pub use wal::{IoMode, Log, LogOptions, Sequence, Wal, WalError};

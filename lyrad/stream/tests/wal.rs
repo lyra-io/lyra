@@ -1,16 +1,16 @@
 use bytes::Bytes;
-use stream::{IoMode, Log, Wal, WalError, WalOptions};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
+use stream::{IoMode, Log, LogOptions, Wal, WalError};
 
-fn standard_options(path: &std::path::Path) -> WalOptions {
-    let mut options = WalOptions::new(path);
+fn standard_options(path: &std::path::Path) -> LogOptions {
+    let mut options = LogOptions::new(path);
     options.io_mode = IoMode::Standard;
     options
 }
 
-async fn open_wal(options: WalOptions) -> Result<Arc<Log>, WalError> {
+async fn open_wal(options: LogOptions) -> Result<Arc<Log>, WalError> {
     Log::open(options).await
 }
 
@@ -38,31 +38,6 @@ async fn appends_return_sequential_sequences() {
             .unwrap(),
         2
     );
-    wal.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn rotates_segment_files_without_changing_sequence_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut options = standard_options(dir.path());
-    options.max_segment_size = 8192;
-    let wal = open_wal(options).await.unwrap();
-
-    for value in 0..4u8 {
-        assert_eq!(
-            wal.append(Bytes::from(vec![value; 128]), true)
-                .await
-                .unwrap(),
-            value as u64
-        );
-    }
-
-    let segment_count = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "seg"))
-        .count();
-    assert_eq!(segment_count, 4);
     wal.shutdown().await.unwrap();
 }
 
@@ -112,9 +87,7 @@ async fn shutdown_is_idempotent_and_rejects_new_appends() {
 #[tokio::test]
 async fn large_payload_appends_without_a_record_size_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = standard_options(dir.path());
-    options.max_segment_size = 64 * 1024;
-    let wal = open_wal(options).await.unwrap();
+    let wal = open_wal(standard_options(dir.path())).await.unwrap();
     let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
 
     assert_eq!(wal.append(payload, true).await.unwrap(), 0);
@@ -122,21 +95,36 @@ async fn large_payload_appends_without_a_record_size_limit() {
 }
 
 #[tokio::test]
-async fn open_fails_when_directory_contains_existing_segments() {
+async fn reopen_recovers_sequences_and_reads_back_records() {
     let dir = tempfile::tempdir().unwrap();
     let options = standard_options(dir.path());
-    let wal = open_wal(options.clone()).await.unwrap();
-    wal.append(Bytes::from_static(b"written"), true)
-        .await
-        .unwrap();
-    wal.shutdown().await.unwrap();
+    {
+        let wal = open_wal(options.clone()).await.unwrap();
+        for value in 0..3u8 {
+            assert_eq!(
+                wal.append(Bytes::from(vec![value]), true).await.unwrap(),
+                value as u64
+            );
+        }
+        wal.shutdown().await.unwrap();
+    }
     assert_eq!(segment_count(dir.path()), 1);
 
-    match open_wal(options).await {
-        Ok(_) => panic!("WAL with existing segments unexpectedly reopened"),
-        Err(WalError::ExistingSegments { .. }) => {}
-        Err(error) => panic!("unexpected open error: {error}"),
+    let wal = open_wal(options).await.unwrap();
+    for sequence in 0..3u64 {
+        assert_eq!(
+            wal.read(sequence).await.unwrap().unwrap(),
+            Bytes::from(vec![sequence as u8])
+        );
     }
+    assert_eq!(wal.read(3).await.unwrap(), None);
+
+    // Sequence numbering resumes after the last durable record.
+    assert_eq!(
+        wal.append(Bytes::from_static(b"next"), true).await.unwrap(),
+        3
+    );
+    wal.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

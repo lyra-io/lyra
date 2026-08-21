@@ -4,10 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum WalError {
-    /// The supplied [`WalOptions`](super::WalOptions) failed validation.
-    #[error("invalid WAL options: {0}")]
-    InvalidOptions(String),
-
     /// The WAL was shut down or is no longer accepting appends.
     #[error("WAL is closed")]
     Closed,
@@ -19,11 +15,6 @@ pub enum WalError {
     /// On-disk data failed validation and cannot be safely recovered.
     #[error("WAL corruption in {path}: {message}")]
     Corruption { path: PathBuf, message: String },
-
-    /// The WAL directory already contains segment files from a previous run,
-    /// which this build does not recover.
-    #[error("WAL directory {path} already contains segments; recovery is not supported")]
-    ExistingSegments { path: PathBuf },
 
     /// An internal background worker failed.
     #[error("WAL worker failed: {0}")]

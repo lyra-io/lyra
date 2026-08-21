@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use stream::{IoMode, Log, Wal, WalOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use stream::{IoMode, Log, LogOptions, Wal};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -41,7 +41,7 @@ async fn run_mode(
     concurrency: usize,
 ) {
     let dir = tempfile::tempdir().expect("create benchmark directory");
-    let mut options = WalOptions::new(dir.path());
+    let mut options = LogOptions::new(dir.path());
     options.io_mode = io_mode;
 
     let wal = match Log::open(options).await {
