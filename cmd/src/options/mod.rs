@@ -9,21 +9,12 @@ pub mod stream;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UnitOptions {
     #[serde(default)]
     pub liblyra: LiblyraOptions,
     #[serde(default)]
     pub stream: stream::StreamOptions,
-}
-
-impl Default for UnitOptions {
-    fn default() -> Self {
-        Self {
-            liblyra: LiblyraOptions::default(),
-            stream: stream::StreamOptions::default(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

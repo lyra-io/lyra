@@ -9,7 +9,7 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY lyrad/ lyrad/
-COPY lyra/ lyra/
+COPY cmd/ cmd/
 
 RUN cargo build --release -p lyra-cli
 
