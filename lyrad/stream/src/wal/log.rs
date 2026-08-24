@@ -20,12 +20,11 @@ use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
 use std::any::Any;
 use std::collections::HashSet;
-use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Result as IoResult};
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::{self, Builder as ThreadBuilder, JoinHandle};
+use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -53,7 +52,6 @@ pub struct SegmentLog {
     state: RwLock<Lifecycle>,
 }
 
-const RETRY_DELAY: Duration = Duration::from_millis(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_FILE_NAME: &str = ".lyra-wal.lock";
 
@@ -66,16 +64,6 @@ struct WorkerThread {
     // Control state
     handle: Option<JoinHandle<()>>,
     done: oneshot::Receiver<()>,
-}
-
-fn lock_directory(dir: &Path) -> Result<DirectoryLock, LogError> {
-    match DirectoryLock::acquire(dir.join(LOCK_FILE_NAME)) {
-        Ok(lock) => Ok(lock),
-        Err(error) if error.kind() == ErrorKind::WouldBlock => {
-            Err(LogError::Locked(dir.to_path_buf()))
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 impl SegmentLog {
@@ -116,11 +104,11 @@ impl SegmentLog {
 
         let (sync_done_tx, sync_done) = oneshot::channel();
         let sync_handle = ThreadBuilder::new().name("lyra-wal-sync".into()).spawn({
-            let context = context.clone();
             let dir = options.dir.clone();
             let last_synced_tx = last_synced_tx.clone();
             move || {
-                sync_loop(context, sync_rx, dir.as_path(), last_synced_tx);
+                sync_loop(sync_rx, dir.as_path(), last_synced_tx);
+                tracing::info!("WAL sync thread exited");
                 let _ = sync_done_tx.send(());
             }
         })?;
@@ -129,13 +117,20 @@ impl SegmentLog {
         let (writer_done_tx, writer_done) = oneshot::channel();
         let recover_records = pending_tx.is_some();
         let writer_handle = match ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
-            let context = context.clone();
             let options = options.clone();
             move || {
-                match lock_directory(&options.dir).and_then(|directory_lock| {
-                    recover_state(&options.dir, recover_records)
-                        .map(|recovered| (directory_lock, recovered))
-                }) {
+                match DirectoryLock::acquire(options.dir.join(LOCK_FILE_NAME))
+                    .map_err(|error| {
+                        if error.kind() == ErrorKind::WouldBlock {
+                            LogError::Locked(options.dir.clone())
+                        } else {
+                            error.into()
+                        }
+                    })
+                    .and_then(|directory_lock| {
+                        recover_state(&options.dir, recover_records)
+                            .map(|recovered| (directory_lock, recovered))
+                    }) {
                     Ok((
                         directory_lock,
                         (next_sequence, next_segment_number, recovered_batches),
@@ -146,7 +141,6 @@ impl SegmentLog {
                             .is_ok()
                         {
                             writer_loop(
-                                context,
                                 operation_rx,
                                 sync_tx,
                                 pending_tx,
@@ -161,6 +155,7 @@ impl SegmentLog {
                         let _ = writer_started_tx.send(Err(error));
                     }
                 }
+                tracing::info!("WAL writer thread exited");
                 let _ = writer_done_tx.send(());
             }
         }) {
@@ -367,7 +362,6 @@ async fn close_tasks(tasks: &Mutex<Option<JoinSet<()>>>) {
 }
 
 fn writer_loop(
-    context: CancellationToken,
     mut operation_rx: mpsc::Receiver<Operation>,
     sync_tx: mpsc::Sender<Operation>,
     pending_publish_tx: Option<mpsc::Sender<PublishBatch>>,
@@ -388,44 +382,58 @@ fn writer_loop(
             break;
         }
 
-        let mut batch = Vec::new();
-        let mut closing = false;
+        let mut batch = Vec::with_capacity(received);
+        let mut records = Vec::with_capacity(received);
+        let mut batch_error = None;
+        let mut write_then_close = false;
         for operation in operations {
             match operation {
-                Operation::Append(request) => batch.push(request),
+                Operation::Append(append_op) => {
+                    if batch_error.is_none() {
+                        let sequence = next_sequence;
+                        if let Some(incremented) = sequence.checked_add(1) {
+                            records.push((sequence, append_op.payload.clone()));
+                            next_sequence = incremented;
+                        } else {
+                            batch_error =
+                                Some(LogError::Worker("WAL sequence space exhausted".into()));
+                        }
+                    }
+                    batch.push(append_op);
+                }
                 Operation::Sync(_) => unreachable!("sync operation sent to WAL writer"),
                 Operation::Close => {
                     operation_rx.close();
-                    closing = true;
+                    write_then_close = true;
                 }
             }
         }
+        if let Some(error) = batch_error {
+            for append_op in batch {
+                let _ = append_op.response.send(Err(error.clone()));
+            }
+            break;
+        }
         if batch.is_empty() {
-            if closing {
+            if write_then_close {
                 break;
             }
             continue;
         }
 
-        let records = match assign_records(&batch, &mut next_sequence) {
-            Ok(records) => records,
-            Err(error) => {
-                respond_to_batch(batch, error);
-                break;
+        if let Err(error) = write_records_with_segment_size(
+            &records,
+            &mut next_segment_number,
+            &mut active,
+            &mut dirty_files,
+            &mut directory_dirty,
+            &options,
+            WAL_SEGMENT_SIZE,
+        ) {
+            tracing::error!(error = %error, "WAL write failed");
+            for append_op in batch {
+                let _ = append_op.response.send(Err(error.clone()));
             }
-        };
-        if let Err(error) = retry_until_cancelled(&context, || {
-            write_records(
-                &records,
-                &mut next_segment_number,
-                &mut active,
-                &mut dirty_files,
-                &mut directory_dirty,
-                &options,
-            )
-        }) {
-            tracing::error!(error = %error, "WAL write failed during close and was ignored");
-            respond_to_batch(batch, LogError::Closed);
             break;
         }
 
@@ -460,7 +468,7 @@ fn writer_loop(
             break;
         }
 
-        if closing {
+        if write_then_close {
             break;
         }
     }
@@ -471,7 +479,6 @@ fn writer_loop(
 }
 
 fn sync_loop(
-    context: CancellationToken,
     mut sync_rx: mpsc::Receiver<Operation>,
     dir: &Path,
     last_synced_sequence: watch::Sender<Option<Sequence>>,
@@ -505,9 +512,7 @@ fn sync_loop(
         }
 
         if let Some(last_sequence) = last_sequence {
-            match retry_until_cancelled(&context, || {
-                perform_sync(&files, sync_dir, dir).map_err(LogError::from)
-            }) {
+            match perform_sync(&files, sync_dir, dir).map_err(LogError::from) {
                 Ok(()) => {
                     last_synced_sequence.send_replace(Some(last_sequence));
                     for (sequence, waiter) in waiters {
@@ -515,10 +520,11 @@ fn sync_loop(
                     }
                 }
                 Err(error) => {
-                    tracing::error!(error = %error, "WAL sync failed during close and was ignored");
+                    tracing::error!(error = %error, "WAL sync failed");
                     for (_, waiter) in waiters {
                         let _ = waiter.send(Err(error.clone()));
                     }
+                    break;
                 }
             }
         }
@@ -526,12 +532,6 @@ fn sync_loop(
         if closing {
             break;
         }
-    }
-}
-
-fn respond_to_batch(batch: Vec<AppendOp>, error: LogError) {
-    for request in batch {
-        let _ = request.response.send(Err(error.clone()));
     }
 }
 
@@ -613,38 +613,6 @@ fn decode_sequence(path: &Path, record: &[u8]) -> Result<Sequence, LogError> {
     Ok(u64::from_le_bytes(prefix.try_into().unwrap()))
 }
 
-fn assign_records(
-    batch: &[AppendOp],
-    next_sequence: &mut Sequence,
-) -> Result<Vec<(Sequence, Bytes)>, LogError> {
-    let mut records = Vec::with_capacity(batch.len());
-    for request in batch {
-        let sequence = *next_sequence;
-        records.push((sequence, request.payload.clone()));
-        let incremented = sequence
-            .checked_add(1)
-            .ok_or_else(|| LogError::Worker("WAL sequence space exhausted".into()))?;
-        *next_sequence = incremented;
-    }
-    Ok(records)
-}
-
-fn retry_until_cancelled<E: Display>(
-    context: &CancellationToken,
-    mut attempt: impl FnMut() -> Result<(), E>,
-) -> Result<(), E> {
-    loop {
-        match attempt() {
-            Ok(()) => return Ok(()),
-            Err(error) if context.is_cancelled() => return Err(error),
-            Err(error) => {
-                tracing::warn!(error = %error, "WAL operation failed; it will be retried");
-                thread::sleep(RETRY_DELAY);
-            }
-        }
-    }
-}
-
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
     if let Some(message) = panic.downcast_ref::<&str>() {
         (*message).to_owned()
@@ -653,25 +621,6 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     } else {
         "WAL worker thread panicked".into()
     }
-}
-
-fn write_records(
-    records: &[(Sequence, Bytes)],
-    next_segment_number: &mut u64,
-    active: &mut Option<(u64, Arc<SegmentFile>, u64)>,
-    dirty_files: &mut Vec<Arc<SegmentFile>>,
-    directory_dirty: &mut bool,
-    options: &LogOptions,
-) -> Result<(), LogError> {
-    write_records_with_segment_size(
-        records,
-        next_segment_number,
-        active,
-        dirty_files,
-        directory_dirty,
-        options,
-        WAL_SEGMENT_SIZE,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -687,7 +636,16 @@ fn write_records_with_segment_size(
     ensure_active_segment(next_segment_number, active, directory_dirty, options)?;
     let mut encoded = {
         let (number, _, offset) = active.as_ref().unwrap();
-        encode_batch(*number, *offset, records)?
+        let prefixes: Vec<_> = records
+            .iter()
+            .map(|(sequence, _)| sequence.to_le_bytes())
+            .collect();
+        let segment_records: Vec<_> = records
+            .iter()
+            .zip(&prefixes)
+            .map(|((_, payload), prefix)| SegmentRecord { prefix, payload })
+            .collect();
+        encode_segment_batch(*number, *offset, &segment_records)?
     };
 
     let should_rotate = {
@@ -699,7 +657,16 @@ fn write_records_with_segment_size(
         *active = None;
         ensure_active_segment(next_segment_number, active, directory_dirty, options)?;
         let (number, _, offset) = active.as_ref().unwrap();
-        encoded = encode_batch(*number, *offset, records)?;
+        let prefixes: Vec<_> = records
+            .iter()
+            .map(|(sequence, _)| sequence.to_le_bytes())
+            .collect();
+        let segment_records: Vec<_> = records
+            .iter()
+            .zip(&prefixes)
+            .map(|((_, payload), prefix)| SegmentRecord { prefix, payload })
+            .collect();
+        encoded = encode_segment_batch(*number, *offset, &segment_records)?;
     }
 
     let buffer = AlignedBuffer::from_slice(&encoded);
@@ -732,23 +699,6 @@ fn ensure_active_segment(
     *directory_dirty = true;
     *active = Some((number, file, FILE_HEADER_SIZE as u64));
     Ok(())
-}
-
-fn encode_batch(
-    segment_number: u64,
-    start_offset: u64,
-    records: &[(Sequence, Bytes)],
-) -> Result<Vec<u8>, LogError> {
-    let prefixes: Vec<_> = records
-        .iter()
-        .map(|(sequence, _)| sequence.to_le_bytes())
-        .collect();
-    let records: Vec<_> = records
-        .iter()
-        .zip(&prefixes)
-        .map(|((_, payload), prefix)| SegmentRecord { prefix, payload })
-        .collect();
-    encode_segment_batch(segment_number, start_offset, &records).map_err(Into::into)
 }
 
 fn perform_sync(files: &[Arc<SegmentFile>], sync_dir: bool, dir: &Path) -> IoResult<()> {

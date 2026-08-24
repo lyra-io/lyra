@@ -311,29 +311,24 @@ async fn close_flushes_unsynced_appends() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn close_cancels_a_retrying_write_without_stranding_its_caller() {
+async fn write_failure_does_not_strand_its_caller() {
     let root = tempfile::tempdir().unwrap();
     let wal_dir = root.path().join("wal");
     let moved_dir = root.path().join("moved");
     let wal = open_wal(standard_options(&wal_dir)).await.unwrap();
     std::fs::rename(&wal_dir, moved_dir).unwrap();
 
-    let append = {
-        let wal = Arc::clone(&wal);
-        tokio::spawn(async move { wal.append(Bytes::from_static(b"blocked"), true).await })
-    };
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        wal.append(Bytes::from_static(b"blocked"), true),
+    )
+    .await
+    .expect("append timed out");
+    assert!(matches!(result, Err(LogError::Io(_))));
 
     tokio::time::timeout(Duration::from_secs(5), wal.close())
         .await
         .expect("close timed out");
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), append)
-            .await
-            .expect("append timed out")
-            .unwrap(),
-        Err(LogError::Closed)
-    );
 }
 
 #[tokio::test]
