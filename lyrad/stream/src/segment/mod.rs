@@ -1,14 +1,18 @@
 //! Physical segment format and local I/O used by stream storage.
 
 mod error;
+mod file_segment;
 mod format;
 mod io;
 
 pub use error::SegmentError;
-pub use io::SegmentFile;
+pub use file_segment::FileSegment;
 
-pub(crate) use format::{FILE_HEADER_SIZE, SegmentRecord, encode_batch, scan_segment};
-pub(crate) use io::{AlignedBuffer, list_segment_files, sync_directory};
+#[cfg(test)]
+pub(crate) use format::FILE_HEADER_SIZE;
+pub(crate) use io::{SegmentFile, list_segment_files, sync_directory};
+
+use bytes::Bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
@@ -19,4 +23,27 @@ pub enum IoMode {
     DirectRequired,
     /// Use the operating system page cache for all I/O.
     Standard,
+}
+
+/// A logical record position within one segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentOffset(u64);
+
+/// The result of attempting to append one record to a segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendResult {
+    Appended(SegmentOffset),
+    Full,
+}
+
+/// Record-level operations supported by a local segment.
+pub trait Segment {
+    /// Appends one payload or reports that the record area is full.
+    fn append(&mut self, payload: &[u8]) -> Result<AppendResult, SegmentError>;
+
+    /// Reads one payload by its segment-local offset.
+    fn read(&self, offset: SegmentOffset) -> Result<Option<Bytes>, SegmentError>;
+
+    /// Makes the segment immutable and writes its index and footer.
+    fn seal(&mut self) -> Result<(), SegmentError>;
 }

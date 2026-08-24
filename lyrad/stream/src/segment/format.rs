@@ -1,18 +1,25 @@
 //! Encoding and scanning for stream storage segment files.
 
+#[cfg(test)]
 use super::IoMode;
 use super::SegmentError;
 use super::io::SegmentFile;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) const ALIGNMENT: usize = 4096;
 pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
 pub(crate) const FILE_HEADER_SIZE: usize = ALIGNMENT;
 const FILE_MAGIC: &[u8; 8] = b"LYRASEG\0";
-const FILE_VERSION: u16 = 2;
+const FILE_VERSION: u16 = 3;
 const FILE_HEADER_FIELDS_SIZE: usize = 32;
-const PHYSICAL_HEADER_SIZE: usize = 11;
+const FOOTER_MAGIC: &[u8; 8] = b"LYRAIDX\0";
+const FOOTER_VERSION: u16 = 1;
+const FOOTER_FIELDS_SIZE: usize = 52;
+const FOOTER_SIZE: usize = ALIGNMENT;
+const INDEX_ENTRY_SIZE: usize = size_of::<u64>();
+pub(crate) const PHYSICAL_HEADER_SIZE: usize = 11;
 const CRC_MASK_DELTA: u32 = 0xa282_ead8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,13 +46,27 @@ impl RecordType {
 #[derive(Debug)]
 pub(crate) struct SegmentScan {
     pub(crate) segment_number: u64,
-    pub(crate) records: Vec<Bytes>,
+    pub(crate) index: Vec<u64>,
     pub(crate) valid_len: u64,
 }
 
-pub(crate) struct SegmentRecord<'a> {
-    pub(crate) prefix: &'a [u8],
-    pub(crate) payload: &'a [u8],
+pub(crate) struct LoadedIndex {
+    pub(crate) segment_number: u64,
+    pub(crate) records_size: u64,
+    pub(crate) index: Vec<u64>,
+}
+
+struct SegmentFooter {
+    segment_number: u64,
+    records_size: u64,
+    record_count: u64,
+    index_size: u64,
+    index_checksum: u32,
+}
+
+struct ScannedRecord {
+    position: u64,
+    payload: Bytes,
 }
 
 pub(crate) fn encode_file_header(segment_number: u64) -> Vec<u8> {
@@ -61,38 +82,143 @@ pub(crate) fn encode_file_header(segment_number: u64) -> Vec<u8> {
     header
 }
 
-pub(crate) fn encode_batch(
+pub(crate) fn encode_index_footer(
+    segment_number: u64,
+    records_size: u64,
+    index: &[u64],
+) -> Result<Vec<u8>, SegmentError> {
+    let entries_size = index
+        .len()
+        .checked_mul(INDEX_ENTRY_SIZE)
+        .ok_or(SegmentError::OffsetExhausted)?;
+    let index_size = if entries_size == 0 {
+        0
+    } else {
+        align_up(entries_size, ALIGNMENT)
+    };
+    let tail_size = index_size
+        .checked_add(FOOTER_SIZE)
+        .ok_or(SegmentError::OffsetExhausted)?;
+    let mut output = vec![0; tail_size];
+    for (entry, bytes) in index.iter().zip(output[..entries_size].chunks_exact_mut(8)) {
+        bytes.copy_from_slice(&entry.to_le_bytes());
+    }
+
+    let (index_bytes, footer) = output.split_at_mut(index_size);
+    footer[..8].copy_from_slice(FOOTER_MAGIC);
+    footer[8..10].copy_from_slice(&FOOTER_VERSION.to_le_bytes());
+    footer[10..12].copy_from_slice(&(FOOTER_FIELDS_SIZE as u16).to_le_bytes());
+    footer[12..20].copy_from_slice(&segment_number.to_le_bytes());
+    footer[20..28].copy_from_slice(&records_size.to_le_bytes());
+    footer[28..36].copy_from_slice(
+        &u64::try_from(index.len())
+            .map_err(|_| SegmentError::OffsetExhausted)?
+            .to_le_bytes(),
+    );
+    footer[36..44].copy_from_slice(
+        &u64::try_from(index_size)
+            .map_err(|_| SegmentError::OffsetExhausted)?
+            .to_le_bytes(),
+    );
+    footer[44..48].copy_from_slice(&crc32c::crc32c(index_bytes).to_le_bytes());
+    let footer_checksum = crc32c::crc32c(&footer[..48]);
+    footer[48..52].copy_from_slice(&footer_checksum.to_le_bytes());
+    Ok(output)
+}
+
+pub(crate) fn load_index(file: &SegmentFile) -> Result<Option<LoadedIndex>, SegmentError> {
+    let file_len = file.len()?;
+    let Some(footer_start) = file_len.checked_sub(FOOTER_SIZE as u64) else {
+        return Ok(None);
+    };
+    let footer_bytes = file.read_at(footer_start, FOOTER_SIZE)?;
+    let Some(footer) = decode_footer(&footer_bytes) else {
+        return Ok(None);
+    };
+
+    let entries_size = footer
+        .record_count
+        .checked_mul(INDEX_ENTRY_SIZE as u64)
+        .ok_or_else(|| corruption_error(file.path(), "segment index size overflows u64"))?;
+    let expected_index_size = if entries_size == 0 {
+        0
+    } else {
+        entries_size
+            .checked_next_multiple_of(ALIGNMENT as u64)
+            .ok_or_else(|| corruption_error(file.path(), "aligned segment index size overflows"))?
+    };
+    if footer.index_size != expected_index_size {
+        return Ok(None);
+    }
+
+    let Some(index_start) = footer_start.checked_sub(footer.index_size) else {
+        return Ok(None);
+    };
+    if !footer.records_size.is_multiple_of(ALIGNMENT as u64) {
+        return Ok(None);
+    }
+    let expected_index_start = (FILE_HEADER_SIZE as u64)
+        .checked_add(footer.records_size)
+        .ok_or_else(|| corruption_error(file.path(), "segment records size overflows u64"))?;
+    if index_start != expected_index_start {
+        return Ok(None);
+    }
+
+    let index_size = usize::try_from(footer.index_size)
+        .map_err(|_| corruption_error(file.path(), "segment index does not fit memory"))?;
+    let index_bytes = file.read_at(index_start, index_size)?;
+    if crc32c::crc32c(&index_bytes) != footer.index_checksum {
+        return Ok(None);
+    }
+    let entries_size = usize::try_from(entries_size)
+        .map_err(|_| corruption_error(file.path(), "segment index entries do not fit memory"))?;
+    if !all_zero(&index_bytes[entries_size..]) {
+        return Ok(None);
+    }
+
+    let mut index =
+        Vec::with_capacity(usize::try_from(footer.record_count).map_err(|_| {
+            corruption_error(file.path(), "segment record count does not fit memory")
+        })?);
+    for bytes in index_bytes[..entries_size].chunks_exact(INDEX_ENTRY_SIZE) {
+        index.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+    }
+    if !valid_index(&index, index_start) {
+        return Ok(None);
+    }
+
+    Ok(Some(LoadedIndex {
+        segment_number: footer.segment_number,
+        records_size: footer.records_size,
+        index,
+    }))
+}
+
+pub(crate) fn read_file_header(file: &SegmentFile) -> Result<u64, SegmentError> {
+    if file.len()? < FILE_HEADER_SIZE as u64 {
+        return corruption(file.path(), "truncated segment file header");
+    }
+    let header = file.read_at(0, FILE_HEADER_SIZE)?;
+    decode_file_header(file.path(), &header)
+}
+
+pub(crate) fn encode_record(
     segment_number: u64,
     start_offset: u64,
-    records: &[SegmentRecord<'_>],
+    payload: &[u8],
 ) -> Result<Vec<u8>, SegmentError> {
     let log_number = u32::try_from(segment_number)
         .map_err(|_| SegmentError::SegmentNumberTooLarge(segment_number))?;
     let mut output = Vec::new();
-
-    for record in records {
-        encode_logical_record(
-            &mut output,
-            start_offset,
-            log_number,
-            record.prefix,
-            record.payload,
-        );
-    }
+    encode_logical_record(&mut output, start_offset, log_number, payload);
 
     let aligned_len = align_up(output.len(), ALIGNMENT);
     output.resize(aligned_len, 0);
     Ok(output)
 }
 
-fn encode_logical_record(
-    output: &mut Vec<u8>,
-    start_offset: u64,
-    log_number: u32,
-    prefix: &[u8],
-    payload: &[u8],
-) {
-    let logical_len = prefix.len() + payload.len();
+fn encode_logical_record(output: &mut Vec<u8>, start_offset: u64, log_number: u32, payload: &[u8]) {
+    let logical_len = payload.len();
     let mut consumed = 0;
     let mut first = true;
 
@@ -120,7 +246,6 @@ fn encode_logical_record(
             output,
             record_type,
             log_number,
-            prefix,
             payload,
             consumed,
             fragment_len,
@@ -138,7 +263,6 @@ fn encode_physical_record(
     output: &mut Vec<u8>,
     record_type: RecordType,
     log_number: u32,
-    prefix: &[u8],
     payload: &[u8],
     logical_offset: usize,
     fragment_len: usize,
@@ -147,18 +271,7 @@ fn encode_physical_record(
     let header_start = output.len();
     output.resize(header_start + PHYSICAL_HEADER_SIZE, 0);
 
-    let mut cursor = logical_offset;
-    let mut remaining = fragment_len;
-    if cursor < prefix.len() {
-        let prefix_len = remaining.min(prefix.len() - cursor);
-        output.extend_from_slice(&prefix[cursor..cursor + prefix_len]);
-        cursor += prefix_len;
-        remaining -= prefix_len;
-    }
-    if remaining > 0 {
-        let payload_offset = cursor - prefix.len();
-        output.extend_from_slice(&payload[payload_offset..payload_offset + remaining]);
-    }
+    output.extend_from_slice(&payload[logical_offset..logical_offset + fragment_len]);
 
     let fragment_start = header_start + PHYSICAL_HEADER_SIZE;
     let crc = physical_crc(
@@ -175,29 +288,35 @@ fn encode_physical_record(
 
 /// Streaming reader for segment files, used by the WAL to recover and read
 /// back durable records.
-pub(crate) struct SegmentScanner {
+struct SegmentScanner {
+    // Immutable state
     path: PathBuf,
-    file: SegmentFile,
+    file: Arc<SegmentFile>,
     file_len: u64,
     segment_number: u64,
     expected_log_number: u32,
     tolerate_tail: bool,
+
+    // Mutable state
     position: u64,
     last_good_end: u64,
     fragments: Vec<u8>,
     fragmented: bool,
+    record_position: u64,
     block_start: u64,
     block: Bytes,
     finished: bool,
 }
 
 impl SegmentScanner {
-    pub(crate) fn open(
-        path: &Path,
-        tolerate_tail: bool,
-        io_mode: IoMode,
-    ) -> Result<Self, SegmentError> {
-        let file = SegmentFile::open(path, io_mode)?;
+    #[cfg(test)]
+    fn open(path: &Path, tolerate_tail: bool, io_mode: IoMode) -> Result<Self, SegmentError> {
+        let file = Arc::new(SegmentFile::open(path, io_mode)?);
+        Self::open0(file, tolerate_tail)
+    }
+
+    pub(crate) fn open0(file: Arc<SegmentFile>, tolerate_tail: bool) -> Result<Self, SegmentError> {
+        let path = file.path();
         let file_len = file.len()?;
         if file_len < FILE_HEADER_SIZE as u64 {
             return corruption(path, "truncated segment file header");
@@ -220,6 +339,36 @@ impl SegmentScanner {
             last_good_end: FILE_HEADER_SIZE as u64,
             fragments: Vec::new(),
             fragmented: false,
+            record_position: FILE_HEADER_SIZE as u64,
+            block_start: u64::MAX,
+            block: Bytes::new(),
+            finished: false,
+        })
+    }
+
+    fn range(
+        file: Arc<SegmentFile>,
+        segment_number: u64,
+        position: u64,
+        end: u64,
+    ) -> Result<Self, SegmentError> {
+        let expected_log_number =
+            u32::try_from(segment_number).map_err(|_| SegmentError::Corruption {
+                path: file.path().to_path_buf(),
+                message: "segment number exceeds u32".into(),
+            })?;
+        Ok(Self {
+            path: file.path().to_path_buf(),
+            file,
+            file_len: end,
+            segment_number,
+            expected_log_number,
+            tolerate_tail: false,
+            position,
+            last_good_end: position,
+            fragments: Vec::new(),
+            fragmented: false,
+            record_position: position,
             block_start: u64::MAX,
             block: Bytes::new(),
             finished: false,
@@ -254,7 +403,10 @@ impl SegmentScanner {
         }
     }
 
-    fn tail_error(&mut self, message: impl Into<String>) -> Option<Result<Bytes, SegmentError>> {
+    fn tail_error(
+        &mut self,
+        message: impl Into<String>,
+    ) -> Option<Result<ScannedRecord, SegmentError>> {
         self.finished = true;
         if self.tolerate_tail {
             None
@@ -263,14 +415,17 @@ impl SegmentScanner {
         }
     }
 
-    fn hard_error(&mut self, message: impl Into<String>) -> Option<Result<Bytes, SegmentError>> {
+    fn hard_error(
+        &mut self,
+        message: impl Into<String>,
+    ) -> Option<Result<ScannedRecord, SegmentError>> {
         self.finished = true;
         Some(Err(self.error(message)))
     }
 }
 
 impl Iterator for SegmentScanner {
-    type Item = Result<Bytes, SegmentError>;
+    type Item = Result<ScannedRecord, SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -391,13 +546,17 @@ impl Iterator for SegmentScanner {
                         return self.hard_error("full record found inside fragmented record");
                     }
                     self.last_good_end = self.position;
-                    return Some(Ok(fragment));
+                    return Some(Ok(ScannedRecord {
+                        position: self.position - physical_len as u64,
+                        payload: fragment,
+                    }));
                 }
                 RecordType::First => {
                     if self.fragmented {
                         return self.hard_error("first fragment found inside fragmented record");
                     }
                     self.fragmented = true;
+                    self.record_position = self.position - physical_len as u64;
                     self.fragments.extend_from_slice(&fragment);
                 }
                 RecordType::Middle => {
@@ -413,21 +572,100 @@ impl Iterator for SegmentScanner {
                     self.fragments.extend_from_slice(&fragment);
                     self.fragmented = false;
                     self.last_good_end = self.position;
-                    return Some(Ok(Bytes::from(std::mem::take(&mut self.fragments))));
+                    return Some(Ok(ScannedRecord {
+                        position: self.record_position,
+                        payload: Bytes::from(std::mem::take(&mut self.fragments)),
+                    }));
                 }
             }
         }
     }
 }
 
-pub(crate) fn scan_segment(path: &Path, tolerate_tail: bool) -> Result<SegmentScan, SegmentError> {
-    let mut scanner = SegmentScanner::open(path, tolerate_tail, IoMode::Standard)?;
+#[cfg(test)]
+fn scan_segment(path: &Path, tolerate_tail: bool) -> Result<SegmentScan, SegmentError> {
+    let scanner = SegmentScanner::open(path, tolerate_tail, IoMode::Standard)?;
+    scan0(scanner)
+}
+
+pub(crate) fn scan_file(
+    file: Arc<SegmentFile>,
+    tolerate_tail: bool,
+) -> Result<SegmentScan, SegmentError> {
+    let scanner = SegmentScanner::open0(file, tolerate_tail)?;
+    scan0(scanner)
+}
+
+fn scan0(mut scanner: SegmentScanner) -> Result<SegmentScan, SegmentError> {
     let segment_number = scanner.segment_number();
-    let records = scanner.by_ref().collect::<Result<Vec<_>, _>>()?;
+    let index = scanner
+        .by_ref()
+        .map(|record| record.map(|record| record.position))
+        .collect::<Result<Vec<_>, _>>()?;
+    let valid_len = scanner
+        .valid_len()
+        .checked_next_multiple_of(ALIGNMENT as u64)
+        .ok_or(SegmentError::OffsetExhausted)?;
     Ok(SegmentScan {
         segment_number,
-        records,
-        valid_len: scanner.valid_len(),
+        index,
+        valid_len,
+    })
+}
+
+pub(crate) fn read_record(
+    file: &Arc<SegmentFile>,
+    segment_number: u64,
+    position: u64,
+    end: u64,
+) -> Result<Bytes, SegmentError> {
+    let mut scanner = SegmentScanner::range(Arc::clone(file), segment_number, position, end)?;
+    match scanner.next() {
+        Some(Ok(record)) if record.position == position => Ok(record.payload),
+        Some(Ok(_)) => corruption(file.path(), "segment index points inside a record"),
+        Some(Err(error)) => Err(error),
+        None => corruption(file.path(), "segment index points to no record"),
+    }
+}
+
+fn decode_footer(bytes: &[u8]) -> Option<SegmentFooter> {
+    if bytes.len() != FOOTER_SIZE || &bytes[..8] != FOOTER_MAGIC {
+        return None;
+    }
+    let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    let fields_size = u16::from_le_bytes(bytes[10..12].try_into().unwrap()) as usize;
+    if version != FOOTER_VERSION || fields_size != FOOTER_FIELDS_SIZE {
+        return None;
+    }
+    let expected_checksum = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+    if crc32c::crc32c(&bytes[..48]) != expected_checksum || !all_zero(&bytes[52..]) {
+        return None;
+    }
+    Some(SegmentFooter {
+        segment_number: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
+        records_size: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+        record_count: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
+        index_size: u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
+        index_checksum: u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+    })
+}
+
+fn valid_index(index: &[u64], records_end: u64) -> bool {
+    if index.is_empty() {
+        return records_end == FILE_HEADER_SIZE as u64;
+    }
+    if let Some(first) = index.first()
+        && *first != FILE_HEADER_SIZE as u64
+    {
+        return false;
+    }
+    index.iter().enumerate().all(|(position, value)| {
+        *value >= FILE_HEADER_SIZE as u64
+            && *value < records_end
+            && value.is_multiple_of(ALIGNMENT as u64)
+            && position
+                .checked_sub(1)
+                .is_none_or(|previous| index[previous] < *value)
     })
 }
 
@@ -471,10 +709,14 @@ fn mask_crc(crc: u32) -> u32 {
 }
 
 fn corruption<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
-    Err(SegmentError::Corruption {
+    Err(corruption_error(path, message))
+}
+
+fn corruption_error(path: &Path, message: &str) -> SegmentError {
+    SegmentError::Corruption {
         path: path.to_path_buf(),
         message: message.to_owned(),
-    })
+    }
 }
 
 fn all_zero(bytes: &[u8]) -> bool {
@@ -490,14 +732,18 @@ mod tests {
     use super::*;
 
     fn encode_records(records: &[Bytes]) -> Vec<u8> {
-        let records: Vec<_> = records
-            .iter()
-            .map(|payload| SegmentRecord {
-                prefix: &[],
-                payload,
-            })
-            .collect();
-        encode_batch(1, FILE_HEADER_SIZE as u64, &records).unwrap()
+        let mut encoded = Vec::new();
+        for record in records {
+            let position = FILE_HEADER_SIZE as u64 + encoded.len() as u64;
+            encoded.extend_from_slice(&encode_record(1, position, record).unwrap());
+        }
+        encoded
+    }
+
+    fn scan_records(path: &Path, tolerate_tail: bool) -> Result<Vec<Bytes>, SegmentError> {
+        SegmentScanner::open(path, tolerate_tail, IoMode::Standard)?
+            .map(|record| record.map(|record| record.payload))
+            .collect()
     }
 
     #[test]
@@ -507,7 +753,7 @@ mod tests {
         std::fs::write(&path, encode_file_header(7)).unwrap();
         let scan = scan_segment(&path, false).unwrap();
         assert_eq!(scan.segment_number, 7);
-        assert!(scan.records.is_empty());
+        assert!(scan.index.is_empty());
     }
 
     #[test]
@@ -523,8 +769,7 @@ mod tests {
         bytes.extend_from_slice(&encode_records(&records));
         std::fs::write(&path, bytes).unwrap();
 
-        let scan = scan_segment(&path, false).unwrap();
-        assert_eq!(scan.records, records);
+        assert_eq!(scan_records(&path, false).unwrap(), records);
     }
 
     #[test]
@@ -538,7 +783,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let scan = scan_segment(&path, true).unwrap();
-        assert!(scan.records.is_empty());
+        assert!(scan.index.is_empty());
         assert_eq!(scan.valid_len, FILE_HEADER_SIZE as u64);
         assert!(scan_segment(&path, false).is_err());
     }

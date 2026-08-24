@@ -68,6 +68,7 @@ impl Drop for AlignedBuffer {
 }
 
 pub struct SegmentFile {
+    // Immutable state
     path: PathBuf,
     file: File,
     direct: bool,
@@ -193,10 +194,6 @@ impl SegmentFile {
         Ok(self.file.metadata()?.len())
     }
 
-    pub fn is_empty(&self) -> Result<bool, SegmentError> {
-        Ok(self.len()? == 0)
-    }
-
     pub(crate) fn write_aligned(&self, buffer: &AlignedBuffer, offset: u64) -> IoResult<()> {
         let bytes = buffer.as_slice();
         if self.direct
@@ -227,6 +224,10 @@ impl SegmentFile {
 
     pub(crate) fn sync_data(&self) -> IoResult<()> {
         self.file.sync_data()
+    }
+
+    pub(crate) fn set_len(&self, len: u64) -> IoResult<()> {
+        self.file.set_len(len)
     }
 
     pub fn path(&self) -> &Path {
@@ -299,7 +300,7 @@ fn open_new_file(path: &Path, direct: bool) -> IoResult<File> {
 
 fn open_existing_file(path: &Path, direct: bool) -> IoResult<File> {
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).write(true);
 
     #[cfg(target_os = "linux")]
     if direct {

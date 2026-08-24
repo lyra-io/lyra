@@ -18,9 +18,9 @@ use bytes::Bytes;
 /// A monotonically increasing WAL record identifier.
 pub type Sequence = u64;
 
-/// Target size at which the WAL rotates to a new segment file.
+/// Maximum encoded record-area size before the WAL rotates a segment.
 ///
-/// A single record may exceed this size.
+/// Segment headers, indexes, and footers are excluded from this limit.
 pub(crate) const WAL_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Maximum number of appends buffered while the writer is busy.

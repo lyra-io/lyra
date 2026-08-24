@@ -41,7 +41,10 @@ impl From<SegmentError> for LogError {
         match error {
             SegmentError::Io(message) => Self::Io(message),
             SegmentError::Corruption { path, message } => Self::Corruption { path, message },
-            SegmentError::SegmentNumberTooLarge(_) => Self::Worker(error.to_string()),
+            SegmentError::SegmentNumberTooLarge(_)
+            | SegmentError::Sealed
+            | SegmentError::RecordTooLarge { .. }
+            | SegmentError::OffsetExhausted => Self::Worker(error.to_string()),
         }
     }
 }

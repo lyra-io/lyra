@@ -276,7 +276,7 @@ async fn recovery_failure_releases_the_directory_lock() {
 }
 
 #[tokio::test]
-async fn large_payload_appends_without_a_record_size_limit() {
+async fn appends_a_large_payload_within_the_record_area_limit() {
     let dir = tempfile::tempdir().unwrap();
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
     let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
