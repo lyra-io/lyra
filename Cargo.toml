@@ -2,10 +2,10 @@
 resolver = "3"
 members = [
     "lyrad/meta",
+    "lyrad/liblyra",
     "lyrad/stream",
     "lyrad/tiered",
-    "lyra/liblyra",
-    "lyra/cli",
+    "cmd",
 ]
 
 [workspace.dependencies]
