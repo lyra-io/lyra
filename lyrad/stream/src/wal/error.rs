@@ -1,16 +1,23 @@
 //! Errors produced by the stream storage write-ahead log.
 
-use std::path::PathBuf;
+use crate::segment;
+use segment::SegmentError;
+use std::{io::Error, path::PathBuf};
+use thiserror::Error;
 
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-pub enum WalError {
-    /// The WAL was shut down or is no longer accepting appends.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum LogError {
+    /// The log was closed or is no longer accepting appends.
     #[error("WAL is closed")]
     Closed,
 
     /// An operating-system level I/O failure.
     #[error("WAL I/O error: {0}")]
     Io(String),
+
+    /// Another log instance owns the WAL directory.
+    #[error("WAL directory is already in use: {0}")]
+    Locked(PathBuf),
 
     /// On-disk data failed validation and cannot be safely recovered.
     #[error("WAL corruption in {path}: {message}")]
@@ -21,22 +28,20 @@ pub enum WalError {
     Worker(String),
 }
 
-impl From<std::io::Error> for WalError {
-    fn from(error: std::io::Error) -> Self {
+impl LogError {}
+
+impl From<Error> for LogError {
+    fn from(error: Error) -> Self {
         Self::Io(error.to_string())
     }
 }
 
-impl From<crate::segment::SegmentError> for WalError {
-    fn from(error: crate::segment::SegmentError) -> Self {
+impl From<SegmentError> for LogError {
+    fn from(error: SegmentError) -> Self {
         match error {
-            crate::segment::SegmentError::Io(message) => Self::Io(message),
-            crate::segment::SegmentError::Corruption { path, message } => {
-                Self::Corruption { path, message }
-            }
-            crate::segment::SegmentError::SegmentNumberTooLarge(_) => {
-                Self::Worker(error.to_string())
-            }
+            SegmentError::Io(message) => Self::Io(message),
+            SegmentError::Corruption { path, message } => Self::Corruption { path, message },
+            SegmentError::SegmentNumberTooLarge(_) => Self::Worker(error.to_string()),
         }
     }
 }

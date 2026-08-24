@@ -9,6 +9,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 crc32c = { workspace = true }
 libc = { workspace = true }
+meta = { path = "../meta" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -1,6 +1,6 @@
 //! Errors produced by stream storage segments.
 
-use std::path::PathBuf;
+use std::{io::Error, path::PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentError {
@@ -14,8 +14,8 @@ pub enum SegmentError {
     SegmentNumberTooLarge(u64),
 }
 
-impl From<std::io::Error> for SegmentError {
-    fn from(error: std::io::Error) -> Self {
+impl From<Error> for SegmentError {
+    fn from(error: Error) -> Self {
         Self::Io(error.to_string())
     }
 }

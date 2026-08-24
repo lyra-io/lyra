@@ -1,14 +1,16 @@
 //! Stateful write-ahead log API.
 
-mod append_command;
 mod error;
 mod log;
+mod ops;
 mod options;
+mod publisher;
 
 pub use crate::segment::IoMode;
-pub use error::WalError;
-pub use log::Log;
+pub use error::LogError;
+pub use log::SegmentLog;
 pub use options::LogOptions;
+pub use publisher::{PublishBatch, PublishRecord, PublishTarget};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,39 +26,29 @@ pub(crate) const WAL_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 /// Maximum number of appends buffered while the writer is busy.
 pub(crate) const MAX_INFLIGHT_APPEND_NUM: usize = 4096;
 
-/// Lifecycle of the log, consulted by appends before enqueuing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Lifecycle {
-    /// The log is open and accepts appends.
-    #[default]
-    Running,
-    /// Shutdown has begun; new appends are rejected while pending ones drain.
-    Draining,
-    /// All background workers have stopped.
-    Closed,
+/// Maximum number of written batches waiting behind the active publisher.
+pub(crate) const MAX_PENDING_PUBLISH_BATCH_NUM: usize = 1;
+
+/// An ordered, durable stream log.
+#[async_trait]
+pub trait Log: Send + Sync {
+    /// Appends `payload` and returns its assigned sequence.
+    ///
+    /// A sync append is acknowledged after its sequence becomes durable. A
+    /// non-sync append is acknowledged after its bytes are written.
+    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, LogError>;
+
+    /// Stops admission, drains owned work, and closes all components.
+    async fn close(&self);
 }
 
-/// A write-ahead log that assigns an ordered [`Sequence`] to every appended
-/// payload.
-#[async_trait]
-pub trait Wal: Send + Sync + 'static {
-    /// Appends `payload` and returns the sequence assigned to it.
-    ///
-    /// When `sync` is true, the returned future completes only after the
-    /// record and any preceding records have been flushed to stable storage.
-    /// When `sync` is false, it completes as soon as the record is written to
-    /// the operating system; all records still become durable on
-    /// [`Wal::shutdown`].
-    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError>;
-
-    /// Reads the payload durably stored at `sequence`, if any.
-    ///
-    /// Returns `None` when the sequence has not been written, or when its
-    /// only record was part of a torn tail lost in an unclean shutdown.
-    async fn read(&self, sequence: Sequence) -> Result<Option<Bytes>, WalError>;
-
-    /// Drains pending appends, flushes them to stable storage, and stops all
-    /// background workers. Idempotent; after shutdown, [`Wal::append`] fails
-    /// with [`WalError::Closed`].
-    async fn shutdown(&self) -> Result<(), WalError>;
+/// Whether the log still accepts appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+    /// The log is open and accepts appends.
+    Running,
+    /// Close has begun and new appends are rejected.
+    Closing,
+    /// All owned workers and components have been closed.
+    Closed,
 }

@@ -1,20 +1,51 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use stream::{IoMode, Log, LogOptions, Wal, WalError};
+use stream::{IoMode, Log, LogError, LogOptions, PublishBatch, PublishTarget, SegmentLog};
 
-fn standard_options(path: &std::path::Path) -> LogOptions {
+#[derive(Default)]
+struct MemoryApplyTarget {
+    batches: Mutex<Vec<PublishBatch>>,
+    closed: AtomicBool,
+}
+
+#[async_trait]
+impl PublishTarget for MemoryApplyTarget {
+    async fn apply(&self, batch: PublishBatch) -> Result<(), LogError> {
+        self.batches.lock().unwrap().push(batch);
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), LogError> {
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+struct FailingApplyTarget;
+
+#[async_trait]
+impl PublishTarget for FailingApplyTarget {
+    async fn apply(&self, _batch: PublishBatch) -> Result<(), LogError> {
+        Err(LogError::Worker("apply failed".into()))
+    }
+}
+
+fn standard_options(path: &Path) -> LogOptions {
     let mut options = LogOptions::new(path);
     options.io_mode = IoMode::Standard;
     options
 }
 
-async fn open_wal(options: LogOptions) -> Result<Arc<Log>, WalError> {
-    Log::open(options).await
+async fn open_wal(options: LogOptions) -> Result<Arc<dyn Log>, LogError> {
+    Ok(SegmentLog::open(options).await?)
 }
 
-fn segment_count(path: &std::path::Path) -> usize {
+fn segment_count(path: &Path) -> usize {
     std::fs::read_dir(path)
         .unwrap()
         .filter_map(Result::ok)
@@ -38,7 +69,116 @@ async fn appends_return_sequential_sequences() {
             .unwrap(),
         2
     );
-    wal.shutdown().await.unwrap();
+    wal.close().await;
+}
+
+#[tokio::test]
+async fn applies_written_batches_only_after_their_sequences_are_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = Arc::new(MemoryApplyTarget::default());
+    let log = SegmentLog::open_with_target(standard_options(dir.path()), target.clone())
+        .await
+        .unwrap();
+
+    for value in 0..3u8 {
+        assert_eq!(
+            log.append(Bytes::from(vec![value]), false).await.unwrap(),
+            value as u64
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while target
+            .batches
+            .lock()
+            .unwrap()
+            .last()
+            .map(PublishBatch::last_sequence)
+            != Some(2)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication timed out");
+
+    let applied: Vec<_> = target
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| batch.records())
+        .map(|record| (record.sequence(), record.payload().clone()))
+        .collect();
+    assert_eq!(
+        applied,
+        vec![
+            (0, Bytes::from_static(&[0])),
+            (1, Bytes::from_static(&[1])),
+            (2, Bytes::from_static(&[2])),
+        ]
+    );
+
+    log.close().await;
+    assert!(target.closed.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn applies_recovered_records_before_open_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let original = open_wal(options.clone()).await.unwrap();
+    for value in 0..3u8 {
+        original
+            .append(Bytes::from(vec![value]), false)
+            .await
+            .unwrap();
+    }
+    original.close().await;
+
+    let target = Arc::new(MemoryApplyTarget::default());
+    let recovered = SegmentLog::open_with_target(options, target.clone())
+        .await
+        .unwrap();
+    let applied: Vec<_> = target
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| batch.records())
+        .map(|record| (record.sequence(), record.payload().clone()))
+        .collect();
+    assert_eq!(
+        applied,
+        vec![
+            (0, Bytes::from_static(&[0])),
+            (1, Bytes::from_static(&[1])),
+            (2, Bytes::from_static(&[2])),
+        ]
+    );
+
+    recovered.close().await;
+}
+
+#[tokio::test]
+async fn recovery_apply_failure_releases_the_directory_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let original = open_wal(options.clone()).await.unwrap();
+    original
+        .append(Bytes::from_static(b"record"), true)
+        .await
+        .unwrap();
+    original.close().await;
+
+    let error = SegmentLog::open_with_target(options.clone(), Arc::new(FailingApplyTarget))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error, LogError::Worker("apply failed".into()));
+
+    let reopened = open_wal(options).await.unwrap();
+    reopened.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -59,7 +199,7 @@ async fn concurrent_callers_receive_unique_ordered_sequences() {
         sequences.insert(task.await.unwrap());
     }
     assert_eq!(sequences, (0..100).collect());
-    wal.shutdown().await.unwrap();
+    wal.close().await;
 }
 
 #[tokio::test]
@@ -72,16 +212,67 @@ async fn direct_preferred_appends_with_fallback() {
     wal.append(Bytes::from_static(b"direct-or-standard"), true)
         .await
         .unwrap();
-    wal.shutdown().await.unwrap();
+    wal.close().await;
 }
 
 #[tokio::test]
-async fn shutdown_is_idempotent_and_rejects_new_appends() {
+async fn close_is_idempotent_and_rejects_new_appends() {
     let dir = tempfile::tempdir().unwrap();
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
-    wal.shutdown().await.unwrap();
-    wal.shutdown().await.unwrap();
+    wal.close().await;
+    wal.close().await;
     assert!(wal.append(Bytes::from_static(b"late"), true).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_close_callers_all_complete_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = open_wal(standard_options(dir.path())).await.unwrap();
+    let mut closes = Vec::new();
+
+    for _ in 0..16 {
+        let wal = Arc::clone(&wal);
+        closes.push(tokio::spawn(async move { wal.close().await }));
+    }
+
+    for close in closes {
+        close.await.unwrap();
+    }
+    assert_eq!(
+        wal.append(Bytes::from_static(b"late"), true).await,
+        Err(LogError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn only_one_log_instance_can_own_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let first = open_wal(options.clone()).await.unwrap();
+
+    let error = open_wal(options.clone()).await.err().unwrap();
+    assert_eq!(error, LogError::Locked(dir.path().to_path_buf()));
+
+    first.close().await;
+    let reopened = open_wal(options).await.unwrap();
+    reopened.close().await;
+}
+
+#[tokio::test]
+async fn recovery_failure_releases_the_directory_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let malformed = dir.path().join("1.seg");
+    std::fs::write(&malformed, []).unwrap();
+
+    assert!(matches!(
+        open_wal(options.clone()).await,
+        Err(LogError::Corruption { path, .. }) if path == malformed
+    ));
+
+    std::fs::remove_file(malformed).unwrap();
+    let reopened = open_wal(options).await.unwrap();
+    reopened.close().await;
 }
 
 #[tokio::test]
@@ -91,11 +282,62 @@ async fn large_payload_appends_without_a_record_size_limit() {
     let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
 
     assert_eq!(wal.append(payload, true).await.unwrap(), 0);
-    wal.shutdown().await.unwrap();
+    wal.close().await;
 }
 
 #[tokio::test]
-async fn reopen_recovers_sequences_and_reads_back_records() {
+async fn close_flushes_unsynced_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let wal = open_wal(options.clone()).await.unwrap();
+
+    for value in 0..3u8 {
+        assert_eq!(
+            wal.append(Bytes::from(vec![value]), false).await.unwrap(),
+            value as u64
+        );
+    }
+    wal.close().await;
+
+    let reopened = open_wal(options).await.unwrap();
+    assert_eq!(
+        reopened
+            .append(Bytes::from_static(b"next"), true)
+            .await
+            .unwrap(),
+        3
+    );
+    reopened.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_cancels_a_retrying_write_without_stranding_its_caller() {
+    let root = tempfile::tempdir().unwrap();
+    let wal_dir = root.path().join("wal");
+    let moved_dir = root.path().join("moved");
+    let wal = open_wal(standard_options(&wal_dir)).await.unwrap();
+    std::fs::rename(&wal_dir, moved_dir).unwrap();
+
+    let append = {
+        let wal = Arc::clone(&wal);
+        tokio::spawn(async move { wal.append(Bytes::from_static(b"blocked"), true).await })
+    };
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), wal.close())
+        .await
+        .expect("close timed out");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), append)
+            .await
+            .expect("append timed out")
+            .unwrap(),
+        Err(LogError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn reopen_recovers_sequences() {
     let dir = tempfile::tempdir().unwrap();
     let options = standard_options(dir.path());
     {
@@ -106,29 +348,21 @@ async fn reopen_recovers_sequences_and_reads_back_records() {
                 value as u64
             );
         }
-        wal.shutdown().await.unwrap();
+        wal.close().await;
     }
     assert_eq!(segment_count(dir.path()), 1);
 
     let wal = open_wal(options).await.unwrap();
-    for sequence in 0..3u64 {
-        assert_eq!(
-            wal.read(sequence).await.unwrap().unwrap(),
-            Bytes::from(vec![sequence as u8])
-        );
-    }
-    assert_eq!(wal.read(3).await.unwrap(), None);
-
     // Sequence numbering resumes after the last durable record.
     assert_eq!(
         wal.append(Bytes::from_static(b"next"), true).await.unwrap(),
         3
     );
-    wal.shutdown().await.unwrap();
+    wal.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn racing_appends_and_shutdown_never_strands_a_caller() {
+async fn racing_appends_and_close_never_strands_a_caller() {
     let dir = tempfile::tempdir().unwrap();
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
     let mut appends = Vec::new();
@@ -139,9 +373,9 @@ async fn racing_appends_and_shutdown_never_strands_a_caller() {
         }));
     }
 
-    let shutdown = {
+    let close = {
         let wal = Arc::clone(&wal);
-        tokio::spawn(async move { wal.shutdown().await })
+        tokio::spawn(async move { wal.close().await })
     };
 
     let successful = tokio::time::timeout(Duration::from_secs(5), async {
@@ -151,11 +385,11 @@ async fn racing_appends_and_shutdown_never_strands_a_caller() {
                 successful.insert(sequence);
             }
         }
-        shutdown.await.unwrap().unwrap();
+        close.await.unwrap();
         successful
     })
     .await
-    .expect("append/shutdown race timed out");
+    .expect("append/close race timed out");
 
     assert_eq!(
         successful,

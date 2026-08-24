@@ -7,6 +7,7 @@ use bytes::Bytes;
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -126,18 +127,22 @@ impl SegmentFile {
         }
     }
 
-    fn create_with_mode(
-        path: PathBuf,
-        direct: bool,
-        header: &AlignedBuffer,
-    ) -> std::io::Result<Self> {
+    fn create_with_mode(path: PathBuf, direct: bool, header: &AlignedBuffer) -> IoResult<Self> {
         let file = open_new_file(&path, direct)?;
-        let segment = Self { path, file, direct };
-        segment.write_aligned(header, 0)?;
+        let segment = Self {
+            path: path.clone(),
+            file,
+            direct,
+        };
+        if let Err(error) = segment.write_aligned(header, 0) {
+            drop(segment);
+            cleanup_failed_create(&path)?;
+            return Err(error);
+        }
         Ok(segment)
     }
 
-    fn open_with_mode(path: PathBuf, direct: bool) -> std::io::Result<Self> {
+    fn open_with_mode(path: PathBuf, direct: bool) -> IoResult<Self> {
         let file = open_existing_file(&path, direct)?;
         Ok(Self { path, file, direct })
     }
@@ -150,8 +155,8 @@ impl SegmentFile {
             .checked_add(length as u64)
             .ok_or_else(|| invalid_input("segment read range overflows u64"))?;
         if end > self.file.metadata()?.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
                 "segment read extends past end of file",
             )
             .into());
@@ -175,8 +180,8 @@ impl SegmentFile {
         let mut buffer = AlignedBuffer::zeroed(aligned_len);
         let read = read_once_at(&self.file, buffer.as_mut_slice(), aligned_position)?;
         if read < needed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
                 "direct segment read returned fewer bytes than requested",
             )
             .into());
@@ -192,15 +197,15 @@ impl SegmentFile {
         Ok(self.len()? == 0)
     }
 
-    pub(crate) fn write_aligned(&self, buffer: &AlignedBuffer, offset: u64) -> std::io::Result<()> {
+    pub(crate) fn write_aligned(&self, buffer: &AlignedBuffer, offset: u64) -> IoResult<()> {
         let bytes = buffer.as_slice();
         if self.direct
             && (!(offset as usize).is_multiple_of(ALIGNMENT)
                 || !bytes.len().is_multiple_of(ALIGNMENT)
                 || !(bytes.as_ptr() as usize).is_multiple_of(ALIGNMENT))
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
                 "direct I/O write is not aligned",
             ));
         }
@@ -213,14 +218,14 @@ impl SegmentFile {
         #[cfg(not(unix))]
         {
             let _ = (bytes, offset);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
+            Err(Error::new(
+                ErrorKind::Unsupported,
                 "segment files currently require Unix positioned I/O",
             ))
         }
     }
 
-    pub(crate) fn sync_data(&self) -> std::io::Result<()> {
+    pub(crate) fn sync_data(&self) -> IoResult<()> {
         self.file.sync_data()
     }
 
@@ -240,23 +245,27 @@ pub(crate) fn list_segment_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, Segm
         if path.extension() != Some(OsStr::new(SEGMENT_EXTENSION)) {
             continue;
         }
-        let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
-            continue;
-        };
-        let Ok(segment_number) = stem.parse::<u64>() else {
-            continue;
-        };
+        let stem = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| invalid_segment_filename(&path))?;
+        if stem.len() != 10 || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid_segment_filename(&path));
+        }
+        let segment_number = stem
+            .parse::<u64>()
+            .map_err(|_| invalid_segment_filename(&path))?;
         files.push((segment_number, path));
     }
     files.sort_by_key(|(segment_number, _)| *segment_number);
     Ok(files)
 }
 
-pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(dir: &Path) -> IoResult<()> {
     File::open(dir)?.sync_all()
 }
 
-fn open_new_file(path: &Path, direct: bool) -> std::io::Result<File> {
+fn open_new_file(path: &Path, direct: bool) -> IoResult<File> {
     let mut options = OpenOptions::new();
     options.create_new(true).read(true).write(true);
 
@@ -273,14 +282,14 @@ fn open_new_file(path: &Path, direct: bool) -> std::io::Result<File> {
         use std::os::fd::AsRawFd;
         let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
         if result == -1 {
-            return Err(std::io::Error::last_os_error());
+            return Err(Error::last_os_error());
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if direct {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
+        return Err(Error::new(
+            ErrorKind::Unsupported,
             "direct I/O is not supported on this platform",
         ));
     }
@@ -288,7 +297,7 @@ fn open_new_file(path: &Path, direct: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn open_existing_file(path: &Path, direct: bool) -> std::io::Result<File> {
+fn open_existing_file(path: &Path, direct: bool) -> IoResult<File> {
     let mut options = OpenOptions::new();
     options.read(true);
 
@@ -305,14 +314,14 @@ fn open_existing_file(path: &Path, direct: bool) -> std::io::Result<File> {
         use std::os::fd::AsRawFd;
         let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
         if result == -1 {
-            return Err(std::io::Error::last_os_error());
+            return Err(Error::last_os_error());
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if direct {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
+        return Err(Error::new(
+            ErrorKind::Unsupported,
             "direct I/O is not supported on this platform",
         ));
     }
@@ -320,34 +329,41 @@ fn open_existing_file(path: &Path, direct: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn invalid_input(message: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+fn invalid_input(message: &'static str) -> Error {
+    Error::new(ErrorKind::InvalidInput, message)
+}
+
+fn invalid_segment_filename(path: &Path) -> SegmentError {
+    SegmentError::Corruption {
+        path: path.to_path_buf(),
+        message: "segment filename must contain exactly ten decimal digits".into(),
+    }
 }
 
 #[cfg(unix)]
-fn read_once_at(file: &File, bytes: &mut [u8], position: u64) -> std::io::Result<usize> {
+fn read_once_at(file: &File, bytes: &mut [u8], position: u64) -> IoResult<usize> {
     loop {
         match file.read_at(bytes, position) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             result => return result,
         }
     }
 }
 
 #[cfg(not(unix))]
-fn read_once_at(_file: &File, _bytes: &mut [u8], _position: u64) -> std::io::Result<usize> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
+fn read_once_at(_file: &File, _bytes: &mut [u8], _position: u64) -> IoResult<usize> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
         "segment files currently require Unix positioned I/O",
     ))
 }
 
-fn read_exact_at(file: &File, mut bytes: &mut [u8], mut position: u64) -> std::io::Result<()> {
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut position: u64) -> IoResult<()> {
     while !bytes.is_empty() {
         let read = read_once_at(file, bytes, position)?;
         if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
                 "segment read extends past end of file",
             ));
         }
@@ -357,18 +373,18 @@ fn read_exact_at(file: &File, mut bytes: &mut [u8], mut position: u64) -> std::i
     Ok(())
 }
 
-fn cleanup_failed_create(path: &Path) -> Result<(), SegmentError> {
+fn cleanup_failed_create(path: &Path) -> IoResult<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
-fn direct_io_unavailable(error: &std::io::Error) -> bool {
+fn direct_io_unavailable(error: &Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        ErrorKind::InvalidInput | ErrorKind::Unsupported
     ) || matches!(
         error.raw_os_error(),
         Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP)
@@ -417,5 +433,21 @@ mod tests {
             );
             assert!(file.read_at((ALIGNMENT * 2) as u64, 1).is_err());
         }
+    }
+
+    #[test]
+    fn malformed_segment_filenames_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1.seg");
+        std::fs::write(&path, []).unwrap();
+
+        let error = list_segment_files(dir.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            SegmentError::Corruption {
+                path: error_path,
+                ..
+            } if error_path == path
+        ));
     }
 }

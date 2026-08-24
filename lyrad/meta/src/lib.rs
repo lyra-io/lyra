@@ -4,3 +4,4 @@
 //! compiled from the `.proto` sources in `proto/` at build time.
 
 pub mod proto;
+pub mod utils;

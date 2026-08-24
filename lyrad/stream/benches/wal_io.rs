@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stream::{IoMode, Log, LogOptions, Wal};
+use stream::{IoMode, Log, LogOptions, SegmentLog};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -44,7 +44,7 @@ async fn run_mode(
     let mut options = LogOptions::new(dir.path());
     options.io_mode = io_mode;
 
-    let wal = match Log::open(options).await {
+    let wal = match SegmentLog::open(options).await {
         Ok(wal) => wal,
         Err(error) => {
             println!("{label}: SKIPPED ({error})");
@@ -65,7 +65,7 @@ async fn run_mode(
                 wal.append(payload.clone(), true).await?;
                 latencies.push(append_started.elapsed());
             }
-            Ok::<_, stream::WalError>(latencies)
+            Ok::<_, stream::LogError>(latencies)
         }));
     }
 
@@ -74,14 +74,14 @@ async fn run_mode(
         match task.await.expect("benchmark worker") {
             Ok(worker_latencies) => latencies.extend(worker_latencies),
             Err(error) => {
-                let _ = wal.shutdown().await;
+                wal.close().await;
                 println!("{label}: SKIPPED ({error})");
                 return;
             }
         }
     }
     let elapsed = started.elapsed();
-    wal.shutdown().await.expect("benchmark shutdown");
+    wal.close().await;
 
     latencies.sort_unstable();
     let operations_per_second = records as f64 / elapsed.as_secs_f64();
