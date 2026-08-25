@@ -2,15 +2,17 @@
 
 mod error;
 mod file_segment;
+mod files;
 mod format;
-mod io;
+pub mod vfs;
 
 pub use error::SegmentError;
 pub use file_segment::FileSegment;
+pub use vfs::{DirectVfs, IoFile, MemoryVfs, OpenOptions, StandardVfs, Vfs, VfsFile};
 
+pub(crate) use files::{list_segment_files, sync};
 #[cfg(test)]
 pub(crate) use format::FILE_HEADER_SIZE;
-pub(crate) use io::{SegmentFile, list_segment_files, sync_directory};
 
 use bytes::Bytes;
 

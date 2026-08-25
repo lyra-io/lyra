@@ -1,12 +1,14 @@
 //! File-backed record-level segment implementation.
 
+use super::files::segment_path;
 use super::format::{
-    FILE_HEADER_SIZE, encode_index_footer, encode_record, load_index, read_file_header,
-    read_record, scan_file,
+    FILE_HEADER_SIZE, encode_file_header, encode_index_footer, encode_record, load_index,
+    read_file_header, read_record, scan_file,
 };
-use super::io::{AlignedBuffer, SegmentFile};
+use super::vfs::{IoFile, OpenOptions, Vfs, VfsFile, create_local_file, open_local_file};
 use super::{AppendResult, IoMode, Segment, SegmentError, SegmentOffset};
 use bytes::Bytes;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,7 +33,7 @@ enum SegmentState {
 pub struct FileSegment {
     // Immutable state
     number: u64,
-    file: Arc<SegmentFile>,
+    file: Arc<VfsFile>,
     max_records_size: u64,
 
     // Mutable state
@@ -43,16 +45,50 @@ pub struct FileSegment {
 
 impl FileSegment {
     pub fn create(
+        vfs: &dyn Vfs,
+        dir: &Path,
+        number: u64,
+        max_records_size: u64,
+    ) -> Result<Self, SegmentError> {
+        let path = segment_path(dir, number);
+        let file = vfs.open(&path, OpenOptions::CreateNew)?;
+        if let Err(error) = file.write_at(0, &encode_file_header(number)) {
+            drop(file);
+            match vfs.remove(&path) {
+                Ok(()) => {}
+                Err(cleanup_error) if cleanup_error.kind() == ErrorKind::NotFound => {}
+                Err(cleanup_error) => return Err(cleanup_error.into()),
+            }
+            return Err(error.into());
+        }
+        Ok(Self::create0(file, number, max_records_size))
+    }
+
+    pub(crate) fn create_local(
         dir: &Path,
         number: u64,
         max_records_size: u64,
         io_mode: IoMode,
     ) -> Result<Self, SegmentError> {
-        let file = SegmentFile::create(dir, number, io_mode)?;
-        Ok(Self {
+        let path = segment_path(dir, number);
+        let file = create_local_file(&path, io_mode)?;
+        if let Err(error) = file.write_at(0, &encode_file_header(number)) {
+            drop(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(cleanup_error) if cleanup_error.kind() == ErrorKind::NotFound => {}
+                Err(cleanup_error) => return Err(cleanup_error.into()),
+            }
+            return Err(error.into());
+        }
+        Ok(Self::create0(file, number, max_records_size))
+    }
+
+    fn create0(file: VfsFile, number: u64, max_records_size: u64) -> Self {
+        Self {
             // Immutable state
             number,
-            file,
+            file: Arc::new(file),
             max_records_size,
 
             // Mutable state
@@ -60,17 +96,30 @@ impl FileSegment {
             append_position: SegmentOffset::new(0),
             index: Vec::new(),
             state: SegmentState::Active,
-        })
+        }
     }
 
     pub fn open(
+        vfs: &dyn Vfs,
+        path: impl AsRef<Path>,
+        max_records_size: u64,
+    ) -> Result<Self, SegmentError> {
+        let path = path.as_ref();
+        let file = Arc::new(vfs.open(path, OpenOptions::Existing)?);
+        Self::open0(path, file, max_records_size)
+    }
+
+    pub(crate) fn open_local(
         path: impl AsRef<Path>,
         max_records_size: u64,
         io_mode: IoMode,
     ) -> Result<Self, SegmentError> {
         let path = path.as_ref();
-        let file = Arc::new(SegmentFile::open(path, io_mode)?);
+        let file = Arc::new(open_local_file(path, io_mode)?);
+        Self::open0(path, file, max_records_size)
+    }
 
+    fn open0(path: &Path, file: Arc<VfsFile>, max_records_size: u64) -> Result<Self, SegmentError> {
         if let Some(loaded) = load_index(&file)? {
             let header_number = read_file_header(&file)?;
             if header_number != loaded.segment_number {
@@ -132,7 +181,7 @@ impl FileSegment {
         self.append_position.get()
     }
 
-    pub(crate) fn file(&self) -> Arc<SegmentFile> {
+    pub(crate) fn file(&self) -> Arc<VfsFile> {
         Arc::clone(&self.file)
     }
 
@@ -167,8 +216,7 @@ impl Segment for FileSegment {
             return Ok(AppendResult::Full);
         }
 
-        let buffer = AlignedBuffer::from_slice(&encoded);
-        self.file.write_aligned(&buffer, position)?;
+        self.file.write_at(position, &encoded)?;
         let offset = self.append_position;
         self.append_position = SegmentOffset::new(
             offset
@@ -205,9 +253,8 @@ impl Segment for FileSegment {
             .checked_add(self.records_size)
             .ok_or(SegmentError::OffsetExhausted)?;
         let encoded = encode_index_footer(self.number, self.records_size, &self.index)?;
-        let buffer = AlignedBuffer::from_slice(&encoded);
-        self.file.set_len(position)?;
-        self.file.write_aligned(&buffer, position)?;
+        self.file.truncate(position)?;
+        self.file.write_at(position, &encoded)?;
         self.state = SegmentState::Sealed;
         Ok(())
     }
@@ -216,14 +263,44 @@ impl Segment for FileSegment {
 #[cfg(test)]
 mod tests {
     use super::super::format::{ALIGNMENT, PHYSICAL_HEADER_SIZE};
+    use super::super::vfs::MemoryVfs;
     use super::*;
+
+    #[test]
+    fn memory_vfs_seals_and_reopens_a_segment() {
+        let vfs = MemoryVfs::default();
+        let dir = Path::new("/wal");
+        vfs.create_dir(dir).unwrap();
+        let mut segment = FileSegment::create(&vfs, dir, 1, ALIGNMENT as u64 * 2).unwrap();
+
+        assert_eq!(
+            segment.append(b"first").unwrap(),
+            AppendResult::Appended(SegmentOffset::new(0))
+        );
+        assert_eq!(
+            segment.append(b"second").unwrap(),
+            AppendResult::Appended(SegmentOffset::new(1))
+        );
+        segment.seal().unwrap();
+
+        let path = segment.file.path().to_path_buf();
+        let reopened = FileSegment::open(&vfs, path, ALIGNMENT as u64 * 2).unwrap();
+        assert_eq!(
+            reopened.read(SegmentOffset::new(0)).unwrap(),
+            Some(Bytes::from_static(b"first"))
+        );
+        assert_eq!(
+            reopened.read(SegmentOffset::new(1)).unwrap(),
+            Some(Bytes::from_static(b"second"))
+        );
+    }
 
     #[test]
     fn sealed_segment_reads_payloads_by_offset() {
         for io_mode in [IoMode::Standard, IoMode::DirectPreferred] {
             let dir = tempfile::tempdir().unwrap();
             let mut segment =
-                FileSegment::create(dir.path(), 1, ALIGNMENT as u64 * 2, io_mode).unwrap();
+                FileSegment::create_local(dir.path(), 1, ALIGNMENT as u64 * 2, io_mode).unwrap();
 
             assert_eq!(
                 segment.append(b"first").unwrap(),
@@ -234,10 +311,11 @@ mod tests {
                 AppendResult::Appended(SegmentOffset::new(1))
             );
             segment.seal().unwrap();
-            segment.file.sync_data().unwrap();
+            segment.file.sync().unwrap();
 
             let reopened =
-                FileSegment::open(segment.file.path(), ALIGNMENT as u64 * 2, io_mode).unwrap();
+                FileSegment::open_local(segment.file.path(), ALIGNMENT as u64 * 2, io_mode)
+                    .unwrap();
             assert_eq!(
                 reopened.read(SegmentOffset::new(0)).unwrap(),
                 Some(Bytes::from_static(b"first"))
@@ -254,7 +332,7 @@ mod tests {
     fn record_area_limit_excludes_header_index_and_footer() {
         let dir = tempfile::tempdir().unwrap();
         let mut segment =
-            FileSegment::create(dir.path(), 1, ALIGNMENT as u64, IoMode::Standard).unwrap();
+            FileSegment::create_local(dir.path(), 1, ALIGNMENT as u64, IoMode::Standard).unwrap();
         assert!(matches!(
             segment.append(b"record").unwrap(),
             AppendResult::Appended(_)
@@ -262,24 +340,24 @@ mod tests {
         assert_eq!(segment.append(b"full").unwrap(), AppendResult::Full);
         segment.seal().unwrap();
 
-        assert!(segment.file.len().unwrap() > ALIGNMENT as u64);
+        assert!(segment.file.size().unwrap() > ALIGNMENT as u64);
     }
 
     #[test]
     fn valid_footer_opens_without_reading_record_data() {
         let dir = tempfile::tempdir().unwrap();
         let mut segment =
-            FileSegment::create(dir.path(), 1, ALIGNMENT as u64, IoMode::Standard).unwrap();
+            FileSegment::create_local(dir.path(), 1, ALIGNMENT as u64, IoMode::Standard).unwrap();
         segment.append(b"record").unwrap();
         segment.seal().unwrap();
-        segment.file.sync_data().unwrap();
+        segment.file.sync().unwrap();
         let path = segment.file.path().to_path_buf();
 
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[FILE_HEADER_SIZE + PHYSICAL_HEADER_SIZE] ^= 0xFF;
         std::fs::write(&path, bytes).unwrap();
 
-        let reopened = FileSegment::open(&path, ALIGNMENT as u64, IoMode::Standard).unwrap();
+        let reopened = FileSegment::open_local(&path, ALIGNMENT as u64, IoMode::Standard).unwrap();
         assert!(reopened.read(SegmentOffset::new(0)).is_err());
     }
 
@@ -287,10 +365,10 @@ mod tests {
     fn corrupt_footer_rebuilds_and_rewrites_the_index() {
         let dir = tempfile::tempdir().unwrap();
         let mut segment =
-            FileSegment::create(dir.path(), 1, ALIGNMENT as u64, IoMode::Standard).unwrap();
+            FileSegment::create_local(dir.path(), 1, ALIGNMENT as u64, IoMode::Standard).unwrap();
         segment.append(b"record").unwrap();
         segment.seal().unwrap();
-        segment.file.sync_data().unwrap();
+        segment.file.sync().unwrap();
         let path = segment.file.path().to_path_buf();
 
         let file_len = std::fs::metadata(&path).unwrap().len();
@@ -301,17 +379,18 @@ mod tests {
             .set_len(file_len - 1)
             .unwrap();
 
-        let mut reopened = FileSegment::open(&path, ALIGNMENT as u64, IoMode::Standard).unwrap();
+        let mut reopened =
+            FileSegment::open_local(&path, ALIGNMENT as u64, IoMode::Standard).unwrap();
         assert!(reopened.needs_repair());
         assert_eq!(
             reopened.read(SegmentOffset::new(0)).unwrap(),
             Some(Bytes::from_static(b"record"))
         );
         reopened.seal().unwrap();
-        reopened.file.sync_data().unwrap();
+        reopened.file.sync().unwrap();
         drop(reopened);
 
-        let reopened = FileSegment::open(&path, ALIGNMENT as u64, IoMode::Standard).unwrap();
+        let reopened = FileSegment::open_local(&path, ALIGNMENT as u64, IoMode::Standard).unwrap();
         assert_eq!(reopened.record_count(), 1);
     }
 }

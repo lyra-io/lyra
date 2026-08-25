@@ -9,8 +9,7 @@ use super::{
     WAL_SEGMENT_SIZE,
 };
 use crate::segment::{
-    AppendResult, FileSegment, Segment, SegmentFile, SegmentOffset, list_segment_files,
-    sync_directory,
+    AppendResult, FileSegment, IoFile, Segment, SegmentOffset, VfsFile, list_segment_files, sync,
 };
 #[cfg(test)]
 use crate::segment::{FILE_HEADER_SIZE, IoMode};
@@ -432,7 +431,7 @@ fn writer_loop(
                         let incremented = number.checked_add(1).ok_or_else(|| {
                             LogError::Worker("WAL segment number space exhausted".into())
                         })?;
-                        active = Some(FileSegment::create(
+                        active = Some(FileSegment::create_local(
                             &options.dir,
                             number,
                             WAL_SEGMENT_SIZE,
@@ -620,7 +619,7 @@ fn recover_state(
     let segment_files = list_segment_files(&options.dir)?;
     let mut segments = Vec::with_capacity(segment_files.len());
     for (file_number, path) in segment_files {
-        let segment = FileSegment::open(&path, WAL_SEGMENT_SIZE, options.io_mode)?;
+        let segment = FileSegment::open_local(&path, WAL_SEGMENT_SIZE, options.io_mode)?;
         validate_segment_number(file_number, segment.number(), &path)?;
         max_segment_number = max_segment_number.max(file_number);
         segments.push((path, segment));
@@ -657,7 +656,7 @@ fn recover_state(
     for (_, segment) in &mut segments {
         if segment.needs_repair() {
             segment.seal()?;
-            segment.file().sync_data()?;
+            segment.file().sync()?;
         }
     }
     let next_segment_number = max_segment_number
@@ -700,15 +699,15 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn perform_sync(files: &[Arc<SegmentFile>], sync_dir: bool, dir: &Path) -> IoResult<()> {
+fn perform_sync(files: &[Arc<VfsFile>], sync_dir: bool, dir: &Path) -> IoResult<()> {
     let mut synced = HashSet::new();
     for file in files {
         if synced.insert(file.path().to_path_buf()) {
-            file.sync_data()?;
+            file.sync()?;
         }
     }
     if sync_dir {
-        sync_directory(dir)?;
+        sync(dir)?;
     }
     Ok(())
 }
@@ -739,7 +738,7 @@ mod tests {
             record.extend_from_slice(payload);
             loop {
                 if active.is_none() {
-                    active = Some(FileSegment::create(
+                    active = Some(FileSegment::create_local(
                         &options.dir,
                         next_segment_number,
                         max_records_size,

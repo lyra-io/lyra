@@ -3,7 +3,9 @@
 #[cfg(test)]
 use super::IoMode;
 use super::SegmentError;
-use super::io::SegmentFile;
+#[cfg(test)]
+use super::vfs::open_local_file;
+use super::vfs::{IoFile, VfsFile};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -126,8 +128,8 @@ pub(crate) fn encode_index_footer(
     Ok(output)
 }
 
-pub(crate) fn load_index(file: &SegmentFile) -> Result<Option<LoadedIndex>, SegmentError> {
-    let file_len = file.len()?;
+pub(crate) fn load_index(file: &VfsFile) -> Result<Option<LoadedIndex>, SegmentError> {
+    let file_len = file.size()?;
     let Some(footer_start) = file_len.checked_sub(FOOTER_SIZE as u64) else {
         return Ok(None);
     };
@@ -194,8 +196,8 @@ pub(crate) fn load_index(file: &SegmentFile) -> Result<Option<LoadedIndex>, Segm
     }))
 }
 
-pub(crate) fn read_file_header(file: &SegmentFile) -> Result<u64, SegmentError> {
-    if file.len()? < FILE_HEADER_SIZE as u64 {
+pub(crate) fn read_file_header(file: &VfsFile) -> Result<u64, SegmentError> {
+    if file.size()? < FILE_HEADER_SIZE as u64 {
         return corruption(file.path(), "truncated segment file header");
     }
     let header = file.read_at(0, FILE_HEADER_SIZE)?;
@@ -291,7 +293,7 @@ fn encode_physical_record(
 struct SegmentScanner {
     // Immutable state
     path: PathBuf,
-    file: Arc<SegmentFile>,
+    file: Arc<VfsFile>,
     file_len: u64,
     segment_number: u64,
     expected_log_number: u32,
@@ -311,13 +313,13 @@ struct SegmentScanner {
 impl SegmentScanner {
     #[cfg(test)]
     fn open(path: &Path, tolerate_tail: bool, io_mode: IoMode) -> Result<Self, SegmentError> {
-        let file = Arc::new(SegmentFile::open(path, io_mode)?);
+        let file = Arc::new(open_local_file(path, io_mode)?);
         Self::open0(file, tolerate_tail)
     }
 
-    pub(crate) fn open0(file: Arc<SegmentFile>, tolerate_tail: bool) -> Result<Self, SegmentError> {
+    pub(crate) fn open0(file: Arc<VfsFile>, tolerate_tail: bool) -> Result<Self, SegmentError> {
         let path = file.path();
-        let file_len = file.len()?;
+        let file_len = file.size()?;
         if file_len < FILE_HEADER_SIZE as u64 {
             return corruption(path, "truncated segment file header");
         }
@@ -347,7 +349,7 @@ impl SegmentScanner {
     }
 
     fn range(
-        file: Arc<SegmentFile>,
+        file: Arc<VfsFile>,
         segment_number: u64,
         position: u64,
         end: u64,
@@ -589,7 +591,7 @@ fn scan_segment(path: &Path, tolerate_tail: bool) -> Result<SegmentScan, Segment
 }
 
 pub(crate) fn scan_file(
-    file: Arc<SegmentFile>,
+    file: Arc<VfsFile>,
     tolerate_tail: bool,
 ) -> Result<SegmentScan, SegmentError> {
     let scanner = SegmentScanner::open0(file, tolerate_tail)?;
@@ -614,7 +616,7 @@ fn scan0(mut scanner: SegmentScanner) -> Result<SegmentScan, SegmentError> {
 }
 
 pub(crate) fn read_record(
-    file: &Arc<SegmentFile>,
+    file: &Arc<VfsFile>,
     segment_number: u64,
     position: u64,
     end: u64,
