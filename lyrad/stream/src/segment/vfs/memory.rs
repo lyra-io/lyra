@@ -123,18 +123,12 @@ impl IoFile for MemoryFile {
         Ok(Bytes::copy_from_slice(bytes))
     }
 
-    fn write_at(&self, position: u64, bytes: &[u8]) -> Result<()> {
-        let position = usize::try_from(position)
-            .map_err(|_| Error::new(ErrorKind::InvalidInput, "position does not fit usize"))?;
-        let end = position
-            .checked_add(bytes.len())
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "write range overflows usize"))?;
+    fn append(&self, bytes: &[u8]) -> Result<u64> {
         let mut data = self.data.write().unwrap();
-        if end > data.len() {
-            data.resize(end, 0);
-        }
-        data[position..end].copy_from_slice(bytes);
-        Ok(())
+        let position = u64::try_from(data.len())
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "file length exceeds u64"))?;
+        data.extend_from_slice(bytes);
+        Ok(position)
     }
 
     fn truncate(&self, size: u64) -> Result<()> {
@@ -161,10 +155,10 @@ mod tests {
         vfs.create_dir(dir).unwrap();
 
         let created = vfs.open(&path, OpenOptions::CreateNew).unwrap();
-        created.write_at(2, b"record").unwrap();
+        assert_eq!(created.append(b"record").unwrap(), 0);
         let opened = vfs.open(&path, OpenOptions::Existing).unwrap();
 
-        assert_eq!(opened.read_at(2, 6).unwrap(), Bytes::from_static(b"record"));
+        assert_eq!(opened.read_at(0, 6).unwrap(), Bytes::from_static(b"record"));
         assert_eq!(vfs.list(dir).unwrap(), vec![path]);
     }
 }

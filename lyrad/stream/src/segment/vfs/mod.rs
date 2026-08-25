@@ -11,8 +11,9 @@ pub use standard::{StandardFile, StandardVfs};
 use super::IoMode;
 use bytes::Bytes;
 use std::fmt::Debug;
-use std::io::{ErrorKind, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// An opened file supplied by one of the supported virtual filesystems.
 #[derive(Debug)]
@@ -28,7 +29,10 @@ pub enum OpenOptions {
     CreateNew,
 }
 
-/// Positioned I/O required by the segment implementation.
+/// Positioned reads and single-writer appends required by segments.
+///
+/// Calls to [`IoFile::append`] and [`IoFile::truncate`] must be serialized by
+/// the caller. Reads and synchronization may run concurrently with the writer.
 pub trait IoFile: Debug + Send + Sync {
     fn path(&self) -> &Path;
 
@@ -37,8 +41,8 @@ pub trait IoFile: Debug + Send + Sync {
     /// Reads exactly `length` bytes starting at `position`.
     fn read_at(&self, position: u64, length: usize) -> Result<Bytes>;
 
-    /// Writes all bytes starting at `position`.
-    fn write_at(&self, position: u64, bytes: &[u8]) -> Result<()>;
+    /// Appends all bytes and returns their starting file position.
+    fn append(&self, bytes: &[u8]) -> Result<u64>;
 
     /// Removes bytes after `size` when rebuilding a segment tail.
     fn truncate(&self, size: u64) -> Result<()>;
@@ -87,11 +91,11 @@ impl IoFile for VfsFile {
         }
     }
 
-    fn write_at(&self, position: u64, bytes: &[u8]) -> Result<()> {
+    fn append(&self, bytes: &[u8]) -> Result<u64> {
         match self {
-            Self::Memory(file) => file.write_at(position, bytes),
-            Self::Standard(file) => file.write_at(position, bytes),
-            Self::Direct(file) => file.write_at(position, bytes),
+            Self::Memory(file) => file.append(bytes),
+            Self::Standard(file) => file.append(bytes),
+            Self::Direct(file) => file.append(bytes),
         }
     }
 
@@ -112,71 +116,91 @@ impl IoFile for VfsFile {
     }
 }
 
-pub(crate) fn create_local_file(path: &Path, io_mode: IoMode) -> Result<VfsFile> {
+pub(crate) fn create_local_file(path: &Path, io_mode: IoMode) -> Result<(Arc<dyn Vfs>, VfsFile)> {
+    let dir = path.parent().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "segment path has no parent directory",
+        )
+    })?;
     match io_mode {
-        IoMode::Standard => StandardVfs.open(path, OpenOptions::CreateNew),
-        IoMode::DirectRequired => DirectVfs::new(path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "segment path has no parent directory",
-            )
-        })?)?
-        .open(path, OpenOptions::CreateNew),
-        IoMode::DirectPreferred => match DirectVfs::new(path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "segment path has no parent directory",
-            )
-        })?)
-        .and_then(|vfs| vfs.open(path, OpenOptions::CreateNew))
-        {
-            Ok(file) => Ok(file),
-            Err(error) if direct::direct_io_unavailable(&error) => {
-                match StandardVfs.remove(path) {
-                    Ok(()) => {}
-                    Err(cleanup_error) if cleanup_error.kind() == ErrorKind::NotFound => {}
-                    Err(cleanup_error) => return Err(cleanup_error),
+        IoMode::Standard => {
+            let vfs: Arc<dyn Vfs> = Arc::new(StandardVfs);
+            let file = vfs.open(path, OpenOptions::CreateNew)?;
+            Ok((vfs, file))
+        }
+        IoMode::DirectRequired => {
+            let vfs: Arc<dyn Vfs> = Arc::new(DirectVfs::new(dir)?);
+            let file = vfs.open(path, OpenOptions::CreateNew)?;
+            Ok((vfs, file))
+        }
+        IoMode::DirectPreferred => {
+            let direct = DirectVfs::new(dir).and_then(|vfs| {
+                let vfs: Arc<dyn Vfs> = Arc::new(vfs);
+                let file = vfs.open(path, OpenOptions::CreateNew)?;
+                Ok((vfs, file))
+            });
+            match direct {
+                Ok(opened) => Ok(opened),
+                Err(error) if direct::direct_io_unavailable(&error) => {
+                    match StandardVfs.remove(path) {
+                        Ok(()) => {}
+                        Err(cleanup_error) if cleanup_error.kind() == ErrorKind::NotFound => {}
+                        Err(cleanup_error) => return Err(cleanup_error),
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "direct I/O unavailable; falling back to standard I/O"
+                    );
+                    let vfs: Arc<dyn Vfs> = Arc::new(StandardVfs);
+                    let file = vfs.open(path, OpenOptions::CreateNew)?;
+                    Ok((vfs, file))
                 }
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "direct I/O unavailable; falling back to standard I/O"
-                );
-                StandardVfs.open(path, OpenOptions::CreateNew)
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
     }
 }
 
-pub(crate) fn open_local_file(path: &Path, io_mode: IoMode) -> Result<VfsFile> {
+pub(crate) fn open_local_file(path: &Path, io_mode: IoMode) -> Result<(Arc<dyn Vfs>, VfsFile)> {
+    let dir = path.parent().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "segment path has no parent directory",
+        )
+    })?;
     match io_mode {
-        IoMode::Standard => StandardVfs.open(path, OpenOptions::Existing),
-        IoMode::DirectRequired => DirectVfs::new(path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "segment path has no parent directory",
-            )
-        })?)?
-        .open(path, OpenOptions::Existing),
-        IoMode::DirectPreferred => match DirectVfs::new(path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "segment path has no parent directory",
-            )
-        })?)
-        .and_then(|vfs| vfs.open(path, OpenOptions::Existing))
-        {
-            Ok(file) => Ok(file),
-            Err(error) if direct::direct_io_unavailable(&error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "direct I/O unavailable for segment read; falling back to standard I/O"
-                );
-                StandardVfs.open(path, OpenOptions::Existing)
+        IoMode::Standard => {
+            let vfs: Arc<dyn Vfs> = Arc::new(StandardVfs);
+            let file = vfs.open(path, OpenOptions::Existing)?;
+            Ok((vfs, file))
+        }
+        IoMode::DirectRequired => {
+            let vfs: Arc<dyn Vfs> = Arc::new(DirectVfs::new(dir)?);
+            let file = vfs.open(path, OpenOptions::Existing)?;
+            Ok((vfs, file))
+        }
+        IoMode::DirectPreferred => {
+            let direct = DirectVfs::new(dir).and_then(|vfs| {
+                let vfs: Arc<dyn Vfs> = Arc::new(vfs);
+                let file = vfs.open(path, OpenOptions::Existing)?;
+                Ok((vfs, file))
+            });
+            match direct {
+                Ok(opened) => Ok(opened),
+                Err(error) if direct::direct_io_unavailable(&error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "direct I/O unavailable for segment read; falling back to standard I/O"
+                    );
+                    let vfs: Arc<dyn Vfs> = Arc::new(StandardVfs);
+                    let file = vfs.open(path, OpenOptions::Existing)?;
+                    Ok((vfs, file))
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
     }
 }

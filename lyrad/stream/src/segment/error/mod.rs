@@ -1,6 +1,7 @@
 //! Errors produced by stream storage segments.
 
-use std::{io::Error, path::PathBuf};
+use std::io::Error;
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentError {

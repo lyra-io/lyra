@@ -627,14 +627,8 @@ fn recover_state(
 
     for (path, segment) in &segments {
         let mut recovered_records = Vec::new();
-        for offset in 0..segment.record_count() {
-            let record =
-                segment
-                    .read(SegmentOffset::new(offset))?
-                    .ok_or_else(|| LogError::Corruption {
-                        path: path.clone(),
-                        message: format!("segment index is missing record offset {offset}"),
-                    })?;
+        let mut offset = 0;
+        while let Some(record) = segment.read(SegmentOffset::new(offset))? {
             let sequence = decode_sequence(path, &record)?;
             if sequence != next_sequence {
                 return Err(LogError::Corruption {
@@ -648,6 +642,9 @@ fn recover_state(
             if collect_records {
                 recovered_records.push((sequence, record.slice(8..)));
             }
+            offset = offset
+                .checked_add(1)
+                .ok_or_else(|| LogError::Worker("segment offset space exhausted".into()))?;
         }
         if !recovered_records.is_empty() {
             recovered_batches.push(PublishBatch::new(&recovered_records));

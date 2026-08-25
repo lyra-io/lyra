@@ -14,6 +14,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "macos")]
 const MACOS_BUFFER_ALIGNMENT: usize = 4096;
@@ -31,6 +32,9 @@ pub struct DirectFile {
     path: PathBuf,
     file: File,
     alignment: DirectAlignment,
+
+    // Mutable state
+    append_position: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,12 +69,14 @@ impl Vfs for DirectVfs {
                 "direct-I/O file must be directly inside the VFS root",
             ));
         }
-        open_file(path, options).map(|file| {
-            VfsFile::Direct(DirectFile {
+        open_file(path, options).and_then(|file| {
+            let append_position = AtomicU64::new(file.metadata()?.len());
+            Ok(VfsFile::Direct(DirectFile {
                 path: path.to_path_buf(),
                 file,
                 alignment: self.alignment,
-            })
+                append_position,
+            }))
         })
     }
 
@@ -126,7 +132,13 @@ impl IoFile for DirectFile {
         Ok(Bytes::copy_from_slice(&buffer.as_slice()[prefix..needed]))
     }
 
-    fn write_at(&self, position: u64, bytes: &[u8]) -> Result<()> {
+    fn append(&self, bytes: &[u8]) -> Result<u64> {
+        let position = self.append_position.load(Ordering::Relaxed);
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| invalid_input("file append length does not fit u64"))?;
+        let next_position = position
+            .checked_add(length)
+            .ok_or_else(|| invalid_input("file append position overflows u64"))?;
         let io_alignment = self.alignment.io.unwrap_or(1);
         if !position.is_multiple_of(io_alignment as u64)
             || !bytes.len().is_multiple_of(io_alignment)
@@ -136,18 +148,23 @@ impl IoFile for DirectFile {
             ));
         }
         if bytes.is_empty() {
-            return Ok(());
+            return Ok(position);
         }
 
         if (bytes.as_ptr() as usize).is_multiple_of(self.alignment.memory) {
-            return write_all_at(&self.file, bytes, position);
+            write_all_at(&self.file, bytes, position)?;
+        } else {
+            let buffer = AlignedBuffer::from_slice(bytes, self.alignment.memory);
+            write_all_at(&self.file, buffer.as_slice(), position)?;
         }
-        let buffer = AlignedBuffer::from_slice(bytes, self.alignment.memory);
-        write_all_at(&self.file, buffer.as_slice(), position)
+        self.append_position.store(next_position, Ordering::Relaxed);
+        Ok(position)
     }
 
     fn truncate(&self, size: u64) -> Result<()> {
-        self.file.set_len(size)
+        self.file.set_len(size)?;
+        self.append_position.store(size, Ordering::Relaxed);
+        Ok(())
     }
 
     fn sync(&self) -> Result<()> {

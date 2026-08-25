@@ -5,6 +5,7 @@ use bytes::Bytes;
 use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::io::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -17,6 +18,9 @@ pub struct StandardFile {
     // Immutable state
     path: PathBuf,
     file: File,
+
+    // Mutable state
+    append_position: AtomicU64,
 }
 
 impl Vfs for StandardVfs {
@@ -35,9 +39,11 @@ impl Vfs for StandardVfs {
             file_options.create_new(true);
         }
         let file = file_options.open(path)?;
+        let append_position = AtomicU64::new(file.metadata()?.len());
         Ok(VfsFile::Standard(StandardFile {
             path: path.to_path_buf(),
             file,
+            append_position,
         }))
     }
 
@@ -75,12 +81,22 @@ impl IoFile for StandardFile {
         Ok(Bytes::from(bytes))
     }
 
-    fn write_at(&self, position: u64, bytes: &[u8]) -> Result<()> {
-        write_all_at(&self.file, bytes, position)
+    fn append(&self, bytes: &[u8]) -> Result<u64> {
+        let position = self.append_position.load(Ordering::Relaxed);
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| invalid_input("file append length does not fit u64"))?;
+        let next_position = position
+            .checked_add(length)
+            .ok_or_else(|| invalid_input("file append position overflows u64"))?;
+        write_all_at(&self.file, bytes, position)?;
+        self.append_position.store(next_position, Ordering::Relaxed);
+        Ok(position)
     }
 
     fn truncate(&self, size: u64) -> Result<()> {
-        self.file.set_len(size)
+        self.file.set_len(size)?;
+        self.append_position.store(size, Ordering::Relaxed);
+        Ok(())
     }
 
     fn sync(&self) -> Result<()> {
