@@ -1,7 +1,6 @@
 //! Errors produced by the stream storage write-ahead log.
 
-use crate::segment;
-use segment::SegmentError;
+use super::segment::SegmentError;
 use std::{io::Error, path::PathBuf};
 use thiserror::Error;
 
@@ -28,8 +27,6 @@ pub enum LogError {
     Worker(String),
 }
 
-impl LogError {}
-
 impl From<Error> for LogError {
     fn from(error: Error) -> Self {
         Self::Io(error.to_string())
@@ -40,9 +37,9 @@ impl From<SegmentError> for LogError {
     fn from(error: SegmentError) -> Self {
         match error {
             SegmentError::Io(message) => Self::Io(message),
-            SegmentError::Corruption { path, message } => Self::Corruption { path, message },
+            SegmentError::Corruption { path, message }
+            | SegmentError::Truncated { path, message } => Self::Corruption { path, message },
             SegmentError::SegmentNumberTooLarge(_)
-            | SegmentError::Sealed
             | SegmentError::RecordTooLarge { .. }
             | SegmentError::OffsetExhausted => Self::Worker(error.to_string()),
         }

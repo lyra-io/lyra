@@ -5,12 +5,13 @@ mod log;
 mod ops;
 mod options;
 mod publisher;
+mod segment;
 
-pub use crate::segment::IoMode;
 pub use error::LogError;
 pub use log::SegmentLog;
 pub use options::LogOptions;
 pub use publisher::{PublishBatch, PublishRecord, PublishTarget};
+pub use segment::SegmentOffset;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,9 +19,7 @@ use bytes::Bytes;
 /// A monotonically increasing WAL record identifier.
 pub type Sequence = u64;
 
-/// Maximum encoded record-area size before the WAL rotates a segment.
-///
-/// Segment headers, indexes, and footers are excluded from this limit.
+/// Maximum encoded WAL segment size before rotation.
 pub(crate) const WAL_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Maximum number of appends buffered while the writer is busy.

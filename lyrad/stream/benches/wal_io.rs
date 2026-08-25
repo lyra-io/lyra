@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stream::{IoMode, Log, LogOptions, SegmentLog};
+use stream::{Log, LogOptions, SegmentLog};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -10,44 +10,21 @@ async fn main() {
     let concurrency = env_usize("WAL_BENCH_CONCURRENCY", 32).max(1);
 
     println!(
-        "WAL benchmark: records={records}, payload={payload_size}B, concurrency={concurrency}, target={}, direct_backend={}",
+        "WAL benchmark: records={records}, payload={payload_size}B, concurrency={concurrency}, target={}",
         std::env::consts::OS,
-        direct_backend_name(),
     );
 
-    run_mode(
-        "standard",
-        IoMode::Standard,
-        records,
-        payload_size,
-        concurrency,
-    )
-    .await;
-    run_mode(
-        "direct-required",
-        IoMode::DirectRequired,
-        records,
-        payload_size,
-        concurrency,
-    )
-    .await;
+    run(records, payload_size, concurrency).await;
 }
 
-async fn run_mode(
-    label: &str,
-    io_mode: IoMode,
-    records: usize,
-    payload_size: usize,
-    concurrency: usize,
-) {
+async fn run(records: usize, payload_size: usize, concurrency: usize) {
     let dir = tempfile::tempdir().expect("create benchmark directory");
-    let mut options = LogOptions::new(dir.path());
-    options.io_mode = io_mode;
+    let options = LogOptions::new(dir.path());
 
     let wal = match SegmentLog::open(options).await {
         Ok(wal) => wal,
         Err(error) => {
-            println!("{label}: SKIPPED ({error})");
+            println!("buffered: SKIPPED ({error})");
             return;
         }
     };
@@ -75,7 +52,7 @@ async fn run_mode(
             Ok(worker_latencies) => latencies.extend(worker_latencies),
             Err(error) => {
                 wal.close().await;
-                println!("{label}: SKIPPED ({error})");
+                println!("buffered: SKIPPED ({error})");
                 return;
             }
         }
@@ -87,7 +64,7 @@ async fn run_mode(
     let operations_per_second = records as f64 / elapsed.as_secs_f64();
     let mib_per_second = operations_per_second * payload_size as f64 / (1024.0 * 1024.0);
     println!(
-        "{label}: {:.0} ops/s, {:.2} MiB/s, p50={:?}, p95={:?}, p99={:?}, elapsed={:?}",
+        "buffered: {:.0} ops/s, {:.2} MiB/s, p50={:?}, p95={:?}, p99={:?}, elapsed={:?}",
         operations_per_second,
         mib_per_second,
         percentile(&latencies, 50),
@@ -110,14 +87,4 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-
-fn direct_backend_name() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "O_DIRECT"
-    } else if cfg!(target_os = "macos") {
-        "F_NOCACHE"
-    } else {
-        "unsupported"
-    }
 }

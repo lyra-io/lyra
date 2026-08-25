@@ -1,25 +1,24 @@
 //! Stateful write-ahead log implementation.
 
 use super::error::LogError;
-use super::ops::{AppendOp, Operation, SyncOp};
+use super::ops::{AppendOp, Operation, SyncFile, SyncOp};
 use super::options::LogOptions;
 use super::publisher::{PublishBatch, PublishTarget, apply_after_sync};
+use super::segment::{
+    AppendResult, FileSegment, Segment, SegmentError, SegmentFile, SegmentOffset,
+    list_segment_files, sync_directory,
+};
 use super::{
     Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, MAX_PENDING_PUBLISH_BATCH_NUM, Sequence,
     WAL_SEGMENT_SIZE,
 };
-use crate::segment::{
-    AppendResult, FileSegment, IoFile, Segment, SegmentOffset, VfsFile, list_segment_files, sync,
-};
-#[cfg(test)]
-use crate::segment::{FILE_HEADER_SIZE, IoMode};
 use async_trait::async_trait;
 use bytes::Bytes;
 use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
 use std::any::Any;
 use std::collections::HashSet;
-use std::io::{ErrorKind, Result as IoResult};
+use std::io::{BufReader, ErrorKind, Result as IoResult, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
@@ -64,12 +63,20 @@ struct WorkerThread {
     done: oneshot::Receiver<()>,
 }
 
+#[derive(Debug)]
+struct RecoveredState {
+    // Immutable state
+    next_sequence: Sequence,
+    next_segment_number: u64,
+    recovered_batches: Vec<PublishBatch>,
+    active: Option<FileSegment>,
+}
+
 impl SegmentLog {
     /// Opens the WAL at `options.dir`.
     ///
-    /// Existing segment files from a previous run are scanned and recovered:
-    /// sequence numbering resumes after the last durable record, and new
-    /// appends continue in a fresh segment.
+    /// Existing segments are scanned to restore sequence numbering. A valid
+    /// final segment remains active for subsequent appends.
     pub async fn open(options: LogOptions) -> Result<Arc<Self>, LogError> {
         Self::open0(options, None).await
     }
@@ -114,6 +121,7 @@ impl SegmentLog {
         let (writer_started_tx, writer_started) = oneshot::channel();
         let (writer_done_tx, writer_done) = oneshot::channel();
         let recover_records = pending_tx.is_some();
+        let applied_offset = target.as_ref().and_then(|target| target.applied_offset());
         let writer_handle = match ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
             let options = options.clone();
             move || {
@@ -126,13 +134,16 @@ impl SegmentLog {
                         }
                     })
                     .and_then(|directory_lock| {
-                        recover_state(&options, recover_records)
+                        recover_state(&options, recover_records, applied_offset)
                             .map(|recovered| (directory_lock, recovered))
                     }) {
-                    Ok((
-                        directory_lock,
-                        (next_sequence, next_segment_number, recovered_batches),
-                    )) => {
+                    Ok((directory_lock, recovered)) => {
+                        let RecoveredState {
+                            next_sequence,
+                            next_segment_number,
+                            recovered_batches,
+                            active,
+                        } = recovered;
                         let last_sequence = next_sequence.checked_sub(1);
                         if writer_started_tx
                             .send(Ok((last_sequence, recovered_batches)))
@@ -145,6 +156,7 @@ impl SegmentLog {
                                 options,
                                 next_sequence,
                                 next_segment_number,
+                                active,
                             );
                         }
                         drop(directory_lock);
@@ -366,11 +378,10 @@ fn writer_loop(
     options: LogOptions,
     mut next_sequence: Sequence,
     mut next_segment_number: u64,
+    mut active: Option<FileSegment>,
 ) {
-    let mut active: Option<FileSegment> = None;
     let mut dirty_files = Vec::new();
     let mut directory_dirty = false;
-    let mut seal_active = true;
 
     loop {
         let mut operations = Vec::new();
@@ -409,7 +420,6 @@ fn writer_loop(
             for append_op in batch {
                 let _ = append_op.response.send(Err(error.clone()));
             }
-            seal_active = false;
             break;
         }
         if batch.is_empty() {
@@ -419,6 +429,7 @@ fn writer_loop(
             continue;
         }
 
+        let mut publish_records = Vec::with_capacity(records.len());
         let write_result = (|| -> Result<(), LogError> {
             for (sequence, payload) in &records {
                 let mut record = Vec::with_capacity(8 + payload.len());
@@ -431,37 +442,29 @@ fn writer_loop(
                         let incremented = number.checked_add(1).ok_or_else(|| {
                             LogError::Worker("WAL segment number space exhausted".into())
                         })?;
-                        active = Some(FileSegment::create_local(
-                            &options.dir,
-                            number,
-                            WAL_SEGMENT_SIZE,
-                            options.io_mode,
-                        )?);
+                        active = Some(FileSegment::create(&options.dir, number, WAL_SEGMENT_SIZE)?);
                         next_segment_number = incremented;
                         directory_dirty = true;
                     }
 
                     match active.as_mut().unwrap().append(&record)? {
-                        AppendResult::Appended(_) => {
-                            let file = active.as_ref().unwrap().file();
-                            if !dirty_files
-                                .iter()
-                                .any(|candidate| Arc::ptr_eq(candidate, &file))
+                        AppendResult::Appended(offset) => {
+                            let segment = active.as_ref().unwrap();
+                            let file = segment.file();
+                            let end = segment.write_position();
+                            if let Some(candidate) =
+                                dirty_files.iter_mut().find(|candidate: &&mut SyncFile| {
+                                    Arc::ptr_eq(&candidate.file, &file)
+                                })
                             {
-                                dirty_files.push(file);
+                                candidate.end = end;
+                            } else {
+                                dirty_files.push(SyncFile { file, end });
                             }
+                            publish_records.push((*sequence, offset, payload.clone()));
                             break;
                         }
                         AppendResult::Full => {
-                            let segment = active.as_mut().unwrap();
-                            segment.seal()?;
-                            let file = segment.file();
-                            if !dirty_files
-                                .iter()
-                                .any(|candidate| Arc::ptr_eq(candidate, &file))
-                            {
-                                dirty_files.push(file);
-                            }
                             active = None;
                         }
                     }
@@ -474,7 +477,6 @@ fn writer_loop(
             for append_op in batch {
                 let _ = append_op.response.send(Err(error.clone()));
             }
-            seal_active = false;
             break;
         }
 
@@ -488,7 +490,8 @@ fn writer_loop(
         }
 
         if let Some(pending_publish_tx) = &pending_publish_tx
-            && let Err(error) = pending_publish_tx.blocking_send(PublishBatch::new(&records))
+            && let Err(error) =
+                pending_publish_tx.blocking_send(PublishBatch::new(&publish_records))
         {
             tracing::error!(error = %error, "pending-publish queue closed; batch was not published");
         }
@@ -506,42 +509,11 @@ fn writer_loop(
                     let _ = waiter.send(Err(LogError::Closed));
                 }
             }
-            seal_active = false;
             break;
         }
 
         if write_then_close {
             break;
-        }
-    }
-
-    if seal_active && let Some(segment) = active.as_mut() {
-        match segment.seal().map_err(LogError::from) {
-            Ok(()) => {
-                let file = segment.file();
-                if !dirty_files
-                    .iter()
-                    .any(|candidate| Arc::ptr_eq(candidate, &file))
-                {
-                    dirty_files.push(file);
-                }
-                if let Some(last_sequence) = next_sequence.checked_sub(1) {
-                    let sync_op = SyncOp {
-                        files: std::mem::take(&mut dirty_files),
-                        sync_directory: std::mem::take(&mut directory_dirty),
-                        last_sequence,
-                        waiters: Vec::new(),
-                    };
-                    if sync_tx.blocking_send(Operation::Sync(sync_op)).is_err() {
-                        tracing::error!(
-                            "sync-operation queue closed before the sealed segment was delivered"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "WAL segment seal failed during close");
-            }
         }
     }
 
@@ -607,75 +579,165 @@ fn sync_loop(
     }
 }
 
-/// Opens existing segments and returns the next sequence, next segment number,
-/// and optional durable batches to apply.
+/// Scans from the target's last applied record, repairs a truncated final
+/// record, and restores the final segment as the active buffered segment.
 fn recover_state(
     options: &LogOptions,
     collect_records: bool,
-) -> Result<(Sequence, u64, Vec<PublishBatch>), LogError> {
-    let mut next_sequence: Sequence = 0;
+    applied_offset: Option<SegmentOffset>,
+) -> Result<RecoveredState, LogError> {
+    let mut next_sequence = applied_offset.is_none().then_some(0);
     let mut max_segment_number: u64 = 0;
     let mut recovered_batches = Vec::new();
     let segment_files = list_segment_files(&options.dir)?;
-    let mut segments = Vec::with_capacity(segment_files.len());
-    for (file_number, path) in segment_files {
-        let segment = FileSegment::open_local(&path, WAL_SEGMENT_SIZE, options.io_mode)?;
-        validate_segment_number(file_number, segment.number(), &path)?;
-        max_segment_number = max_segment_number.max(file_number);
-        segments.push((path, segment));
-    }
+    let segment_count = segment_files.len();
+    let mut active = None;
+    let mut applied_found = applied_offset.is_none();
 
-    for (path, segment) in &segments {
+    for (index, (file_number, path)) in segment_files.into_iter().enumerate() {
+        let final_segment = index + 1 == segment_count;
+        max_segment_number = max_segment_number.max(file_number);
+
+        if let Some(offset) = applied_offset
+            && !applied_found
+            && file_number < offset.segment_number()
+        {
+            continue;
+        }
+        if let Some(offset) = applied_offset
+            && !applied_found
+            && file_number > offset.segment_number()
+        {
+            return Err(invalid_applied_offset(options, offset));
+        }
+
+        let file = Arc::new(SegmentFile::open(&path)?);
+        let mut file_size = file.size()?;
+        if file_size > WAL_SEGMENT_SIZE {
+            return Err(LogError::Corruption {
+                path,
+                message: format!(
+                    "segment size {} exceeds the maximum {WAL_SEGMENT_SIZE}",
+                    file_size
+                ),
+            });
+        }
+
+        let starts_at_applied = applied_offset
+            .is_some_and(|offset| !applied_found && offset.segment_number() == file_number);
+        let start_position = if starts_at_applied {
+            applied_offset.unwrap().position()
+        } else {
+            0
+        };
+        if starts_at_applied && start_position >= file_size {
+            return Err(invalid_applied_offset(
+                options,
+                applied_offset.expect("an applied offset selected the start position"),
+            ));
+        }
+
+        let segment =
+            FileSegment::open(Arc::clone(&file), file_number, WAL_SEGMENT_SIZE, file_size)?;
+        let mut reader = BufReader::new(file.reader()?);
+        reader.seek(SeekFrom::Start(start_position))?;
+        let mut position = start_position;
+        let mut skip_applied_record = !applied_found;
         let mut recovered_records = Vec::new();
-        let mut offset = 0;
-        while let Some(record) = segment.read(SegmentOffset::new(offset))? {
-            let sequence = decode_sequence(path, &record)?;
-            if sequence != next_sequence {
+
+        while position < file_size {
+            let record_offset = SegmentOffset::new(file_number, position);
+            let (next_position, record) = match segment.read(&mut reader, position, file_size) {
+                Ok(record) => record,
+                Err(SegmentError::Truncated { .. }) if final_segment && applied_found => {
+                    if position < file_size {
+                        file.truncate(position)?;
+                        file.sync(position)?;
+                        file_size = position;
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        valid_size = position,
+                        "truncated incomplete final WAL record during recovery"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+
+            let sequence = decode_sequence(&path, &record)?;
+            if skip_applied_record {
+                next_sequence = Some(
+                    sequence
+                        .checked_add(1)
+                        .ok_or_else(|| LogError::Worker("WAL sequence space exhausted".into()))?,
+                );
+                skip_applied_record = false;
+                applied_found = true;
+                position = next_position;
+                continue;
+            }
+
+            let expected_sequence = next_sequence.expect("recovery sequence initialized");
+            if sequence != expected_sequence {
                 return Err(LogError::Corruption {
                     path: path.clone(),
-                    message: format!("expected WAL sequence {next_sequence}, found {sequence}"),
+                    message: format!("expected WAL sequence {expected_sequence}, found {sequence}"),
                 });
             }
-            next_sequence = next_sequence
-                .checked_add(1)
-                .ok_or_else(|| LogError::Worker("WAL sequence space exhausted".into()))?;
+            next_sequence = Some(
+                expected_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| LogError::Worker("WAL sequence space exhausted".into()))?,
+            );
             if collect_records {
-                recovered_records.push((sequence, record.slice(8..)));
+                recovered_records.push((sequence, record_offset, record.slice(8..)));
             }
-            offset = offset
-                .checked_add(1)
-                .ok_or_else(|| LogError::Worker("segment offset space exhausted".into()))?;
+            position = next_position;
         }
+        file.discard_cache(position);
         if !recovered_records.is_empty() {
             recovered_batches.push(PublishBatch::new(&recovered_records));
         }
-    }
-    for (_, segment) in &mut segments {
-        if segment.needs_repair() {
-            segment.seal()?;
-            segment.file().sync()?;
+        if final_segment {
+            active = Some(FileSegment::open(
+                file,
+                file_number,
+                WAL_SEGMENT_SIZE,
+                file_size,
+            )?);
         }
     }
+
+    if let Some(offset) = applied_offset
+        && !applied_found
+    {
+        return Err(invalid_applied_offset(options, offset));
+    }
+
     let next_segment_number = max_segment_number
         .checked_add(1)
         .ok_or_else(|| LogError::Worker("WAL segment number space exhausted".into()))?;
-    Ok((next_sequence, next_segment_number, recovered_batches))
+    Ok(RecoveredState {
+        // Immutable state
+        next_sequence: next_sequence.unwrap_or(0),
+        next_segment_number,
+        recovered_batches,
+        active,
+    })
 }
 
-fn validate_segment_number(
-    file_number: u64,
-    header_number: u64,
-    path: &Path,
-) -> Result<(), LogError> {
-    if file_number == header_number {
-        return Ok(());
-    }
-    Err(LogError::Corruption {
-        path: path.to_path_buf(),
+fn invalid_applied_offset(options: &LogOptions, offset: SegmentOffset) -> LogError {
+    LogError::Corruption {
+        path: options
+            .dir
+            .join(format!("{:010}.seg", offset.segment_number())),
         message: format!(
-            "segment filename identifies {file_number}, but its header identifies {header_number}"
+            "applied WAL offset {}:{} does not identify a record",
+            offset.segment_number(),
+            offset.position()
         ),
-    })
+    }
 }
 
 fn decode_sequence(path: &Path, record: &[u8]) -> Result<Sequence, LogError> {
@@ -696,15 +758,15 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn perform_sync(files: &[Arc<VfsFile>], sync_dir: bool, dir: &Path) -> IoResult<()> {
+fn perform_sync(files: &[SyncFile], sync_dir: bool, dir: &Path) -> IoResult<()> {
     let mut synced = HashSet::new();
-    for file in files {
-        if synced.insert(file.path().to_path_buf()) {
-            file.sync()?;
+    for sync_file in files.iter().rev() {
+        if synced.insert(sync_file.file.path().to_path_buf()) {
+            sync_file.file.sync(sync_file.end)?;
         }
     }
     if sync_dir {
-        sync(dir)?;
+        sync_directory(dir)?;
     }
     Ok(())
 }
@@ -715,9 +777,7 @@ mod tests {
     use std::fs::OpenOptions;
 
     fn standard_options(path: &Path) -> LogOptions {
-        let mut options = LogOptions::new(path);
-        options.io_mode = IoMode::Standard;
-        options
+        LogOptions::new(path)
     }
 
     fn seed_records(
@@ -735,31 +795,45 @@ mod tests {
             record.extend_from_slice(payload);
             loop {
                 if active.is_none() {
-                    active = Some(FileSegment::create_local(
+                    active = Some(FileSegment::create(
                         &options.dir,
                         next_segment_number,
                         max_records_size,
-                        options.io_mode,
                     )?);
                     next_segment_number += 1;
                 }
                 match active.as_mut().unwrap().append(&record)? {
                     AppendResult::Appended(_) => {
-                        dirty_files.push(active.as_ref().unwrap().file());
+                        let segment = active.as_ref().unwrap();
+                        let file = segment.file();
+                        let end = segment.write_position();
+                        if let Some(candidate) = dirty_files
+                            .iter_mut()
+                            .find(|candidate: &&mut SyncFile| Arc::ptr_eq(&candidate.file, &file))
+                        {
+                            candidate.end = end;
+                        } else {
+                            dirty_files.push(SyncFile { file, end });
+                        }
                         break;
                     }
                     AppendResult::Full => {
-                        let segment = active.as_mut().unwrap();
-                        segment.seal()?;
-                        dirty_files.push(segment.file());
                         active = None;
                     }
                 }
             }
         }
-        if let Some(segment) = active.as_mut() {
-            segment.seal()?;
-            dirty_files.push(segment.file());
+        if let Some(segment) = active.as_ref() {
+            let file = segment.file();
+            let end = segment.write_position();
+            if let Some(candidate) = dirty_files
+                .iter_mut()
+                .find(|candidate: &&mut SyncFile| Arc::ptr_eq(&candidate.file, &file))
+            {
+                candidate.end = end;
+            } else {
+                dirty_files.push(SyncFile { file, end });
+            }
         }
         perform_sync(&dirty_files, true, &options.dir)?;
         Ok(())
@@ -781,7 +855,7 @@ mod tests {
         let payloads: Vec<_> = (0..4u8)
             .map(|value| Bytes::from(vec![value; 128]))
             .collect();
-        seed_segments(&options, &payloads, 4096);
+        seed_segments(&options, &payloads, 147);
 
         assert_eq!(list_segment_files(dir.path()).unwrap().len(), 4);
         let log = SegmentLog::open(options).await.unwrap();
@@ -799,7 +873,7 @@ mod tests {
         let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
         let error = seed_records(&options, &[(0, payload)], 64 * 1024).unwrap_err();
         assert!(
-            matches!(error, LogError::Worker(message) if message.contains("maximum record area"))
+            matches!(error, LogError::Worker(message) if message.contains("maximum segment size"))
         );
     }
 
@@ -808,7 +882,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let options = standard_options(dir.path());
         let payloads = vec![Bytes::from(vec![0x11; 128]), Bytes::from(vec![0x22; 128])];
-        seed_segments(&options, &payloads, 4096);
+        seed_segments(&options, &payloads, 147);
 
         let files = list_segment_files(dir.path()).unwrap();
         assert_eq!(files.len(), 2);
@@ -816,19 +890,16 @@ mod tests {
             .write(true)
             .open(&files[0].1)
             .unwrap()
-            .set_len(FILE_HEADER_SIZE as u64 + 4)
+            .set_len(4)
             .unwrap();
 
         let error = SegmentLog::open(options).await.err().unwrap();
         assert!(matches!(error, LogError::Corruption { .. }));
-        assert_eq!(
-            std::fs::metadata(&files[0].1).unwrap().len(),
-            FILE_HEADER_SIZE as u64 + 4
-        );
+        assert_eq!(std::fs::metadata(&files[0].1).unwrap().len(), 4);
     }
 
     #[tokio::test]
-    async fn recovery_truncates_a_torn_final_segment_before_continuing() {
+    async fn recovery_truncates_a_torn_final_segment_and_continues() {
         let dir = tempfile::tempdir().unwrap();
         let options = standard_options(dir.path());
         let payloads = vec![Bytes::from(vec![0x11; 128]), Bytes::from(vec![0x22; 128])];
@@ -839,14 +910,11 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len((FILE_HEADER_SIZE * 2 + 4) as u64)
+            .set_len(151)
             .unwrap();
 
         let log = SegmentLog::open(options.clone()).await.unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            (FILE_HEADER_SIZE * 4) as u64
-        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 147);
         assert_eq!(
             log.append(Bytes::from_static(b"replacement"), true)
                 .await
@@ -866,6 +934,27 @@ mod tests {
         reopened.close().await;
     }
 
+    #[tokio::test]
+    async fn recovery_rejects_checksum_corruption_in_the_final_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = standard_options(dir.path());
+        seed_segments(&options, &[Bytes::from_static(b"record")], WAL_SEGMENT_SIZE);
+
+        let path = list_segment_files(dir.path()).unwrap()[0].1.clone();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[11] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+
+        let error = SegmentLog::open(options).await.err().unwrap();
+        assert!(matches!(
+            error,
+            LogError::Corruption { message, .. }
+                if message == "physical record checksum mismatch"
+        ));
+        assert_eq!(std::fs::metadata(path).unwrap().len(), file_size);
+    }
+
     #[test]
     fn recovery_rejects_a_sequence_gap() {
         let dir = tempfile::tempdir().unwrap();
@@ -877,7 +966,7 @@ mod tests {
 
         seed_records(&options, &records, WAL_SEGMENT_SIZE).unwrap();
 
-        let error = recover_state(&options, false).unwrap_err();
+        let error = recover_state(&options, false, None).unwrap_err();
         assert!(matches!(
             error,
             LogError::Corruption { message, .. }
@@ -886,7 +975,41 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_a_segment_filename_header_mismatch() {
+    fn recovery_does_not_read_records_before_the_applied_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = standard_options(dir.path());
+        let mut segment = FileSegment::create(&options.dir, 1, WAL_SEGMENT_SIZE).unwrap();
+        let mut offsets = Vec::new();
+        for (sequence, payload) in [b"zero".as_slice(), b"one", b"two"].into_iter().enumerate() {
+            let mut record = Vec::with_capacity(8 + payload.len());
+            record.extend_from_slice(&(sequence as Sequence).to_le_bytes());
+            record.extend_from_slice(payload);
+            let AppendResult::Appended(offset) = segment.append(&record).unwrap() else {
+                panic!("test records must fit in one segment");
+            };
+            offsets.push(offset);
+        }
+        segment.file().sync(segment.write_position()).unwrap();
+
+        let path = list_segment_files(dir.path()).unwrap()[0].1.clone();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[11] ^= 0xFF;
+        std::fs::write(path, bytes).unwrap();
+
+        let recovered = recover_state(&options, true, Some(offsets[1])).unwrap();
+        assert_eq!(recovered.next_sequence, 3);
+        let records = recovered
+            .recovered_batches
+            .iter()
+            .flat_map(PublishBatch::records)
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence(), 2);
+        assert_eq!(records[0].payload(), &Bytes::from_static(b"two"));
+    }
+
+    #[test]
+    fn recovery_rejects_a_segment_filename_record_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let options = standard_options(dir.path());
         seed_segments(&options, &[Bytes::from_static(b"record")], WAL_SEGMENT_SIZE);
@@ -894,12 +1017,12 @@ mod tests {
         let renamed_path = dir.path().join("0000000002.seg");
         std::fs::rename(original_path, &renamed_path).unwrap();
 
-        let error = recover_state(&options, false).unwrap_err();
+        let error = recover_state(&options, false, None).unwrap_err();
         assert!(matches!(
             error,
             LogError::Corruption { path, message }
                 if path == renamed_path
-                    && message == "segment filename identifies 2, but its header identifies 1"
+                    && message == "physical record segment number mismatch"
         ));
     }
 }

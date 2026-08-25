@@ -1,6 +1,5 @@
 //! Write-ahead log configuration.
 
-use crate::segment::IoMode;
 use std::path::PathBuf;
 
 /// Configuration for opening a [`Log`](super::Log).
@@ -8,16 +7,11 @@ use std::path::PathBuf;
 pub struct LogOptions {
     /// Directory where segment files are stored and recovered from.
     pub dir: PathBuf,
-    /// I/O mode used for segment reads and writes.
-    pub io_mode: IoMode,
 }
 
 impl LogOptions {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            ..Self::default()
-        }
+        Self { dir: dir.into() }
     }
 }
 
@@ -25,7 +19,6 @@ impl Default for LogOptions {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("/tmp/lyra-wal"),
-            io_mode: IoMode::DirectPreferred,
         }
     }
 }

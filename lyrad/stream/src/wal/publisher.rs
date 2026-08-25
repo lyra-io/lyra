@@ -1,7 +1,7 @@
 //! Application of durable WAL records to a downstream state owner.
 
-use super::Sequence;
 use super::error::LogError;
+use super::{SegmentOffset, Sequence};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ const APPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRecord {
     sequence: Sequence,
+    offset: SegmentOffset,
     payload: Bytes,
 }
 
@@ -22,6 +23,11 @@ impl PublishRecord {
     /// Returns the record's logical sequence.
     pub fn sequence(&self) -> Sequence {
         self.sequence
+    }
+
+    /// Returns the physical position used to resume WAL recovery after this record.
+    pub fn offset(&self) -> SegmentOffset {
+        self.offset
     }
 
     /// Returns the record payload.
@@ -37,12 +43,13 @@ pub struct PublishBatch {
 }
 
 impl PublishBatch {
-    pub(super) fn new(records: &[(Sequence, Bytes)]) -> Self {
+    pub(super) fn new(records: &[(Sequence, SegmentOffset, Bytes)]) -> Self {
         Self {
             records: records
                 .iter()
-                .map(|(sequence, payload)| PublishRecord {
+                .map(|(sequence, offset, payload)| PublishRecord {
                     sequence: *sequence,
+                    offset: *offset,
                     payload: payload.clone(),
                 })
                 .collect(),
@@ -74,6 +81,14 @@ impl PublishBatch {
 /// Downstream state owner for durable WAL records.
 #[async_trait]
 pub trait PublishTarget: Send + Sync + 'static {
+    /// Returns the last WAL record already reflected in the target's durable state.
+    ///
+    /// Implementations should persist this offset atomically with the state
+    /// produced by [`apply`](Self::apply). Recovery resumes after this record.
+    fn applied_offset(&self) -> Option<SegmentOffset> {
+        None
+    }
+
     async fn apply(&self, batch: PublishBatch) -> Result<(), LogError>;
 
     async fn close(&self) -> Result<(), LogError> {

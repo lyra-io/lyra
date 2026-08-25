@@ -3,10 +3,10 @@
 //! This crate owns mutable stream durability: write ordering, background WAL
 //! workers, local segment rotation, synchronization, and lifecycle.
 
-pub mod segment;
+pub mod vfs;
 pub mod wal;
 
 pub use wal::{
-    IoMode, Log, LogError, LogOptions, PublishBatch, PublishRecord, PublishTarget, SegmentLog,
-    Sequence,
+    Log, LogError, LogOptions, PublishBatch, PublishRecord, PublishTarget, SegmentLog,
+    SegmentOffset, Sequence,
 };

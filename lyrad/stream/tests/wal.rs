@@ -5,17 +5,23 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use stream::{IoMode, Log, LogError, LogOptions, PublishBatch, PublishTarget, SegmentLog};
+use stream::{Log, LogError, LogOptions, PublishBatch, PublishTarget, SegmentLog, SegmentOffset};
 
 #[derive(Default)]
 struct MemoryApplyTarget {
     batches: Mutex<Vec<PublishBatch>>,
+    applied_offset: Mutex<Option<SegmentOffset>>,
     closed: AtomicBool,
 }
 
 #[async_trait]
 impl PublishTarget for MemoryApplyTarget {
+    fn applied_offset(&self) -> Option<SegmentOffset> {
+        *self.applied_offset.lock().unwrap()
+    }
+
     async fn apply(&self, batch: PublishBatch) -> Result<(), LogError> {
+        *self.applied_offset.lock().unwrap() = batch.records().last().map(|record| record.offset());
         self.batches.lock().unwrap().push(batch);
         Ok(())
     }
@@ -36,9 +42,7 @@ impl PublishTarget for FailingApplyTarget {
 }
 
 fn standard_options(path: &Path) -> LogOptions {
-    let mut options = LogOptions::new(path);
-    options.io_mode = IoMode::Standard;
-    options
+    LogOptions::new(path)
 }
 
 async fn open_wal(options: LogOptions) -> Result<Arc<dyn Log>, LogError> {
@@ -161,6 +165,74 @@ async fn applies_recovered_records_before_open_returns() {
 }
 
 #[tokio::test]
+async fn recovery_starts_after_the_targets_applied_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let target = Arc::new(MemoryApplyTarget::default());
+    let original = SegmentLog::open_with_target(options.clone(), target.clone())
+        .await
+        .unwrap();
+
+    for value in 0..3u8 {
+        original
+            .append(Bytes::from(vec![value]), true)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while target
+            .batches
+            .lock()
+            .unwrap()
+            .last()
+            .is_none_or(|batch| batch.last_sequence() < 2)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication timed out");
+    original.close().await;
+    target.batches.lock().unwrap().clear();
+
+    let reopened = SegmentLog::open_with_target(options, target.clone())
+        .await
+        .unwrap();
+    assert!(target.batches.lock().unwrap().is_empty());
+    assert_eq!(
+        reopened
+            .append(Bytes::from_static(b"next"), true)
+            .await
+            .unwrap(),
+        3
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while target
+            .batches
+            .lock()
+            .unwrap()
+            .last()
+            .is_none_or(|batch| batch.last_sequence() < 3)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication timed out");
+    let applied: Vec<_> = target
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|batch| batch.records())
+        .map(|record| record.sequence())
+        .collect();
+    assert_eq!(applied, vec![3]);
+    reopened.close().await;
+}
+
+#[tokio::test]
 async fn recovery_apply_failure_releases_the_directory_lock() {
     let dir = tempfile::tempdir().unwrap();
     let options = standard_options(dir.path());
@@ -203,13 +275,11 @@ async fn concurrent_callers_receive_unique_ordered_sequences() {
 }
 
 #[tokio::test]
-async fn direct_preferred_appends_with_fallback() {
+async fn buffered_wal_appends() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = standard_options(dir.path());
-    options.io_mode = IoMode::DirectPreferred;
-    let wal = open_wal(options).await.unwrap();
+    let wal = open_wal(standard_options(dir.path())).await.unwrap();
 
-    wal.append(Bytes::from_static(b"direct-or-standard"), true)
+    wal.append(Bytes::from_static(b"buffered"), true)
         .await
         .unwrap();
     wal.close().await;

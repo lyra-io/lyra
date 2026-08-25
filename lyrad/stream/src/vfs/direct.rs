@@ -346,16 +346,6 @@ fn linux_direct_io_alignment(file: &File) -> Result<DirectAlignment> {
     })
 }
 
-pub(crate) fn direct_io_unavailable(error: &Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::InvalidInput | ErrorKind::Unsupported
-    ) || matches!(
-        error.raw_os_error(),
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

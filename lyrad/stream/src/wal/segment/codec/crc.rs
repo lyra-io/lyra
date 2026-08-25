@@ -1,10 +1,6 @@
-//! CRC32C calculation for segment metadata and physical record fragments.
+//! CRC32C calculation for physical WAL record fragments.
 
 const MASK_DELTA: u32 = 0xa282_ead8;
-
-pub(super) fn checksum(bytes: &[u8]) -> u32 {
-    crc32c::crc32c(bytes)
-}
 
 pub(super) fn physical_checksum(record_type: u8, segment_number: u32, payload: &[u8]) -> u32 {
     let checksum = crc32c::crc32c(&[record_type]);
