@@ -10,13 +10,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
+use meta::utils::promise::Promise;
 use std::any::Any;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 /// A buffered write-ahead log backed by Lyra's segment format.
 ///
@@ -30,9 +32,6 @@ pub struct SegmentLog {
 
     // Immutable state
     operation_tx: mpsc::Sender<Operation>,
-    advanced_sequence: watch::Receiver<Sequence>,
-    synced_sequence: watch::Receiver<Sequence>,
-    sync: bool,
 
     // Mutable state
     state: RwLock<Lifecycle>,
@@ -72,16 +71,13 @@ impl SegmentLog {
 
         let (operation_tx, operation_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
         let (sync_tx, sync_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
-        let (advanced_tx, advanced_sequence) = watch::channel(0);
-        let (synced_tx, synced_sequence) = watch::channel(0);
 
         let (sync_done_tx, sync_done) = oneshot::channel();
         let sync_handle = ThreadBuilder::new().name("lyra-wal-sync".into()).spawn({
             let dir = options.dir.clone();
-            let synced_tx = synced_tx.clone();
             let vfs = vfs.clone();
             move || {
-                sync_loop(sync_rx, vfs, dir.as_path(), synced_tx);
+                sync_loop(sync_rx, vfs, dir.as_path());
                 tracing::info!("WAL sync thread exited");
                 let _ = sync_done_tx.send(());
             }
@@ -91,7 +87,6 @@ impl SegmentLog {
         let (writer_done_tx, writer_done) = oneshot::channel();
         let writer_handle = match ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
             let options = options.clone();
-            let advanced_tx = advanced_tx.clone();
             let vfs = vfs.clone();
             move || {
                 match DirectoryLock::acquire(options.dir.join(LOCK_FILE_NAME))
@@ -106,16 +101,8 @@ impl SegmentLog {
                         recover_state(&vfs, &options).map(|recovered| (directory_lock, recovered))
                     }) {
                     Ok((directory_lock, recovered)) => {
-                        let last_sequence = recovered.next_sequence.checked_sub(1);
-                        if writer_started_tx.send(Ok(last_sequence)).is_ok() {
-                            writer_loop(
-                                operation_rx,
-                                sync_tx,
-                                advanced_tx,
-                                vfs,
-                                options,
-                                recovered,
-                            );
+                        if writer_started_tx.send(Ok(())).is_ok() {
+                            writer_loop(operation_rx, sync_tx, vfs, options, recovered);
                         }
                         drop(directory_lock);
                     }
@@ -136,11 +123,7 @@ impl SegmentLog {
         };
 
         match writer_started.await {
-            Ok(Ok(last_sequence)) => {
-                let sequence = last_sequence.map_or(0, |sequence| sequence + 1);
-                advanced_tx.send_replace(sequence);
-                synced_tx.send_replace(sequence);
-            }
+            Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let _ = writer_done.await;
                 let _ = sync_done.await;
@@ -174,9 +157,6 @@ impl SegmentLog {
             })),
             close_lock: Mutex::new(()),
             operation_tx,
-            advanced_sequence,
-            synced_sequence,
-            sync: options.sync,
             state: RwLock::new(Lifecycle::Running),
         }))
     }
@@ -184,32 +164,35 @@ impl SegmentLog {
 
 #[async_trait]
 impl Log for SegmentLog {
-    /// Appends `payload` and returns its assigned sequence.
+    /// Eagerly submits `payload` and returns its eventual assigned sequence.
     ///
-    /// The append acknowledgement follows the log's configured sync policy.
-    async fn append(&self, payload: Bytes) -> Result<Sequence, WalError> {
-        let permit = self
-            .operation_tx
-            .reserve()
-            .await
-            .map_err(|_| WalError::Closed)?;
-        let state = self.state.read().await;
+    /// The returned promise follows the log's configured sync policy. Dropping
+    /// it discards only the result and does not cancel the accepted append.
+    fn append(&self, payload: Bytes) -> Promise<Sequence, WalError> {
+        let (result_tx, promise) = Promise::new();
+        let Ok(state) = self.state.try_read() else {
+            let _ = result_tx.send(Err(WalError::Closed));
+            return promise;
+        };
         if *state != Lifecycle::Running {
-            return Err(WalError::Closed);
+            let _ = result_tx.send(Err(WalError::Closed));
+            return promise;
         }
 
-        let (sequence_tx, sequence_rx) = oneshot::channel();
-        permit.send(Operation::Append(AppendOp {
-            payload,
-            sequence_tx,
-        }));
-        drop(state);
-        let sequence = sequence_rx.await.map_err(|_| WalError::Closed)??;
-        wait_for_sequence(self.advanced_sequence.clone(), sequence).await?;
-        if self.sync {
-            wait_for_sequence(self.synced_sequence.clone(), sequence).await?;
+        match self
+            .operation_tx
+            .try_send(Operation::Append(AppendOp { payload, result_tx }))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(Operation::Append(append_op))) => {
+                let _ = append_op.result_tx.send(Err(WalError::QueueFull));
+            }
+            Err(TrySendError::Closed(Operation::Append(append_op))) => {
+                let _ = append_op.result_tx.send(Err(WalError::Closed));
+            }
+            Err(_) => unreachable!("append queue returned a non-append operation"),
         }
-        Ok(sequence)
+        promise
     }
 
     /// Stops admission, drains owned work, and closes all components.
@@ -279,24 +262,9 @@ fn finish_worker(name: &'static str, worker: &mut WorkerThread, stopped: bool) {
     }
 }
 
-async fn wait_for_sequence(
-    mut progress: watch::Receiver<Sequence>,
-    required_sequence: Sequence,
-) -> Result<(), WalError> {
-    let required_sequence = required_sequence
-        .checked_add(1)
-        .ok_or_else(|| WalError::Worker("WAL sequence space exhausted".into()))?;
-    progress
-        .wait_for(|sequence| *sequence >= required_sequence)
-        .await
-        .map(|_| ())
-        .map_err(|_| WalError::Closed)
-}
-
 fn writer_loop(
     mut operation_rx: mpsc::Receiver<Operation>,
     sync_tx: mpsc::Sender<Operation>,
-    advanced_sequence: watch::Sender<Sequence>,
     vfs: VfsI,
     options: LogOptions,
     recovered: RecoveredState,
@@ -320,17 +288,19 @@ fn writer_loop(
         for operation in operations {
             match operation {
                 Operation::Append(append_op) => {
+                    let AppendOp { payload, result_tx } = append_op;
+                    let mut result_tx = Some(result_tx);
                     let sequence = next_sequence;
                     let Some(incremented_sequence) = sequence.checked_add(1) else {
                         let error = WalError::Worker("WAL sequence space exhausted".into());
-                        let _ = append_op.sequence_tx.send(Err(error));
+                        let _ = result_tx.take().unwrap().send(Err(error));
                         break 'writer;
                     };
                     next_sequence = incremented_sequence;
 
-                    let mut record = Vec::with_capacity(8 + append_op.payload.len());
+                    let mut record = Vec::with_capacity(8 + payload.len());
                     record.extend_from_slice(&sequence.to_le_bytes());
-                    record.extend_from_slice(&append_op.payload);
+                    record.extend_from_slice(&payload);
                     let write_result = (|| -> Result<(), WalError> {
                         loop {
                             if active_segment.is_none() {
@@ -363,7 +333,7 @@ fn writer_loop(
                     })();
                     if let Err(error) = write_result {
                         tracing::error!(sequence, error = %error, "WAL write failed");
-                        let _ = append_op.sequence_tx.send(Err(error));
+                        let _ = result_tx.take().unwrap().send(Err(error));
                         break 'writer;
                     }
 
@@ -373,17 +343,25 @@ fn writer_loop(
                     let sync_op = SyncOp {
                         segments: std::mem::take(&mut dirty_segments),
                         sync_directory: std::mem::take(&mut directory_dirty),
-                        last_sequence: sequence,
+                        completion: options.sync.then(|| (sequence, result_tx.take().unwrap())),
                     };
-                    if sync_tx.blocking_send(Operation::Sync(sync_op)).is_err() {
+                    if let Err(send_error) = sync_tx.blocking_send(Operation::Sync(sync_op)) {
                         let error = WalError::Worker("WAL sync thread stopped".into());
                         tracing::error!(sequence, error = %error);
-                        let _ = append_op.sequence_tx.send(Err(error));
+                        let Operation::Sync(mut sync_op) = send_error.0 else {
+                            unreachable!("sync queue returned a non-sync operation")
+                        };
+                        let result_tx = result_tx
+                            .take()
+                            .or_else(|| sync_op.completion.take().map(|(_, result_tx)| result_tx))
+                            .unwrap();
+                        let _ = result_tx.send(Err(error));
                         break 'writer;
                     }
 
-                    advanced_sequence.send_replace(incremented_sequence);
-                    let _ = append_op.sequence_tx.send(Ok(sequence));
+                    if let Some(result_tx) = result_tx {
+                        let _ = result_tx.send(Ok(sequence));
+                    }
                 }
                 Operation::Sync(_) => unreachable!("sync operation sent to WAL writer"),
                 Operation::Close => {
@@ -403,12 +381,7 @@ fn writer_loop(
     }
 }
 
-fn sync_loop(
-    mut sync_rx: mpsc::Receiver<Operation>,
-    vfs: VfsI,
-    dir: &Path,
-    synced_sequence: watch::Sender<Sequence>,
-) {
+fn sync_loop(mut sync_rx: mpsc::Receiver<Operation>, vfs: VfsI, dir: &Path) {
     loop {
         let mut operations = Vec::new();
         let received = sync_rx.blocking_recv_many(&mut operations, MAX_INFLIGHT_APPEND_NUM);
@@ -418,14 +391,14 @@ fn sync_loop(
 
         let mut segments = Vec::new();
         let mut sync_dir = false;
-        let mut last_sequence = None;
+        let mut completions = Vec::new();
         let mut closing = false;
         for operation in operations {
             match operation {
                 Operation::Sync(sync_op) => {
                     segments.extend(sync_op.segments);
                     sync_dir |= sync_op.sync_directory;
-                    last_sequence = Some(sync_op.last_sequence);
+                    completions.extend(sync_op.completion);
                 }
                 Operation::Append(_) => unreachable!("append operation sent to WAL sync worker"),
                 Operation::Close => {
@@ -435,13 +408,18 @@ fn sync_loop(
             }
         }
 
-        if let Some(last_sequence) = last_sequence {
+        if !segments.is_empty() {
             match perform_sync(&segments, sync_dir, &vfs, dir) {
                 Ok(()) => {
-                    synced_sequence.send_replace(last_sequence + 1);
+                    for (sequence, result_tx) in completions {
+                        let _ = result_tx.send(Ok(sequence));
+                    }
                 }
                 Err(error) => {
                     tracing::error!(error = %error, "WAL sync failed");
+                    for (_, result_tx) in completions {
+                        let _ = result_tx.send(Err(error.clone()));
+                    }
                     break;
                 }
             }

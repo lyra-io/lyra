@@ -8,13 +8,13 @@ use tokio::sync::oneshot;
 
 pub struct AppendOp {
     pub payload: Bytes,
-    pub sequence_tx: oneshot::Sender<Result<Sequence, WalError>>,
+    pub result_tx: oneshot::Sender<Result<Sequence, WalError>>,
 }
 
 pub struct SyncOp {
     pub segments: Vec<FileSegment>,
     pub sync_directory: bool,
-    pub last_sequence: Sequence,
+    pub completion: Option<(Sequence, oneshot::Sender<Result<Sequence, WalError>>)>,
 }
 
 pub(super) enum Operation {

@@ -8,6 +8,7 @@ resolver = "3"
 libc = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+tokio = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

@@ -1,5 +1,6 @@
 //! Errors produced by the stream storage write-ahead log.
 
+use meta::utils::promise::PromiseDisconnected;
 use std::io::Error;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -9,6 +10,10 @@ pub enum WalError {
     /// The log was closed or is no longer accepting appends.
     #[error("WAL is closed")]
     Closed,
+
+    /// The bounded append queue cannot currently accept another record.
+    #[error("WAL append queue is full")]
+    QueueFull,
 
     /// An operating-system level I/O failure.
     #[error("WAL I/O error: {0}")]
@@ -70,5 +75,11 @@ impl WalError {
 impl From<Error> for WalError {
     fn from(error: Error) -> Self {
         Self::Io(error.to_string())
+    }
+}
+
+impl From<PromiseDisconnected> for WalError {
+    fn from(_: PromiseDisconnected) -> Self {
+        Self::Closed
     }
 }

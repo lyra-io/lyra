@@ -12,6 +12,7 @@ pub use options::LogOptions;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use meta::utils::promise::Promise;
 
 /// A monotonically increasing WAL record identifier.
 pub type Sequence = u64;
@@ -25,10 +26,11 @@ pub(crate) const MAX_INFLIGHT_APPEND_NUM: usize = 4096;
 /// An ordered, durable stream log.
 #[async_trait]
 pub trait Log: Send + Sync {
-    /// Appends `payload` and returns its assigned sequence.
+    /// Eagerly submits `payload` and returns its eventual assigned sequence.
     ///
-    /// The append acknowledgement follows the log's configured sync policy.
-    async fn append(&self, payload: Bytes) -> Result<Sequence, WalError>;
+    /// A successfully returned promise remains independent of its waiter and
+    /// follows the log's configured synchronization policy.
+    fn append(&self, payload: Bytes) -> Promise<Sequence, WalError>;
 
     /// Stops admission, drains owned work, and closes all components.
     async fn close(&self);

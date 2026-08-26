@@ -63,12 +63,39 @@ async fn buffered_wal_appends() {
 }
 
 #[tokio::test]
+async fn dropping_a_promise_does_not_cancel_the_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = standard_options(dir.path());
+    let wal = open_wal(options.clone()).await.unwrap();
+
+    drop(wal.append(Bytes::from_static(b"detached")));
+    assert_eq!(
+        wal.append(Bytes::from_static(b"observed")).await.unwrap(),
+        1
+    );
+    wal.close().await;
+
+    let reopened = open_wal(options).await.unwrap();
+    assert_eq!(
+        reopened
+            .append(Bytes::from_static(b"recovered"))
+            .await
+            .unwrap(),
+        2
+    );
+    reopened.close().await;
+}
+
+#[tokio::test]
 async fn close_is_idempotent_and_rejects_new_appends() {
     let dir = tempfile::tempdir().unwrap();
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
     wal.close().await;
     wal.close().await;
-    assert!(wal.append(Bytes::from_static(b"late")).await.is_err());
+    assert_eq!(
+        wal.append(Bytes::from_static(b"late")).await,
+        Err(WalError::Closed)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

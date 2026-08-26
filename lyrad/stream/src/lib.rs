@@ -6,4 +6,5 @@
 pub mod vfs;
 pub mod wal;
 
+pub use meta::utils::promise::Promise;
 pub use wal::{Log, LogOptions, SegmentLog, Sequence, WalError};
