@@ -39,8 +39,8 @@ pub enum WalError {
     ReadBufferTooSmall { size: usize, max: usize },
 
     /// A physical WAL position cannot be represented.
-    #[error("WAL offset space is exhausted")]
-    OffsetExhausted,
+    #[error("WAL position space is exhausted")]
+    PositionExhausted,
 
     /// An internal background worker failed.
     #[error("WAL worker failed: {0}")]

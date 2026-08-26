@@ -1,7 +1,7 @@
 //! Buffered WAL segment implementation.
 
 use super::codec::{decode_record, encode_record};
-use super::{AppendResult, WalError, make_segment_path};
+use super::{AppendResult, Segment, WalError, make_segment_path};
 use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Result as IoResult, Seek, SeekFrom, Write};
@@ -126,7 +126,7 @@ impl FileHandle {
 }
 
 #[derive(Debug)]
-pub(in crate::wal) struct Segment {
+pub(in crate::wal) struct FileSegment {
     // Immutable state
     number: u64,
     file: Arc<FileHandle>,
@@ -136,7 +136,7 @@ pub(in crate::wal) struct Segment {
     write_position: u64,
 }
 
-impl Segment {
+impl FileSegment {
     pub(in crate::wal) fn create(dir: &Path, number: u64, max_size: u64) -> Result<Self, WalError> {
         u32::try_from(number).map_err(|_| WalError::SegmentNumberTooLarge(number))?;
         let file = Arc::new(FileHandle::create(&make_segment_path(dir, number))?);
@@ -174,43 +174,36 @@ impl Segment {
             write_position,
         })
     }
+}
 
-    pub(in crate::wal) fn file(&self) -> Arc<FileHandle> {
+impl Segment for FileSegment {
+    fn file(&self) -> Arc<FileHandle> {
         Arc::clone(&self.file)
     }
 
-    pub(in crate::wal) const fn number(&self) -> u64 {
-        self.number
-    }
-
-    pub(in crate::wal) const fn write_position(&self) -> u64 {
+    fn write_position(&self) -> u64 {
         self.write_position
     }
 
     /// Reads complete records whose combined payload size does not exceed
-    /// `max_bytes`, returning the next unread offset and each record's offset.
-    pub(in crate::wal) fn read(
-        &self,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<(u64, Vec<(u64, Bytes)>), WalError> {
-        if offset > self.write_position {
+    /// `max_bytes`, returning the next unread position and the payloads.
+    fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError> {
+        if position > self.write_position {
             return Err(WalError::corruption(
                 self.file.path(),
                 format!(
-                    "offset {offset} is outside segment {} with size {}",
+                    "position {position} is outside segment {} with size {}",
                     self.number, self.write_position
                 ),
             ));
         }
 
         let mut reader = BufReader::new(self.file.reader()?);
-        reader.seek(SeekFrom::Start(offset))?;
-        let mut position = offset;
+        reader.seek(SeekFrom::Start(position))?;
+        let mut position = position;
         let mut payload_bytes = 0usize;
         let mut records = Vec::new();
         while position < self.write_position {
-            let record_offset = position;
             let decoded = decode_record(
                 &mut reader,
                 self.file.path(),
@@ -225,7 +218,7 @@ impl Segment {
             };
             let next_payload_bytes = payload_bytes
                 .checked_add(payload.len())
-                .ok_or(WalError::OffsetExhausted)?;
+                .ok_or(WalError::PositionExhausted)?;
             if next_payload_bytes > max_bytes {
                 if records.is_empty() {
                     return Err(WalError::ReadBufferTooSmall {
@@ -236,7 +229,7 @@ impl Segment {
                 break;
             }
 
-            records.push((record_offset, payload));
+            records.push(payload);
             payload_bytes = next_payload_bytes;
             position = next_position;
         }
@@ -244,13 +237,13 @@ impl Segment {
         Ok((position, records))
     }
 
-    pub(in crate::wal) fn append(&mut self, payload: &[u8]) -> Result<AppendResult, WalError> {
+    fn append(&mut self, payload: &[u8]) -> Result<AppendResult, WalError> {
         let encoded = encode_record(self.number, self.write_position, payload)?;
-        let encoded_size = u64::try_from(encoded.len()).map_err(|_| WalError::OffsetExhausted)?;
+        let encoded_size = u64::try_from(encoded.len()).map_err(|_| WalError::PositionExhausted)?;
         let next_position = self
             .write_position
             .checked_add(encoded_size)
-            .ok_or(WalError::OffsetExhausted)?;
+            .ok_or(WalError::PositionExhausted)?;
         if next_position > self.max_size {
             if self.write_position == 0 {
                 return Err(WalError::RecordTooLarge {
@@ -261,10 +254,9 @@ impl Segment {
             return Ok(AppendResult::Full);
         }
 
-        let offset = self.write_position;
         self.file.append(&encoded)?;
         self.write_position = next_position;
-        Ok(AppendResult::Appended(offset))
+        Ok(AppendResult::Appended)
     }
 }
 
@@ -275,30 +267,27 @@ mod tests {
     #[test]
     fn appends_and_reads_records_without_metadata_envelopes() {
         let dir = tempfile::tempdir().unwrap();
-        let mut segment = Segment::create(dir.path(), 1, 4096).unwrap();
-        assert_eq!(segment.append(b"first").unwrap(), AppendResult::Appended(0));
-        assert_eq!(
-            segment.append(b"second").unwrap(),
-            AppendResult::Appended(16)
-        );
+        let mut segment = FileSegment::create(dir.path(), 1, 4096).unwrap();
+        assert_eq!(segment.append(b"first").unwrap(), AppendResult::Appended);
+        assert_eq!(segment.append(b"second").unwrap(), AppendResult::Appended);
         segment.file().sync(segment.write_position()).unwrap();
 
-        let (next_offset, records) = segment.read(0, 5).unwrap();
-        assert_eq!(records, vec![(0, Bytes::from_static(b"first"))]);
-        assert_eq!(next_offset, 16);
+        let (next_position, records) = segment.read(0, 5).unwrap();
+        assert_eq!(records, vec![Bytes::from_static(b"first")]);
+        assert_eq!(next_position, 16);
 
-        let (next_offset, records) = segment.read(next_offset, 6).unwrap();
-        assert_eq!(records, vec![(16, Bytes::from_static(b"second"))]);
-        assert_eq!(next_offset, 33);
+        let (next_position, records) = segment.read(next_position, 6).unwrap();
+        assert_eq!(records, vec![Bytes::from_static(b"second")]);
+        assert_eq!(next_position, 33);
     }
 
     #[test]
     fn maximum_size_has_no_external_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let mut segment = Segment::create(dir.path(), 1, 16).unwrap();
+        let mut segment = FileSegment::create(dir.path(), 1, 16).unwrap();
         assert!(matches!(
             segment.append(b"first").unwrap(),
-            AppendResult::Appended(_)
+            AppendResult::Appended
         ));
         assert_eq!(segment.append(b"second").unwrap(), AppendResult::Full);
         assert_eq!(segment.file().size().unwrap(), 16);
@@ -307,7 +296,7 @@ mod tests {
     #[test]
     fn read_rejects_a_first_record_larger_than_the_byte_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut segment = Segment::create(dir.path(), 1, 4096).unwrap();
+        let mut segment = FileSegment::create(dir.path(), 1, 4096).unwrap();
         segment.append(b"record").unwrap();
 
         assert!(matches!(

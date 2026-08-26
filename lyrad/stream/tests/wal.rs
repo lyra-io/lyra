@@ -5,26 +5,23 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use stream::{Log, LogOptions, PublishBatch, PublishTarget, SegmentLog, WalError};
+use stream::{Log, LogOptions, PublishBatch, PublishTarget, SegmentLog, Sequence, WalError};
 
 #[derive(Default)]
 struct MemoryApplyTarget {
     batches: Mutex<Vec<PublishBatch>>,
-    applied_offset: Mutex<Option<(u64, u64)>>,
+    applied_sequence: Mutex<Option<Sequence>>,
     closed: AtomicBool,
 }
 
 #[async_trait]
 impl PublishTarget for MemoryApplyTarget {
-    fn applied_offset(&self) -> Option<(u64, u64)> {
-        *self.applied_offset.lock().unwrap()
+    fn applied_sequence(&self) -> Option<Sequence> {
+        *self.applied_sequence.lock().unwrap()
     }
 
     async fn apply(&self, batch: PublishBatch) -> Result<(), WalError> {
-        *self.applied_offset.lock().unwrap() = batch
-            .records()
-            .last()
-            .map(|record| (record.segment_number(), record.offset()));
+        *self.applied_sequence.lock().unwrap() = Some(batch.last_sequence());
         self.batches.lock().unwrap().push(batch);
         Ok(())
     }
@@ -65,17 +62,9 @@ async fn appends_return_sequential_sequences() {
     let dir = tempfile::tempdir().unwrap();
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
 
-    assert_eq!(
-        wal.append(Bytes::from_static(b"one"), true).await.unwrap(),
-        0
-    );
-    assert_eq!(wal.append(Bytes::new(), true).await.unwrap(), 1);
-    assert_eq!(
-        wal.append(Bytes::from_static(b"three"), true)
-            .await
-            .unwrap(),
-        2
-    );
+    assert_eq!(wal.append(Bytes::from_static(b"one")).await.unwrap(), 0);
+    assert_eq!(wal.append(Bytes::new()).await.unwrap(), 1);
+    assert_eq!(wal.append(Bytes::from_static(b"three")).await.unwrap(), 2);
     wal.close().await;
 }
 
@@ -89,7 +78,7 @@ async fn applies_written_batches_only_after_their_sequences_are_synced() {
 
     for value in 0..3u8 {
         assert_eq!(
-            log.append(Bytes::from(vec![value]), false).await.unwrap(),
+            log.append(Bytes::from(vec![value])).await.unwrap(),
             value as u64
         );
     }
@@ -115,7 +104,7 @@ async fn applies_written_batches_only_after_their_sequences_are_synced() {
         .unwrap()
         .iter()
         .flat_map(|batch| batch.records())
-        .map(|record| (record.sequence(), record.payload().clone()))
+        .map(|(sequence, payload)| (sequence, payload.clone()))
         .collect();
     assert_eq!(
         applied,
@@ -136,10 +125,7 @@ async fn applies_recovered_records_before_open_returns() {
     let options = standard_options(dir.path());
     let original = open_wal(options.clone()).await.unwrap();
     for value in 0..3u8 {
-        original
-            .append(Bytes::from(vec![value]), false)
-            .await
-            .unwrap();
+        original.append(Bytes::from(vec![value])).await.unwrap();
     }
     original.close().await;
 
@@ -153,7 +139,7 @@ async fn applies_recovered_records_before_open_returns() {
         .unwrap()
         .iter()
         .flat_map(|batch| batch.records())
-        .map(|record| (record.sequence(), record.payload().clone()))
+        .map(|(sequence, payload)| (sequence, payload.clone()))
         .collect();
     assert_eq!(
         applied,
@@ -168,7 +154,7 @@ async fn applies_recovered_records_before_open_returns() {
 }
 
 #[tokio::test]
-async fn recovery_starts_after_the_targets_applied_offset() {
+async fn recovery_starts_after_the_targets_applied_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let options = standard_options(dir.path());
     let target = Arc::new(MemoryApplyTarget::default());
@@ -177,10 +163,7 @@ async fn recovery_starts_after_the_targets_applied_offset() {
         .unwrap();
 
     for value in 0..3u8 {
-        original
-            .append(Bytes::from(vec![value]), true)
-            .await
-            .unwrap();
+        original.append(Bytes::from(vec![value])).await.unwrap();
     }
     tokio::time::timeout(Duration::from_secs(5), async {
         while target
@@ -203,10 +186,7 @@ async fn recovery_starts_after_the_targets_applied_offset() {
         .unwrap();
     assert!(target.batches.lock().unwrap().is_empty());
     assert_eq!(
-        reopened
-            .append(Bytes::from_static(b"next"), true)
-            .await
-            .unwrap(),
+        reopened.append(Bytes::from_static(b"next")).await.unwrap(),
         3
     );
 
@@ -229,7 +209,7 @@ async fn recovery_starts_after_the_targets_applied_offset() {
         .unwrap()
         .iter()
         .flat_map(|batch| batch.records())
-        .map(|record| record.sequence())
+        .map(|(sequence, _)| sequence)
         .collect();
     assert_eq!(applied, vec![3]);
     reopened.close().await;
@@ -241,7 +221,7 @@ async fn recovery_apply_failure_releases_the_directory_lock() {
     let options = standard_options(dir.path());
     let original = open_wal(options.clone()).await.unwrap();
     original
-        .append(Bytes::from_static(b"record"), true)
+        .append(Bytes::from_static(b"record"))
         .await
         .unwrap();
     original.close().await;
@@ -265,7 +245,7 @@ async fn concurrent_callers_receive_unique_ordered_sequences() {
     for value in 0..100u8 {
         let wal = Arc::clone(&wal);
         tasks.push(tokio::spawn(async move {
-            wal.append(Bytes::from(vec![value]), true).await.unwrap()
+            wal.append(Bytes::from(vec![value])).await.unwrap()
         }));
     }
 
@@ -282,9 +262,7 @@ async fn buffered_wal_appends() {
     let dir = tempfile::tempdir().unwrap();
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
 
-    wal.append(Bytes::from_static(b"buffered"), true)
-        .await
-        .unwrap();
+    wal.append(Bytes::from_static(b"buffered")).await.unwrap();
     wal.close().await;
 }
 
@@ -294,7 +272,7 @@ async fn close_is_idempotent_and_rejects_new_appends() {
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
     wal.close().await;
     wal.close().await;
-    assert!(wal.append(Bytes::from_static(b"late"), true).await.is_err());
+    assert!(wal.append(Bytes::from_static(b"late")).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -312,7 +290,7 @@ async fn concurrent_close_callers_all_complete_cleanly() {
         close.await.unwrap();
     }
     assert_eq!(
-        wal.append(Bytes::from_static(b"late"), true).await,
+        wal.append(Bytes::from_static(b"late")).await,
         Err(WalError::Closed)
     );
 }
@@ -354,19 +332,19 @@ async fn appends_a_large_payload_within_the_record_area_limit() {
     let wal = open_wal(standard_options(dir.path())).await.unwrap();
     let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
 
-    assert_eq!(wal.append(payload, true).await.unwrap(), 0);
+    assert_eq!(wal.append(payload).await.unwrap(), 0);
     wal.close().await;
 }
 
 #[tokio::test]
-async fn close_flushes_unsynced_appends() {
+async fn durable_appends_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let options = standard_options(dir.path());
     let wal = open_wal(options.clone()).await.unwrap();
 
     for value in 0..3u8 {
         assert_eq!(
-            wal.append(Bytes::from(vec![value]), false).await.unwrap(),
+            wal.append(Bytes::from(vec![value])).await.unwrap(),
             value as u64
         );
     }
@@ -374,10 +352,7 @@ async fn close_flushes_unsynced_appends() {
 
     let reopened = open_wal(options).await.unwrap();
     assert_eq!(
-        reopened
-            .append(Bytes::from_static(b"next"), true)
-            .await
-            .unwrap(),
+        reopened.append(Bytes::from_static(b"next")).await.unwrap(),
         3
     );
     reopened.close().await;
@@ -393,7 +368,7 @@ async fn write_failure_does_not_strand_its_caller() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        wal.append(Bytes::from_static(b"blocked"), true),
+        wal.append(Bytes::from_static(b"blocked")),
     )
     .await
     .expect("append timed out");
@@ -412,7 +387,7 @@ async fn reopen_recovers_sequences() {
         let wal = open_wal(options.clone()).await.unwrap();
         for value in 0..3u8 {
             assert_eq!(
-                wal.append(Bytes::from(vec![value]), true).await.unwrap(),
+                wal.append(Bytes::from(vec![value])).await.unwrap(),
                 value as u64
             );
         }
@@ -422,10 +397,7 @@ async fn reopen_recovers_sequences() {
 
     let wal = open_wal(options).await.unwrap();
     // Sequence numbering resumes after the last durable record.
-    assert_eq!(
-        wal.append(Bytes::from_static(b"next"), true).await.unwrap(),
-        3
-    );
+    assert_eq!(wal.append(Bytes::from_static(b"next")).await.unwrap(), 3);
     wal.close().await;
 }
 
@@ -437,7 +409,7 @@ async fn racing_appends_and_close_never_strands_a_caller() {
     for value in 0..100u8 {
         let wal = Arc::clone(&wal);
         appends.push(tokio::spawn(async move {
-            wal.append(Bytes::from(vec![value]), true).await
+            wal.append(Bytes::from(vec![value])).await
         }));
     }
 

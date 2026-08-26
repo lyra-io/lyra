@@ -10,7 +10,7 @@ mod segment;
 pub use error::WalError;
 pub use log::SegmentLog;
 pub use options::LogOptions;
-pub use publisher::{PublishBatch, PublishRecord, PublishTarget};
+pub use publisher::{PublishBatch, PublishTarget};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,9 +32,8 @@ pub(crate) const MAX_PENDING_PUBLISH_BATCH_NUM: usize = 1;
 pub trait Log: Send + Sync {
     /// Appends `payload` and returns its assigned sequence.
     ///
-    /// A sync append is acknowledged after its sequence becomes durable. A
-    /// non-sync append is acknowledged after its bytes are written.
-    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError>;
+    /// The append is acknowledged after its sequence becomes durable.
+    async fn append(&self, payload: Bytes) -> Result<Sequence, WalError>;
 
     /// Stops admission, drains owned work, and closes all components.
     async fn close(&self);

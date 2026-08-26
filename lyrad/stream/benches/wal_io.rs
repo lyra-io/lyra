@@ -39,7 +39,7 @@ async fn run(records: usize, payload_size: usize, concurrency: usize) {
             let mut latencies = Vec::with_capacity(count);
             for _ in 0..count {
                 let append_started = Instant::now();
-                wal.append(payload.clone(), true).await?;
+                wal.append(payload.clone()).await?;
                 latencies.push(append_started.elapsed());
             }
             Ok::<_, stream::WalError>(latencies)

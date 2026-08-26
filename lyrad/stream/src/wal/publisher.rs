@@ -11,90 +11,64 @@ use tokio_util::sync::CancellationToken;
 
 const APPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-/// One ordered WAL record ready for downstream publication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishRecord {
-    sequence: Sequence,
-    segment_number: u64,
-    offset: u64,
-    payload: Bytes,
-}
-
-impl PublishRecord {
-    /// Returns the record's logical sequence.
-    pub fn sequence(&self) -> Sequence {
-        self.sequence
-    }
-
-    /// Returns the number of the segment containing this record.
-    pub fn segment_number(&self) -> u64 {
-        self.segment_number
-    }
-
-    /// Returns the record's byte position used to resume WAL recovery.
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    /// Returns the record payload.
-    pub fn payload(&self) -> &Bytes {
-        &self.payload
-    }
-}
-
 /// A contiguous, ordered batch of WAL records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishBatch {
-    records: Vec<PublishRecord>,
+    first_sequence: Sequence,
+    payloads: Vec<Bytes>,
 }
 
 impl PublishBatch {
-    pub(super) fn new(records: &[(Sequence, u64, u64, Bytes)]) -> Self {
+    pub(super) fn new(records: &[(Sequence, Bytes)]) -> Self {
+        let first_sequence = records.first().expect("publish batches are never empty").0;
+        debug_assert!(
+            records
+                .windows(2)
+                .all(|records| records[0].0.checked_add(1) == Some(records[1].0))
+        );
         Self {
-            records: records
-                .iter()
-                .map(
-                    |(sequence, segment_number, offset, payload)| PublishRecord {
-                        sequence: *sequence,
-                        segment_number: *segment_number,
-                        offset: *offset,
-                        payload: payload.clone(),
-                    },
-                )
-                .collect(),
+            first_sequence,
+            payloads: records.iter().map(|(_, payload)| payload.clone()).collect(),
         }
     }
 
-    /// Returns the records in sequence order.
-    pub fn records(&self) -> &[PublishRecord] {
-        &self.records
+    /// Returns each sequence and payload in order.
+    pub fn records(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Sequence, &Bytes)> + ExactSizeIterator + '_ {
+        self.payloads
+            .iter()
+            .enumerate()
+            .map(move |(index, payload)| {
+                let sequence = self
+                    .first_sequence
+                    .checked_add(index as Sequence)
+                    .expect("publish batch sequence range is valid");
+                (sequence, payload)
+            })
     }
 
     /// Returns the first sequence in the batch.
     pub fn first_sequence(&self) -> Sequence {
-        self.records
-            .first()
-            .expect("publish batches are never empty")
-            .sequence
+        self.first_sequence
     }
 
     /// Returns the last sequence in the batch.
     pub fn last_sequence(&self) -> Sequence {
-        self.records
-            .last()
-            .expect("publish batches are never empty")
-            .sequence
+        self.first_sequence
+            .checked_add(self.payloads.len() as Sequence - 1)
+            .expect("publish batch sequence range is valid")
     }
 }
 
 /// Downstream state owner for durable WAL records.
 #[async_trait]
 pub trait PublishTarget: Send + Sync + 'static {
-    /// Returns the last WAL record already reflected in the target's durable state.
+    /// Returns the last WAL sequence reflected in the target's durable state.
     ///
-    /// Implementations should persist this offset atomically with the state
-    /// produced by [`apply`](Self::apply). Recovery resumes after this record.
-    fn applied_offset(&self) -> Option<(u64, u64)> {
+    /// Implementations should persist this sequence atomically with the state
+    /// produced by [`apply`](Self::apply). Recovery republishes later records.
+    fn applied_sequence(&self) -> Option<Sequence> {
         None
     }
 

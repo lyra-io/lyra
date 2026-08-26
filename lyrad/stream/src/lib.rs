@@ -6,6 +6,4 @@
 pub mod vfs;
 pub mod wal;
 
-pub use wal::{
-    Log, LogOptions, PublishBatch, PublishRecord, PublishTarget, SegmentLog, Sequence, WalError,
-};
+pub use wal::{Log, LogOptions, PublishBatch, PublishTarget, SegmentLog, Sequence, WalError};

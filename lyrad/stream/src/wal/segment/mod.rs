@@ -4,20 +4,33 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bytes::Bytes;
 
 mod codec;
 #[allow(clippy::module_inception)]
 mod segment;
 
 pub(super) use super::WalError;
-pub(super) use segment::{FileHandle, Segment};
+pub(super) use segment::{FileHandle, FileSegment};
 
 const SEGMENT_EXTENSION: &str = "seg";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AppendResult {
-    Appended(u64),
+    Appended,
     Full,
+}
+
+pub(super) trait Segment {
+    fn file(&self) -> Arc<FileHandle>;
+
+    fn write_position(&self) -> u64;
+
+    fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError>;
+
+    fn append(&mut self, payload: &[u8]) -> Result<AppendResult, WalError>;
 }
 
 pub(in crate::wal) fn make_segment_path(dir: &Path, segment_number: u64) -> PathBuf {

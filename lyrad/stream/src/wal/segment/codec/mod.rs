@@ -16,6 +16,5 @@
 
 mod crc;
 mod record;
-mod segment;
 
-pub(super) use segment::{decode_record, encode_record};
+pub(super) use record::{decode_record, encode_record};
