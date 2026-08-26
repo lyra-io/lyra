@@ -2,9 +2,8 @@
 
 use super::Sequence;
 use super::error::WalError;
-use super::segment::FileHandle;
+use super::segment::FileSegment;
 use bytes::Bytes;
-use std::sync::Arc;
 use tokio::sync::oneshot;
 
 pub type SyncWaiter = (Sequence, oneshot::Sender<Result<Sequence, WalError>>);
@@ -14,13 +13,8 @@ pub struct AppendOp {
     pub response: oneshot::Sender<Result<Sequence, WalError>>,
 }
 
-pub struct SyncFile {
-    pub file: Arc<FileHandle>,
-    pub end: u64,
-}
-
 pub struct SyncOp {
-    pub files: Vec<SyncFile>,
+    pub segments: Vec<FileSegment>,
     pub sync_directory: bool,
     pub last_sequence: Sequence,
     pub waiters: Vec<SyncWaiter>,

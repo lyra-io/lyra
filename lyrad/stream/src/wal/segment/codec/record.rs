@@ -1,7 +1,7 @@
 //! Logical WAL record encoding and decoding.
 
 use super::super::WalError;
-use super::crc::physical_checksum;
+use super::crc::calculate_checksum;
 use bytes::Bytes;
 use std::io::Read;
 use std::path::Path;
@@ -181,7 +181,7 @@ fn encode_fragment(
     output.resize(header_start + HEADER_SIZE, 0);
     output.extend_from_slice(payload);
 
-    let checksum = physical_checksum(record_type as u8, segment_number, payload);
+    let checksum = calculate_checksum(record_type as u8, segment_number, payload);
     output[header_start..header_start + 4].copy_from_slice(&checksum.to_le_bytes());
     output[header_start + 4..header_start + 6]
         .copy_from_slice(&(payload.len() as u16).to_le_bytes());
@@ -233,7 +233,7 @@ fn decode_fragment(
         .map_err(|message| WalError::corruption(path, message))?;
     let mut payload = vec![0; payload_size];
     reader.read_exact(&mut payload)?;
-    if physical_checksum(record_type_byte, segment_number, &payload) != expected_checksum {
+    if calculate_checksum(record_type_byte, segment_number, &payload) != expected_checksum {
         return Err(WalError::corruption(
             path,
             "physical record checksum mismatch",

@@ -15,6 +15,7 @@
 
 - Use numbered suffixes for private implementation layers, such as `open0` and `open1`, instead of names such as `open_inner`.
 - Name utility functions that construct values with a `make_` prefix, such as `make_segment_path`.
+- Keep short, single-use logic inline instead of extracting a helper that is only several straightforward lines.
 
 ## Stateful Rust structs
 

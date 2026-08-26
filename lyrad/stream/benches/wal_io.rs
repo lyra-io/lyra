@@ -19,7 +19,7 @@ async fn main() {
 
 async fn run(records: usize, payload_size: usize, concurrency: usize) {
     let dir = tempfile::tempdir().expect("create benchmark directory");
-    let options = LogOptions::new(dir.path());
+    let options = LogOptions::new(dir.path(), true);
 
     let wal = match SegmentLog::open(options).await {
         Ok(wal) => wal,

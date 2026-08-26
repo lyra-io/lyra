@@ -4,13 +4,11 @@ mod error;
 mod log;
 mod ops;
 mod options;
-mod publisher;
 mod segment;
 
 pub use error::WalError;
-pub use log::SegmentLog;
+pub use log::{PublishBatch, SegmentLog};
 pub use options::LogOptions;
-pub use publisher::{PublishBatch, PublishTarget};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,12 +25,30 @@ pub(crate) const MAX_INFLIGHT_APPEND_NUM: usize = 4096;
 /// Maximum number of written batches waiting behind the active publisher.
 pub(crate) const MAX_PENDING_PUBLISH_BATCH_NUM: usize = 1;
 
+/// Downstream state owner for durable WAL records.
+#[async_trait]
+pub trait PublishTarget: Send + Sync + 'static {
+    /// Returns the last WAL sequence reflected in the target's durable state.
+    ///
+    /// Implementations should persist this sequence atomically with the state
+    /// produced by [`apply`](Self::apply). Recovery republishes later records.
+    fn applied_sequence(&self) -> Option<Sequence> {
+        None
+    }
+
+    async fn apply(&self, batch: PublishBatch) -> Result<(), WalError>;
+
+    async fn close(&self) -> Result<(), WalError> {
+        Ok(())
+    }
+}
+
 /// An ordered, durable stream log.
 #[async_trait]
 pub trait Log: Send + Sync {
     /// Appends `payload` and returns its assigned sequence.
     ///
-    /// The append is acknowledged after its sequence becomes durable.
+    /// The append acknowledgement follows the log's configured sync policy.
     async fn append(&self, payload: Bytes) -> Result<Sequence, WalError>;
 
     /// Stops admission, drains owned work, and closes all components.

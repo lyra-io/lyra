@@ -42,7 +42,7 @@ impl PublishTarget for FailingApplyTarget {
 }
 
 fn standard_options(path: &Path) -> LogOptions {
-    LogOptions::new(path)
+    LogOptions::new(path, true)
 }
 
 async fn open_wal(options: LogOptions) -> Result<Arc<dyn Log>, WalError> {
@@ -337,9 +337,9 @@ async fn appends_a_large_payload_within_the_record_area_limit() {
 }
 
 #[tokio::test]
-async fn durable_appends_survive_reopen() {
+async fn close_flushes_unsynced_appends() {
     let dir = tempfile::tempdir().unwrap();
-    let options = standard_options(dir.path());
+    let options = LogOptions::new(dir.path(), false);
     let wal = open_wal(options.clone()).await.unwrap();
 
     for value in 0..3u8 {

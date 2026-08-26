@@ -1,15 +1,12 @@
 //! Stateful write-ahead log implementation.
 
 use super::error::WalError;
-use super::ops::{AppendOp, Operation, SyncFile, SyncOp};
+use super::ops::{AppendOp, Operation, SyncOp};
 use super::options::LogOptions;
-use super::publisher::{PublishBatch, PublishTarget, apply_after_sync};
-use super::segment::{
-    AppendResult, FileHandle, FileSegment, Segment, list_segment_files, sync_directory,
-};
+use super::segment::{FileSegment, Segment, list_segment_files, sync_all};
 use super::{
-    Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, MAX_PENDING_PUBLISH_BATCH_NUM, Sequence,
-    WAL_SEGMENT_SIZE,
+    Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, MAX_PENDING_PUBLISH_BATCH_NUM, PublishTarget,
+    Sequence, WAL_SEGMENT_SIZE,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,7 +14,7 @@ use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
 use std::any::Any;
 use std::collections::HashSet;
-use std::io::{ErrorKind, Result as IoResult};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
@@ -25,6 +22,56 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+/// A contiguous, ordered batch of WAL records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishBatch {
+    first_sequence: Sequence,
+    payloads: Vec<Bytes>,
+}
+
+impl PublishBatch {
+    fn new(records: &[(Sequence, Bytes)]) -> Self {
+        let first_sequence = records.first().expect("publish batches are never empty").0;
+        debug_assert!(
+            records
+                .windows(2)
+                .all(|records| records[0].0.checked_add(1) == Some(records[1].0))
+        );
+        Self {
+            first_sequence,
+            payloads: records.iter().map(|(_, payload)| payload.clone()).collect(),
+        }
+    }
+
+    /// Returns each sequence and payload in order.
+    pub fn records(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Sequence, &Bytes)> + ExactSizeIterator + '_ {
+        self.payloads
+            .iter()
+            .enumerate()
+            .map(move |(index, payload)| {
+                let sequence = self
+                    .first_sequence
+                    .checked_add(index as Sequence)
+                    .expect("publish batch sequence range is valid");
+                (sequence, payload)
+            })
+    }
+
+    /// Returns the first sequence in the batch.
+    pub fn first_sequence(&self) -> Sequence {
+        self.first_sequence
+    }
+
+    /// Returns the last sequence in the batch.
+    pub fn last_sequence(&self) -> Sequence {
+        self.first_sequence
+            .checked_add(self.payloads.len() as Sequence - 1)
+            .expect("publish batch sequence range is valid")
+    }
+}
 
 /// A batching write-ahead log backed by Lyra's segment format.
 ///
@@ -49,6 +96,7 @@ pub struct SegmentLog {
 }
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+const APPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_FILE_NAME: &str = ".lyra-wal.lock";
 const RECOVERY_READ_SIZE: usize = WAL_SEGMENT_SIZE as usize;
 
@@ -251,7 +299,7 @@ impl SegmentLog {
 impl Log for SegmentLog {
     /// Appends `payload` and returns its assigned sequence.
     ///
-    /// The append is acknowledged after its sequence becomes durable.
+    /// The append acknowledgement follows the log's configured sync policy.
     async fn append(&self, payload: Bytes) -> Result<Sequence, WalError> {
         let permit = self
             .operation_tx
@@ -365,6 +413,50 @@ async fn close_tasks(tasks: &Mutex<Option<JoinSet<()>>>) {
     tasks_guard.take();
 }
 
+async fn apply_after_sync(
+    context: CancellationToken,
+    mut pending_rx: mpsc::Receiver<PublishBatch>,
+    mut last_synced_sequence: watch::Receiver<Option<Sequence>>,
+    target: Arc<dyn PublishTarget>,
+) {
+    while let Some(batch) = pending_rx.recv().await {
+        let required_sequence = batch.last_sequence();
+        if last_synced_sequence
+            .wait_for(|sequence| sequence.is_some_and(|sequence| sequence >= required_sequence))
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                required_sequence,
+                "synced-sequence watcher closed before an apply batch became durable"
+            );
+            break;
+        }
+
+        loop {
+            match target.apply(batch.clone()).await {
+                Ok(()) => break,
+                Err(error) if context.is_cancelled() => {
+                    tracing::error!(
+                        sequence = required_sequence,
+                        error = %error,
+                        "apply failed during close and was ignored"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        sequence = required_sequence,
+                        error = %error,
+                        "apply failed; it will be retried"
+                    );
+                    tokio::time::sleep(APPLY_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+}
+
 fn writer_loop(
     mut operation_rx: mpsc::Receiver<Operation>,
     sync_tx: mpsc::Sender<Operation>,
@@ -374,7 +466,7 @@ fn writer_loop(
     mut next_segment_number: u64,
     mut active: Option<FileSegment>,
 ) {
-    let mut dirty_files = Vec::new();
+    let mut dirty_segments = Vec::new();
     let mut directory_dirty = false;
 
     loop {
@@ -440,25 +532,14 @@ fn writer_loop(
                         directory_dirty = true;
                     }
 
-                    match active.as_mut().unwrap().append(&record)? {
-                        AppendResult::Appended => {
-                            let segment = active.as_ref().unwrap();
-                            let file = segment.file();
-                            let end = segment.write_position();
-                            if let Some(candidate) =
-                                dirty_files.iter_mut().find(|candidate: &&mut SyncFile| {
-                                    Arc::ptr_eq(&candidate.file, &file)
-                                })
-                            {
-                                candidate.end = end;
-                            } else {
-                                dirty_files.push(SyncFile { file, end });
-                            }
+                    match active.as_mut().unwrap().append(&record) {
+                        Ok(()) => {
                             break;
                         }
-                        AppendResult::Full => {
-                            active = None;
+                        Err(WalError::SegmentFull) => {
+                            dirty_segments.push(active.take().unwrap());
                         }
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -471,12 +552,18 @@ fn writer_loop(
             }
             break;
         }
+        if let Some(segment) = active.as_ref() {
+            dirty_segments.push(segment.clone());
+        }
 
-        let sync_waiters = batch
-            .into_iter()
-            .zip(&records)
-            .map(|(request, (sequence, _))| (*sequence, request.response))
-            .collect();
+        let mut sync_waiters = Vec::new();
+        for (request, (sequence, _)) in batch.into_iter().zip(&records) {
+            if options.sync {
+                sync_waiters.push((*sequence, request.response));
+            } else {
+                let _ = request.response.send(Ok(*sequence));
+            }
+        }
 
         if let Some(pending_publish_tx) = &pending_publish_tx
             && let Err(error) = pending_publish_tx.blocking_send(PublishBatch::new(&records))
@@ -485,7 +572,7 @@ fn writer_loop(
         }
 
         let sync_op = SyncOp {
-            files: std::mem::take(&mut dirty_files),
+            segments: std::mem::take(&mut dirty_segments),
             sync_directory: std::mem::take(&mut directory_dirty),
             last_sequence: records.last().unwrap().0,
             waiters: sync_waiters,
@@ -522,7 +609,7 @@ fn sync_loop(
             break;
         }
 
-        let mut files = Vec::new();
+        let mut segments = Vec::new();
         let mut sync_dir = false;
         let mut last_sequence = None;
         let mut waiters = Vec::new();
@@ -530,7 +617,7 @@ fn sync_loop(
         for operation in operations {
             match operation {
                 Operation::Sync(sync_op) => {
-                    files.extend(sync_op.files);
+                    segments.extend(sync_op.segments);
                     sync_dir |= sync_op.sync_directory;
                     last_sequence = Some(sync_op.last_sequence);
                     waiters.extend(sync_op.waiters);
@@ -544,7 +631,7 @@ fn sync_loop(
         }
 
         if let Some(last_sequence) = last_sequence {
-            match perform_sync(&files, sync_dir, dir).map_err(WalError::from) {
+            match perform_sync(&segments, sync_dir, dir) {
                 Ok(()) => {
                     last_synced_sequence.send_replace(Some(last_sequence));
                     for (sequence, waiter) in waiters {
@@ -586,8 +673,7 @@ fn recover_state(
         let final_segment = index + 1 == segment_count;
         max_segment_number = max_segment_number.max(file_number);
 
-        let file = Arc::new(FileHandle::open(&path)?);
-        let mut file_size = file.size()?;
+        let file_size = std::fs::metadata(&path)?.len();
         if file_size > WAL_SEGMENT_SIZE {
             return Err(WalError::Corruption {
                 path,
@@ -598,8 +684,7 @@ fn recover_state(
             });
         }
 
-        let segment =
-            FileSegment::open(Arc::clone(&file), file_number, WAL_SEGMENT_SIZE, file_size)?;
+        let mut segment = FileSegment::open(&path, file_number, WAL_SEGMENT_SIZE, file_size)?;
         let mut position = 0;
         let mut recovered_records = Vec::new();
 
@@ -608,9 +693,8 @@ fn recover_state(
                 Ok(records) => records,
                 Err(WalError::Truncated { .. }) if final_segment => {
                     if position < file_size {
-                        file.truncate(position)?;
-                        file.sync(position)?;
-                        file_size = position;
+                        segment.truncate(position)?;
+                        segment.sync()?;
                     }
                     tracing::warn!(
                         path = %path.display(),
@@ -650,24 +734,21 @@ fn recover_state(
             }
             position = next_position;
         }
-        file.discard_cache(position);
         if !recovered_records.is_empty() {
             recovered_batches.push(PublishBatch::new(&recovered_records));
         }
         if final_segment {
-            active = Some(FileSegment::open(
-                file,
-                file_number,
-                WAL_SEGMENT_SIZE,
-                file_size,
-            )?);
+            active = Some(segment);
         }
     }
 
     if let Some(sequence) = applied_sequence
         && !applied_found
     {
-        return Err(invalid_applied_sequence(options, sequence));
+        return Err(WalError::Corruption {
+            path: options.dir.clone(),
+            message: format!("applied WAL sequence {sequence} does not identify a record"),
+        });
     }
 
     let next_segment_number = max_segment_number
@@ -680,13 +761,6 @@ fn recover_state(
         recovered_batches,
         active,
     })
-}
-
-fn invalid_applied_sequence(options: &LogOptions, sequence: Sequence) -> WalError {
-    WalError::Corruption {
-        path: options.dir.clone(),
-        message: format!("applied WAL sequence {sequence} does not identify a record"),
-    }
 }
 
 fn decode_sequence(path: &Path, record: &[u8]) -> Result<Sequence, WalError> {
@@ -707,15 +781,15 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn perform_sync(files: &[SyncFile], sync_dir: bool, dir: &Path) -> IoResult<()> {
+fn perform_sync(segments: &[FileSegment], sync_dir: bool, dir: &Path) -> Result<(), WalError> {
     let mut synced = HashSet::new();
-    for sync_file in files.iter().rev() {
-        if synced.insert(sync_file.file.path().to_path_buf()) {
-            sync_file.file.sync(sync_file.end)?;
+    for segment in segments.iter().rev() {
+        if synced.insert(segment.sequence()) {
+            segment.sync()?;
         }
     }
     if sync_dir {
-        sync_directory(dir)?;
+        sync_all(dir)?;
     }
     Ok(())
 }
@@ -726,7 +800,7 @@ mod tests {
     use std::fs::OpenOptions;
 
     fn standard_options(path: &Path) -> LogOptions {
-        LogOptions::new(path)
+        LogOptions::new(path, true)
     }
 
     fn seed_records(
@@ -736,7 +810,7 @@ mod tests {
     ) -> Result<(), WalError> {
         let mut next_segment_number = 1;
         let mut active: Option<FileSegment> = None;
-        let mut dirty_files = Vec::new();
+        let mut dirty_segments = Vec::new();
 
         for (sequence, payload) in records {
             let mut record = Vec::with_capacity(8 + payload.len());
@@ -751,40 +825,19 @@ mod tests {
                     )?);
                     next_segment_number += 1;
                 }
-                match active.as_mut().unwrap().append(&record)? {
-                    AppendResult::Appended => {
-                        let segment = active.as_ref().unwrap();
-                        let file = segment.file();
-                        let end = segment.write_position();
-                        if let Some(candidate) = dirty_files
-                            .iter_mut()
-                            .find(|candidate: &&mut SyncFile| Arc::ptr_eq(&candidate.file, &file))
-                        {
-                            candidate.end = end;
-                        } else {
-                            dirty_files.push(SyncFile { file, end });
-                        }
-                        break;
+                match active.as_mut().unwrap().append(&record) {
+                    Ok(()) => break,
+                    Err(WalError::SegmentFull) => {
+                        dirty_segments.push(active.take().unwrap());
                     }
-                    AppendResult::Full => {
-                        active = None;
-                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
         if let Some(segment) = active.as_ref() {
-            let file = segment.file();
-            let end = segment.write_position();
-            if let Some(candidate) = dirty_files
-                .iter_mut()
-                .find(|candidate: &&mut SyncFile| Arc::ptr_eq(&candidate.file, &file))
-            {
-                candidate.end = end;
-            } else {
-                dirty_files.push(SyncFile { file, end });
-            }
+            dirty_segments.push(segment.clone());
         }
-        perform_sync(&dirty_files, true, &options.dir)?;
+        perform_sync(&dirty_segments, true, &options.dir)?;
         Ok(())
     }
 

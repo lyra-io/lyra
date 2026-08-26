@@ -34,6 +34,10 @@ pub enum WalError {
     #[error("encoded record size {size} exceeds the maximum WAL segment size {max}")]
     RecordTooLarge { size: u64, max: u64 },
 
+    /// The active segment has no room for the next encoded record.
+    #[error("WAL segment is full")]
+    SegmentFull,
+
     /// The caller's read limit cannot hold the first record.
     #[error("WAL record payload size {size} exceeds the maximum read size {max}")]
     ReadBufferTooSmall { size: usize, max: usize },

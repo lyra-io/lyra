@@ -1,7 +1,7 @@
 //! Buffered WAL segment implementation.
 
 use super::codec::{decode_record, encode_record};
-use super::{AppendResult, Segment, WalError, make_segment_path};
+use super::{Segment, WalError, make_segment_path};
 use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Result as IoResult, Seek, SeekFrom, Write};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
-pub(in crate::wal) struct FileHandle {
+struct FileHandle {
     // Immutable state
     path: PathBuf,
     file: File,
@@ -26,7 +26,7 @@ impl FileHandle {
         Self::open0(path, true)
     }
 
-    pub(in crate::wal) fn open(path: &Path) -> Result<Self, WalError> {
+    fn open(path: &Path) -> Result<Self, WalError> {
         Self::open0(path, false)
     }
 
@@ -44,11 +44,11 @@ impl FileHandle {
         })
     }
 
-    pub(in crate::wal) fn path(&self) -> &Path {
+    fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(in crate::wal) fn size(&self) -> Result<u64, WalError> {
+    fn size(&self) -> Result<u64, WalError> {
         Ok(self.file.metadata()?.len())
     }
 
@@ -61,18 +61,18 @@ impl FileHandle {
         Ok(())
     }
 
-    pub(in crate::wal) fn truncate(&self, size: u64) -> Result<(), WalError> {
+    fn truncate(&self, size: u64) -> Result<(), WalError> {
         self.file.set_len(size)?;
         Ok(())
     }
 
-    pub(in crate::wal) fn sync(&self, end: u64) -> IoResult<()> {
+    fn sync(&self, end: u64) -> IoResult<()> {
         self.file.sync_data()?;
         self.discard_cache(end);
         Ok(())
     }
 
-    pub(in crate::wal) fn discard_cache(&self, end: u64) {
+    fn discard_cache(&self, end: u64) {
         self.discard_cache0(end);
     }
 
@@ -125,7 +125,7 @@ impl FileHandle {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(in crate::wal) struct FileSegment {
     // Immutable state
     number: u64,
@@ -152,12 +152,13 @@ impl FileSegment {
     }
 
     pub(in crate::wal) fn open(
-        file: Arc<FileHandle>,
+        path: &Path,
         number: u64,
         max_size: u64,
         write_position: u64,
     ) -> Result<Self, WalError> {
         u32::try_from(number).map_err(|_| WalError::SegmentNumberTooLarge(number))?;
+        let file = Arc::new(FileHandle::open(path)?);
         if write_position > max_size || file.size()? != write_position {
             return Err(WalError::corruption(
                 file.path(),
@@ -177,12 +178,8 @@ impl FileSegment {
 }
 
 impl Segment for FileSegment {
-    fn file(&self) -> Arc<FileHandle> {
-        Arc::clone(&self.file)
-    }
-
-    fn write_position(&self) -> u64 {
-        self.write_position
+    fn sequence(&self) -> u64 {
+        self.number
     }
 
     /// Reads complete records whose combined payload size does not exceed
@@ -234,10 +231,16 @@ impl Segment for FileSegment {
             position = next_position;
         }
 
+        self.file.discard_cache(position);
         Ok((position, records))
     }
 
-    fn append(&mut self, payload: &[u8]) -> Result<AppendResult, WalError> {
+    fn sync(&self) -> Result<(), WalError> {
+        self.file.sync(self.write_position)?;
+        Ok(())
+    }
+
+    fn append(&mut self, payload: &[u8]) -> Result<(), WalError> {
         let encoded = encode_record(self.number, self.write_position, payload)?;
         let encoded_size = u64::try_from(encoded.len()).map_err(|_| WalError::PositionExhausted)?;
         let next_position = self
@@ -251,12 +254,27 @@ impl Segment for FileSegment {
                     max: self.max_size,
                 });
             }
-            return Ok(AppendResult::Full);
+            return Err(WalError::SegmentFull);
         }
 
         self.file.append(&encoded)?;
         self.write_position = next_position;
-        Ok(AppendResult::Appended)
+        Ok(())
+    }
+
+    fn truncate(&mut self, position: u64) -> Result<(), WalError> {
+        if position > self.write_position {
+            return Err(WalError::corruption(
+                self.file.path(),
+                format!(
+                    "cannot truncate segment {} from {} to {position}",
+                    self.number, self.write_position
+                ),
+            ));
+        }
+        self.file.truncate(position)?;
+        self.write_position = position;
+        Ok(())
     }
 }
 
@@ -268,9 +286,9 @@ mod tests {
     fn appends_and_reads_records_without_metadata_envelopes() {
         let dir = tempfile::tempdir().unwrap();
         let mut segment = FileSegment::create(dir.path(), 1, 4096).unwrap();
-        assert_eq!(segment.append(b"first").unwrap(), AppendResult::Appended);
-        assert_eq!(segment.append(b"second").unwrap(), AppendResult::Appended);
-        segment.file().sync(segment.write_position()).unwrap();
+        segment.append(b"first").unwrap();
+        segment.append(b"second").unwrap();
+        segment.sync().unwrap();
 
         let (next_position, records) = segment.read(0, 5).unwrap();
         assert_eq!(records, vec![Bytes::from_static(b"first")]);
@@ -285,12 +303,14 @@ mod tests {
     fn maximum_size_has_no_external_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let mut segment = FileSegment::create(dir.path(), 1, 16).unwrap();
-        assert!(matches!(
-            segment.append(b"first").unwrap(),
-            AppendResult::Appended
-        ));
-        assert_eq!(segment.append(b"second").unwrap(), AppendResult::Full);
-        assert_eq!(segment.file().size().unwrap(), 16);
+        segment.append(b"first").unwrap();
+        assert_eq!(segment.append(b"second"), Err(WalError::SegmentFull));
+        assert_eq!(
+            std::fs::metadata(make_segment_path(dir.path(), 1))
+                .unwrap()
+                .len(),
+            16
+        );
     }
 
     #[test]
