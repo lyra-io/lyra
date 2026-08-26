@@ -1,7 +1,7 @@
 //! WAL segment block framing and logical record assembly.
 
-use super::super::SegmentError;
-use super::record::{HEADER_SIZE, RecordType, decode, encode};
+use super::super::WalError;
+use super::record::{HEADER_SIZE, RecordType, decode_fragment, encode_fragment};
 use bytes::Bytes;
 use std::io::Read;
 use std::path::Path;
@@ -12,19 +12,19 @@ pub(in crate::wal) fn encode_record(
     segment_number: u64,
     start_position: u64,
     payload: &[u8],
-) -> Result<Vec<u8>, SegmentError> {
+) -> Result<Vec<u8>, WalError> {
     let segment_number = u32::try_from(segment_number)
-        .map_err(|_| SegmentError::SegmentNumberTooLarge(segment_number))?;
+        .map_err(|_| WalError::SegmentNumberTooLarge(segment_number))?;
     let mut output = Vec::new();
     let mut consumed = 0;
     let mut first = true;
 
     loop {
         let absolute_position = start_position
-            .checked_add(u64::try_from(output.len()).map_err(|_| SegmentError::OffsetExhausted)?)
-            .ok_or(SegmentError::OffsetExhausted)?;
+            .checked_add(u64::try_from(output.len()).map_err(|_| WalError::OffsetExhausted)?)
+            .ok_or(WalError::OffsetExhausted)?;
         let block_offset = usize::try_from(absolute_position % BLOCK_SIZE as u64)
-            .map_err(|_| SegmentError::OffsetExhausted)?;
+            .map_err(|_| WalError::OffsetExhausted)?;
         let block_remaining = BLOCK_SIZE - block_offset;
         if block_remaining < HEADER_SIZE {
             output.resize(output.len() + block_remaining, 0);
@@ -40,7 +40,7 @@ pub(in crate::wal) fn encode_record(
             (false, true) => RecordType::Last,
             (false, false) => RecordType::Middle,
         };
-        encode(
+        encode_fragment(
             &mut output,
             record_type,
             segment_number,
@@ -60,9 +60,9 @@ pub(in crate::wal) fn decode_record(
     segment_number: u64,
     start_position: u64,
     file_end: u64,
-) -> Result<(u64, Bytes), SegmentError> {
+) -> Result<(u64, Bytes), WalError> {
     let expected_segment_number =
-        u32::try_from(segment_number).map_err(|_| SegmentError::Corruption {
+        u32::try_from(segment_number).map_err(|_| WalError::Corruption {
             path: path.to_path_buf(),
             message: "segment number exceeds u32".into(),
         })?;
@@ -72,26 +72,32 @@ pub(in crate::wal) fn decode_record(
 
     loop {
         if position >= file_end {
-            return truncated(path, "incomplete record at end of file");
+            return Err(WalError::truncated(
+                path,
+                "incomplete record at end of file",
+            ));
         }
 
-        let block_offset = usize::try_from(position % BLOCK_SIZE as u64)
-            .map_err(|_| SegmentError::OffsetExhausted)?;
+        let block_offset =
+            usize::try_from(position % BLOCK_SIZE as u64).map_err(|_| WalError::OffsetExhausted)?;
         let block_remaining = BLOCK_SIZE - block_offset;
         let file_remaining = file_end - position;
         if block_remaining < HEADER_SIZE {
             let trailer_size = usize::try_from(file_remaining.min(block_remaining as u64))
-                .map_err(|_| SegmentError::OffsetExhausted)?;
+                .map_err(|_| WalError::OffsetExhausted)?;
             let mut trailer = vec![0; trailer_size];
             reader.read_exact(&mut trailer)?;
-            if !all_zero(&trailer) {
-                return corruption(path, "non-zero bytes in a block trailer");
+            if !trailer.iter().all(|byte| *byte == 0) {
+                return Err(WalError::corruption(
+                    path,
+                    "non-zero bytes in a block trailer",
+                ));
             }
             position += trailer_size as u64;
             continue;
         }
 
-        let (record_type, fragment, consumed) = decode(
+        let (record_type, fragment, consumed) = decode_fragment(
             reader,
             path,
             expected_segment_number,
@@ -102,50 +108,44 @@ pub(in crate::wal) fn decode_record(
         match record_type {
             RecordType::Full => {
                 if fragmented {
-                    return corruption(path, "full record found inside fragmented record");
+                    return Err(WalError::corruption(
+                        path,
+                        "full record found inside fragmented record",
+                    ));
                 }
                 return Ok((position, fragment));
             }
             RecordType::First => {
                 if fragmented {
-                    return corruption(path, "first fragment found inside fragmented record");
+                    return Err(WalError::corruption(
+                        path,
+                        "first fragment found inside fragmented record",
+                    ));
                 }
                 fragmented = true;
                 fragments.extend_from_slice(&fragment);
             }
             RecordType::Middle => {
                 if !fragmented {
-                    return corruption(path, "middle fragment without first fragment");
+                    return Err(WalError::corruption(
+                        path,
+                        "middle fragment without first fragment",
+                    ));
                 }
                 fragments.extend_from_slice(&fragment);
             }
             RecordType::Last => {
                 if !fragmented {
-                    return corruption(path, "last fragment without first fragment");
+                    return Err(WalError::corruption(
+                        path,
+                        "last fragment without first fragment",
+                    ));
                 }
                 fragments.extend_from_slice(&fragment);
                 return Ok((position, Bytes::from(fragments)));
             }
         }
     }
-}
-
-fn corruption<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
-    Err(SegmentError::Corruption {
-        path: path.to_path_buf(),
-        message: message.to_owned(),
-    })
-}
-
-fn truncated<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
-    Err(SegmentError::Truncated {
-        path: path.to_path_buf(),
-        message: message.to_owned(),
-    })
-}
-
-fn all_zero(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == 0)
 }
 
 #[cfg(test)]
@@ -203,6 +203,6 @@ mod tests {
             file_end,
         )
         .unwrap_err();
-        assert!(matches!(error, SegmentError::Truncated { .. }));
+        assert!(matches!(error, WalError::Truncated { .. }));
     }
 }

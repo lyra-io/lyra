@@ -42,7 +42,7 @@ async fn run(records: usize, payload_size: usize, concurrency: usize) {
                 wal.append(payload.clone(), true).await?;
                 latencies.push(append_started.elapsed());
             }
-            Ok::<_, stream::LogError>(latencies)
+            Ok::<_, stream::WalError>(latencies)
         }));
     }
 

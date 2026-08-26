@@ -1,11 +1,11 @@
 //! Errors produced by the stream storage write-ahead log.
 
-use super::segment::SegmentError;
-use std::{io::Error, path::PathBuf};
+use std::io::Error;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum LogError {
+pub enum WalError {
     /// The log was closed or is no longer accepting appends.
     #[error("WAL is closed")]
     Closed,
@@ -22,26 +22,49 @@ pub enum LogError {
     #[error("WAL corruption in {path}: {message}")]
     Corruption { path: PathBuf, message: String },
 
+    /// A physical WAL record is incomplete.
+    #[error("truncated WAL record in {path}: {message}")]
+    Truncated { path: PathBuf, message: String },
+
+    /// A segment number exceeds the physical record format.
+    #[error("WAL segment number {0} exceeds the physical format limit")]
+    SegmentNumberTooLarge(u64),
+
+    /// An encoded record cannot fit in an empty segment.
+    #[error("encoded record size {size} exceeds the maximum WAL segment size {max}")]
+    RecordTooLarge { size: u64, max: u64 },
+
+    /// The caller's read limit cannot hold the first record.
+    #[error("WAL record payload size {size} exceeds the maximum read size {max}")]
+    ReadBufferTooSmall { size: usize, max: usize },
+
+    /// A physical WAL position cannot be represented.
+    #[error("WAL offset space is exhausted")]
+    OffsetExhausted,
+
     /// An internal background worker failed.
     #[error("WAL worker failed: {0}")]
     Worker(String),
 }
 
-impl From<Error> for LogError {
-    fn from(error: Error) -> Self {
-        Self::Io(error.to_string())
+impl WalError {
+    pub(crate) fn corruption(path: &Path, message: impl Into<String>) -> Self {
+        Self::Corruption {
+            path: path.to_path_buf(),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn truncated(path: &Path, message: impl Into<String>) -> Self {
+        Self::Truncated {
+            path: path.to_path_buf(),
+            message: message.into(),
+        }
     }
 }
 
-impl From<SegmentError> for LogError {
-    fn from(error: SegmentError) -> Self {
-        match error {
-            SegmentError::Io(message) => Self::Io(message),
-            SegmentError::Corruption { path, message }
-            | SegmentError::Truncated { path, message } => Self::Corruption { path, message },
-            SegmentError::SegmentNumberTooLarge(_)
-            | SegmentError::RecordTooLarge { .. }
-            | SegmentError::OffsetExhausted => Self::Worker(error.to_string()),
-        }
+impl From<Error> for WalError {
+    fn from(error: Error) -> Self {
+        Self::Io(error.to_string())
     }
 }

@@ -5,28 +5,31 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use stream::{Log, LogError, LogOptions, PublishBatch, PublishTarget, SegmentLog, SegmentOffset};
+use stream::{Log, LogOptions, PublishBatch, PublishTarget, SegmentLog, WalError};
 
 #[derive(Default)]
 struct MemoryApplyTarget {
     batches: Mutex<Vec<PublishBatch>>,
-    applied_offset: Mutex<Option<SegmentOffset>>,
+    applied_offset: Mutex<Option<(u64, u64)>>,
     closed: AtomicBool,
 }
 
 #[async_trait]
 impl PublishTarget for MemoryApplyTarget {
-    fn applied_offset(&self) -> Option<SegmentOffset> {
+    fn applied_offset(&self) -> Option<(u64, u64)> {
         *self.applied_offset.lock().unwrap()
     }
 
-    async fn apply(&self, batch: PublishBatch) -> Result<(), LogError> {
-        *self.applied_offset.lock().unwrap() = batch.records().last().map(|record| record.offset());
+    async fn apply(&self, batch: PublishBatch) -> Result<(), WalError> {
+        *self.applied_offset.lock().unwrap() = batch
+            .records()
+            .last()
+            .map(|record| (record.segment_number(), record.offset()));
         self.batches.lock().unwrap().push(batch);
         Ok(())
     }
 
-    async fn close(&self) -> Result<(), LogError> {
+    async fn close(&self) -> Result<(), WalError> {
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -36,8 +39,8 @@ struct FailingApplyTarget;
 
 #[async_trait]
 impl PublishTarget for FailingApplyTarget {
-    async fn apply(&self, _batch: PublishBatch) -> Result<(), LogError> {
-        Err(LogError::Worker("apply failed".into()))
+    async fn apply(&self, _batch: PublishBatch) -> Result<(), WalError> {
+        Err(WalError::Worker("apply failed".into()))
     }
 }
 
@@ -45,7 +48,7 @@ fn standard_options(path: &Path) -> LogOptions {
     LogOptions::new(path)
 }
 
-async fn open_wal(options: LogOptions) -> Result<Arc<dyn Log>, LogError> {
+async fn open_wal(options: LogOptions) -> Result<Arc<dyn Log>, WalError> {
     Ok(SegmentLog::open(options).await?)
 }
 
@@ -247,7 +250,7 @@ async fn recovery_apply_failure_releases_the_directory_lock() {
         .await
         .err()
         .unwrap();
-    assert_eq!(error, LogError::Worker("apply failed".into()));
+    assert_eq!(error, WalError::Worker("apply failed".into()));
 
     let reopened = open_wal(options).await.unwrap();
     reopened.close().await;
@@ -310,7 +313,7 @@ async fn concurrent_close_callers_all_complete_cleanly() {
     }
     assert_eq!(
         wal.append(Bytes::from_static(b"late"), true).await,
-        Err(LogError::Closed)
+        Err(WalError::Closed)
     );
 }
 
@@ -321,7 +324,7 @@ async fn only_one_log_instance_can_own_a_directory() {
     let first = open_wal(options.clone()).await.unwrap();
 
     let error = open_wal(options.clone()).await.err().unwrap();
-    assert_eq!(error, LogError::Locked(dir.path().to_path_buf()));
+    assert_eq!(error, WalError::Locked(dir.path().to_path_buf()));
 
     first.close().await;
     let reopened = open_wal(options).await.unwrap();
@@ -337,7 +340,7 @@ async fn recovery_failure_releases_the_directory_lock() {
 
     assert!(matches!(
         open_wal(options.clone()).await,
-        Err(LogError::Corruption { path, .. }) if path == malformed
+        Err(WalError::Corruption { path, .. }) if path == malformed
     ));
 
     std::fs::remove_file(malformed).unwrap();
@@ -394,7 +397,7 @@ async fn write_failure_does_not_strand_its_caller() {
     )
     .await
     .expect("append timed out");
-    assert!(matches!(result, Err(LogError::Io(_))));
+    assert!(matches!(result, Err(WalError::Io(_))));
 
     tokio::time::timeout(Duration::from_secs(5), wal.close())
         .await

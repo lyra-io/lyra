@@ -7,11 +7,10 @@ mod options;
 mod publisher;
 mod segment;
 
-pub use error::LogError;
+pub use error::WalError;
 pub use log::SegmentLog;
 pub use options::LogOptions;
 pub use publisher::{PublishBatch, PublishRecord, PublishTarget};
-pub use segment::SegmentOffset;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,7 +34,7 @@ pub trait Log: Send + Sync {
     ///
     /// A sync append is acknowledged after its sequence becomes durable. A
     /// non-sync append is acknowledged after its bytes are written.
-    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, LogError>;
+    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError>;
 
     /// Stops admission, drains owned work, and closes all components.
     async fn close(&self);

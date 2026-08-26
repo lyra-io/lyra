@@ -1,6 +1,6 @@
 //! Physical WAL record fragment encoding and decoding.
 
-use super::super::SegmentError;
+use super::super::WalError;
 use super::crc::physical_checksum;
 use bytes::Bytes;
 use std::io::Read;
@@ -29,7 +29,7 @@ impl RecordType {
     }
 }
 
-pub(super) fn encode(
+pub(super) fn encode_fragment(
     output: &mut Vec<u8>,
     record_type: RecordType,
     segment_number: u32,
@@ -48,20 +48,23 @@ pub(super) fn encode(
     output[header_start + 7..header_start + 11].copy_from_slice(&segment_number.to_le_bytes());
 }
 
-pub(super) fn decode(
+pub(super) fn decode_fragment(
     reader: &mut impl Read,
     path: &Path,
     expected_segment_number: u32,
     block_remaining: usize,
     file_remaining: u64,
-) -> Result<(RecordType, Bytes, u64), SegmentError> {
+) -> Result<(RecordType, Bytes, u64), WalError> {
     if file_remaining < HEADER_SIZE as u64 {
-        return truncated(path, "truncated physical record header");
+        return Err(WalError::truncated(
+            path,
+            "truncated physical record header",
+        ));
     }
     let mut header = [0; HEADER_SIZE];
     reader.read_exact(&mut header)?;
-    if all_zero(&header) {
-        return truncated(path, "zeroed physical record header");
+    if header.iter().all(|byte| *byte == 0) {
+        return Err(WalError::truncated(path, "zeroed physical record header"));
     }
 
     let expected_checksum = u32::from_le_bytes(header[..4].try_into().unwrap());
@@ -70,46 +73,33 @@ pub(super) fn decode(
     let segment_number = u32::from_le_bytes(header[7..11].try_into().unwrap());
     let record_size = HEADER_SIZE + payload_size;
     if record_size > block_remaining {
-        return corruption(path, "physical record crosses a block boundary");
+        return Err(WalError::corruption(
+            path,
+            "physical record crosses a block boundary",
+        ));
     }
     if record_size as u64 > file_remaining {
-        return truncated(path, "truncated physical record body");
+        return Err(WalError::truncated(path, "truncated physical record body"));
     }
     if segment_number != expected_segment_number {
-        return corruption(path, "physical record segment number mismatch");
+        return Err(WalError::corruption(
+            path,
+            "physical record segment number mismatch",
+        ));
     }
 
-    let record_type =
-        RecordType::decode(record_type_byte).map_err(|message| corruption_error(path, &message))?;
+    let record_type = RecordType::decode(record_type_byte)
+        .map_err(|message| WalError::corruption(path, message))?;
     let mut payload = vec![0; payload_size];
     reader.read_exact(&mut payload)?;
     if physical_checksum(record_type_byte, segment_number, &payload) != expected_checksum {
-        return corruption(path, "physical record checksum mismatch");
+        return Err(WalError::corruption(
+            path,
+            "physical record checksum mismatch",
+        ));
     }
 
     Ok((record_type, Bytes::from(payload), record_size as u64))
-}
-
-fn corruption<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
-    Err(corruption_error(path, message))
-}
-
-fn corruption_error(path: &Path, message: &str) -> SegmentError {
-    SegmentError::Corruption {
-        path: path.to_path_buf(),
-        message: message.to_owned(),
-    }
-}
-
-fn truncated<T>(path: &Path, message: &str) -> Result<T, SegmentError> {
-    Err(SegmentError::Truncated {
-        path: path.to_path_buf(),
-        message: message.to_owned(),
-    })
-}
-
-fn all_zero(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == 0)
 }
 
 #[cfg(test)]
@@ -120,10 +110,10 @@ mod tests {
     #[test]
     fn physical_record_round_trip() {
         let mut encoded = Vec::new();
-        encode(&mut encoded, RecordType::Full, 7, b"payload");
+        encode_fragment(&mut encoded, RecordType::Full, 7, b"payload");
 
         let encoded_size = encoded.len();
-        let (record_type, payload, consumed) = decode(
+        let (record_type, payload, consumed) = decode_fragment(
             &mut Cursor::new(encoded),
             Path::new("segment"),
             7,

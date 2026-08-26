@@ -1,13 +1,10 @@
 //! Stateful write-ahead log implementation.
 
-use super::error::LogError;
+use super::error::WalError;
 use super::ops::{AppendOp, Operation, SyncFile, SyncOp};
 use super::options::LogOptions;
 use super::publisher::{PublishBatch, PublishTarget, apply_after_sync};
-use super::segment::{
-    AppendResult, FileSegment, Segment, SegmentError, SegmentFile, SegmentOffset,
-    list_segment_files, sync_directory,
-};
+use super::segment::{AppendResult, FileHandle, Segment, list_segment_files, sync_directory};
 use super::{
     Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, MAX_PENDING_PUBLISH_BATCH_NUM, Sequence,
     WAL_SEGMENT_SIZE,
@@ -18,7 +15,7 @@ use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
 use std::any::Any;
 use std::collections::HashSet;
-use std::io::{BufReader, ErrorKind, Result as IoResult, Seek, SeekFrom};
+use std::io::{ErrorKind, Result as IoResult};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
@@ -51,6 +48,7 @@ pub struct SegmentLog {
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_FILE_NAME: &str = ".lyra-wal.lock";
+const RECOVERY_READ_SIZE: usize = WAL_SEGMENT_SIZE as usize;
 
 struct WorkerThreads {
     writer: WorkerThread,
@@ -69,7 +67,7 @@ struct RecoveredState {
     next_sequence: Sequence,
     next_segment_number: u64,
     recovered_batches: Vec<PublishBatch>,
-    active: Option<FileSegment>,
+    active: Option<Segment>,
 }
 
 impl SegmentLog {
@@ -77,7 +75,7 @@ impl SegmentLog {
     ///
     /// Existing segments are scanned to restore sequence numbering. A valid
     /// final segment remains active for subsequent appends.
-    pub async fn open(options: LogOptions) -> Result<Arc<Self>, LogError> {
+    pub async fn open(options: LogOptions) -> Result<Arc<Self>, WalError> {
         Self::open0(options, None).await
     }
 
@@ -86,14 +84,14 @@ impl SegmentLog {
     pub async fn open_with_target(
         options: LogOptions,
         target: Arc<dyn PublishTarget>,
-    ) -> Result<Arc<Self>, LogError> {
+    ) -> Result<Arc<Self>, WalError> {
         Self::open0(options, Some(target)).await
     }
 
     async fn open0(
         options: LogOptions,
         target: Option<Arc<dyn PublishTarget>>,
-    ) -> Result<Arc<Self>, LogError> {
+    ) -> Result<Arc<Self>, WalError> {
         tokio::fs::create_dir_all(&options.dir).await?;
 
         let context = CancellationToken::new();
@@ -128,7 +126,7 @@ impl SegmentLog {
                 match DirectoryLock::acquire(options.dir.join(LOCK_FILE_NAME))
                     .map_err(|error| {
                         if error.kind() == ErrorKind::WouldBlock {
-                            LogError::Locked(options.dir.clone())
+                            WalError::Locked(options.dir.clone())
                         } else {
                             error.into()
                         }
@@ -198,7 +196,7 @@ impl SegmentLog {
                     .map(panic_message)
                     .unwrap_or_else(|| "WAL writer thread stopped during startup".into());
                 let _ = sync_handle.join();
-                return Err(LogError::Worker(error));
+                return Err(WalError::Worker(error));
             }
         };
 
@@ -254,15 +252,15 @@ impl Log for SegmentLog {
     /// A sync append is acknowledged after its sequence becomes durable. A
     /// non-sync append is acknowledged after its bytes are written; the sync
     /// thread still makes the batch durable in the background.
-    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, LogError> {
+    async fn append(&self, payload: Bytes, sync: bool) -> Result<Sequence, WalError> {
         let permit = self
             .operation_tx
             .reserve()
             .await
-            .map_err(|_| LogError::Closed)?;
+            .map_err(|_| WalError::Closed)?;
         let state = self.state.read().await;
         if *state != Lifecycle::Running {
-            return Err(LogError::Closed);
+            return Err(WalError::Closed);
         }
 
         let (response, receiver) = oneshot::channel();
@@ -272,7 +270,7 @@ impl Log for SegmentLog {
             response,
         }));
         drop(state);
-        receiver.await.map_err(|_| LogError::Closed)?
+        receiver.await.map_err(|_| WalError::Closed)?
     }
 
     /// Stops admission, drains owned work, and closes all components.
@@ -295,7 +293,7 @@ impl Log for SegmentLog {
             self.operation_tx
                 .send(Operation::Close)
                 .await
-                .map_err(|_| LogError::Closed)
+                .map_err(|_| WalError::Closed)
         );
 
         let mut workers_guard = self.workers.lock().await;
@@ -344,7 +342,7 @@ fn finish_worker(name: &'static str, worker: &mut WorkerThread, stopped: bool) {
             "join-worker",
             handle
                 .join()
-                .map_err(|panic| LogError::Worker(format!("{name}: {}", panic_message(panic))))
+                .map_err(|panic| WalError::Worker(format!("{name}: {}", panic_message(panic))))
         );
     } else {
         drop(handle);
@@ -378,7 +376,7 @@ fn writer_loop(
     options: LogOptions,
     mut next_sequence: Sequence,
     mut next_segment_number: u64,
-    mut active: Option<FileSegment>,
+    mut active: Option<Segment>,
 ) {
     let mut dirty_files = Vec::new();
     let mut directory_dirty = false;
@@ -404,7 +402,7 @@ fn writer_loop(
                             next_sequence = incremented;
                         } else {
                             batch_error =
-                                Some(LogError::Worker("WAL sequence space exhausted".into()));
+                                Some(WalError::Worker("WAL sequence space exhausted".into()));
                         }
                     }
                     batch.push(append_op);
@@ -430,7 +428,7 @@ fn writer_loop(
         }
 
         let mut publish_records = Vec::with_capacity(records.len());
-        let write_result = (|| -> Result<(), LogError> {
+        let write_result = (|| -> Result<(), WalError> {
             for (sequence, payload) in &records {
                 let mut record = Vec::with_capacity(8 + payload.len());
                 record.extend_from_slice(&sequence.to_le_bytes());
@@ -440,9 +438,9 @@ fn writer_loop(
                     if active.is_none() {
                         let number = next_segment_number;
                         let incremented = number.checked_add(1).ok_or_else(|| {
-                            LogError::Worker("WAL segment number space exhausted".into())
+                            WalError::Worker("WAL segment number space exhausted".into())
                         })?;
-                        active = Some(FileSegment::create(&options.dir, number, WAL_SEGMENT_SIZE)?);
+                        active = Some(Segment::create(&options.dir, number, WAL_SEGMENT_SIZE)?);
                         next_segment_number = incremented;
                         directory_dirty = true;
                     }
@@ -461,7 +459,12 @@ fn writer_loop(
                             } else {
                                 dirty_files.push(SyncFile { file, end });
                             }
-                            publish_records.push((*sequence, offset, payload.clone()));
+                            publish_records.push((
+                                *sequence,
+                                segment.number(),
+                                offset,
+                                payload.clone(),
+                            ));
                             break;
                         }
                         AppendResult::Full => {
@@ -506,7 +509,7 @@ fn writer_loop(
             tracing::error!("sync-operation queue closed before a batch was delivered");
             if let Operation::Sync(sync_op) = error.0 {
                 for (_, waiter) in sync_op.waiters {
-                    let _ = waiter.send(Err(LogError::Closed));
+                    let _ = waiter.send(Err(WalError::Closed));
                 }
             }
             break;
@@ -556,7 +559,7 @@ fn sync_loop(
         }
 
         if let Some(last_sequence) = last_sequence {
-            match perform_sync(&files, sync_dir, dir).map_err(LogError::from) {
+            match perform_sync(&files, sync_dir, dir).map_err(WalError::from) {
                 Ok(()) => {
                     last_synced_sequence.send_replace(Some(last_sequence));
                     for (sequence, waiter) in waiters {
@@ -584,8 +587,8 @@ fn sync_loop(
 fn recover_state(
     options: &LogOptions,
     collect_records: bool,
-    applied_offset: Option<SegmentOffset>,
-) -> Result<RecoveredState, LogError> {
+    applied_offset: Option<(u64, u64)>,
+) -> Result<RecoveredState, WalError> {
     let mut next_sequence = applied_offset.is_none().then_some(0);
     let mut max_segment_number: u64 = 0;
     let mut recovered_batches = Vec::new();
@@ -600,21 +603,21 @@ fn recover_state(
 
         if let Some(offset) = applied_offset
             && !applied_found
-            && file_number < offset.segment_number()
+            && file_number < offset.0
         {
             continue;
         }
         if let Some(offset) = applied_offset
             && !applied_found
-            && file_number > offset.segment_number()
+            && file_number > offset.0
         {
             return Err(invalid_applied_offset(options, offset));
         }
 
-        let file = Arc::new(SegmentFile::open(&path)?);
+        let file = Arc::new(FileHandle::open(&path)?);
         let mut file_size = file.size()?;
         if file_size > WAL_SEGMENT_SIZE {
-            return Err(LogError::Corruption {
+            return Err(WalError::Corruption {
                 path,
                 message: format!(
                     "segment size {} exceeds the maximum {WAL_SEGMENT_SIZE}",
@@ -623,10 +626,10 @@ fn recover_state(
             });
         }
 
-        let starts_at_applied = applied_offset
-            .is_some_and(|offset| !applied_found && offset.segment_number() == file_number);
+        let starts_at_applied =
+            applied_offset.is_some_and(|offset| !applied_found && offset.0 == file_number);
         let start_position = if starts_at_applied {
-            applied_offset.unwrap().position()
+            applied_offset.unwrap().1
         } else {
             0
         };
@@ -637,19 +640,15 @@ fn recover_state(
             ));
         }
 
-        let segment =
-            FileSegment::open(Arc::clone(&file), file_number, WAL_SEGMENT_SIZE, file_size)?;
-        let mut reader = BufReader::new(file.reader()?);
-        reader.seek(SeekFrom::Start(start_position))?;
+        let segment = Segment::open(Arc::clone(&file), file_number, WAL_SEGMENT_SIZE, file_size)?;
         let mut position = start_position;
         let mut skip_applied_record = !applied_found;
         let mut recovered_records = Vec::new();
 
         while position < file_size {
-            let record_offset = SegmentOffset::new(file_number, position);
-            let (next_position, record) = match segment.read(&mut reader, position, file_size) {
-                Ok(record) => record,
-                Err(SegmentError::Truncated { .. }) if final_segment && applied_found => {
+            let (next_offset, records) = match segment.read(position, RECOVERY_READ_SIZE) {
+                Ok(records) => records,
+                Err(WalError::Truncated { .. }) if final_segment && applied_found => {
                     if position < file_size {
                         file.truncate(position)?;
                         file.sync(position)?;
@@ -662,45 +661,60 @@ fn recover_state(
                     );
                     break;
                 }
-                Err(error) => return Err(error.into()),
+                Err(WalError::Truncated { path, message }) => {
+                    return Err(WalError::Corruption { path, message });
+                }
+                Err(error) => return Err(error),
             };
+            if records.is_empty() {
+                return Err(WalError::Worker(
+                    "WAL segment read made no recovery progress".into(),
+                ));
+            }
 
-            let sequence = decode_sequence(&path, &record)?;
-            if skip_applied_record {
+            for (record_offset, record) in records {
+                let sequence = decode_sequence(&path, &record)?;
+                if skip_applied_record {
+                    next_sequence =
+                        Some(sequence.checked_add(1).ok_or_else(|| {
+                            WalError::Worker("WAL sequence space exhausted".into())
+                        })?);
+                    skip_applied_record = false;
+                    applied_found = true;
+                    continue;
+                }
+
+                let expected_sequence = next_sequence.expect("recovery sequence initialized");
+                if sequence != expected_sequence {
+                    return Err(WalError::Corruption {
+                        path: path.clone(),
+                        message: format!(
+                            "expected WAL sequence {expected_sequence}, found {sequence}"
+                        ),
+                    });
+                }
                 next_sequence = Some(
-                    sequence
+                    expected_sequence
                         .checked_add(1)
-                        .ok_or_else(|| LogError::Worker("WAL sequence space exhausted".into()))?,
+                        .ok_or_else(|| WalError::Worker("WAL sequence space exhausted".into()))?,
                 );
-                skip_applied_record = false;
-                applied_found = true;
-                position = next_position;
-                continue;
+                if collect_records {
+                    recovered_records.push((
+                        sequence,
+                        file_number,
+                        record_offset,
+                        record.slice(8..),
+                    ));
+                }
             }
-
-            let expected_sequence = next_sequence.expect("recovery sequence initialized");
-            if sequence != expected_sequence {
-                return Err(LogError::Corruption {
-                    path: path.clone(),
-                    message: format!("expected WAL sequence {expected_sequence}, found {sequence}"),
-                });
-            }
-            next_sequence = Some(
-                expected_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| LogError::Worker("WAL sequence space exhausted".into()))?,
-            );
-            if collect_records {
-                recovered_records.push((sequence, record_offset, record.slice(8..)));
-            }
-            position = next_position;
+            position = next_offset;
         }
         file.discard_cache(position);
         if !recovered_records.is_empty() {
             recovered_batches.push(PublishBatch::new(&recovered_records));
         }
         if final_segment {
-            active = Some(FileSegment::open(
+            active = Some(Segment::open(
                 file,
                 file_number,
                 WAL_SEGMENT_SIZE,
@@ -717,7 +731,7 @@ fn recover_state(
 
     let next_segment_number = max_segment_number
         .checked_add(1)
-        .ok_or_else(|| LogError::Worker("WAL segment number space exhausted".into()))?;
+        .ok_or_else(|| WalError::Worker("WAL segment number space exhausted".into()))?;
     Ok(RecoveredState {
         // Immutable state
         next_sequence: next_sequence.unwrap_or(0),
@@ -727,21 +741,18 @@ fn recover_state(
     })
 }
 
-fn invalid_applied_offset(options: &LogOptions, offset: SegmentOffset) -> LogError {
-    LogError::Corruption {
-        path: options
-            .dir
-            .join(format!("{:010}.seg", offset.segment_number())),
+fn invalid_applied_offset(options: &LogOptions, offset: (u64, u64)) -> WalError {
+    WalError::Corruption {
+        path: options.dir.join(format!("{:010}.seg", offset.0)),
         message: format!(
             "applied WAL offset {}:{} does not identify a record",
-            offset.segment_number(),
-            offset.position()
+            offset.0, offset.1
         ),
     }
 }
 
-fn decode_sequence(path: &Path, record: &[u8]) -> Result<Sequence, LogError> {
-    let prefix = record.get(..8).ok_or_else(|| LogError::Corruption {
+fn decode_sequence(path: &Path, record: &[u8]) -> Result<Sequence, WalError> {
+    let prefix = record.get(..8).ok_or_else(|| WalError::Corruption {
         path: path.to_path_buf(),
         message: "record shorter than the sequence prefix".into(),
     })?;
@@ -784,9 +795,9 @@ mod tests {
         options: &LogOptions,
         records: &[(Sequence, Bytes)],
         max_records_size: u64,
-    ) -> Result<(), LogError> {
+    ) -> Result<(), WalError> {
         let mut next_segment_number = 1;
-        let mut active: Option<FileSegment> = None;
+        let mut active: Option<Segment> = None;
         let mut dirty_files = Vec::new();
 
         for (sequence, payload) in records {
@@ -795,7 +806,7 @@ mod tests {
             record.extend_from_slice(payload);
             loop {
                 if active.is_none() {
-                    active = Some(FileSegment::create(
+                    active = Some(Segment::create(
                         &options.dir,
                         next_segment_number,
                         max_records_size,
@@ -872,9 +883,7 @@ mod tests {
         let options = standard_options(dir.path());
         let payload = Bytes::from(vec![0xA5; 1024 * 1024 + 17]);
         let error = seed_records(&options, &[(0, payload)], 64 * 1024).unwrap_err();
-        assert!(
-            matches!(error, LogError::Worker(message) if message.contains("maximum segment size"))
-        );
+        assert!(matches!(error, WalError::RecordTooLarge { .. }));
     }
 
     #[tokio::test]
@@ -894,7 +903,7 @@ mod tests {
             .unwrap();
 
         let error = SegmentLog::open(options).await.err().unwrap();
-        assert!(matches!(error, LogError::Corruption { .. }));
+        assert!(matches!(error, WalError::Corruption { .. }));
         assert_eq!(std::fs::metadata(&files[0].1).unwrap().len(), 4);
     }
 
@@ -949,7 +958,7 @@ mod tests {
         let error = SegmentLog::open(options).await.err().unwrap();
         assert!(matches!(
             error,
-            LogError::Corruption { message, .. }
+            WalError::Corruption { message, .. }
                 if message == "physical record checksum mismatch"
         ));
         assert_eq!(std::fs::metadata(path).unwrap().len(), file_size);
@@ -969,7 +978,7 @@ mod tests {
         let error = recover_state(&options, false, None).unwrap_err();
         assert!(matches!(
             error,
-            LogError::Corruption { message, .. }
+            WalError::Corruption { message, .. }
                 if message == "expected WAL sequence 1, found 2"
         ));
     }
@@ -978,7 +987,7 @@ mod tests {
     fn recovery_does_not_read_records_before_the_applied_offset() {
         let dir = tempfile::tempdir().unwrap();
         let options = standard_options(dir.path());
-        let mut segment = FileSegment::create(&options.dir, 1, WAL_SEGMENT_SIZE).unwrap();
+        let mut segment = Segment::create(&options.dir, 1, WAL_SEGMENT_SIZE).unwrap();
         let mut offsets = Vec::new();
         for (sequence, payload) in [b"zero".as_slice(), b"one", b"two"].into_iter().enumerate() {
             let mut record = Vec::with_capacity(8 + payload.len());
@@ -996,7 +1005,7 @@ mod tests {
         bytes[11] ^= 0xFF;
         std::fs::write(path, bytes).unwrap();
 
-        let recovered = recover_state(&options, true, Some(offsets[1])).unwrap();
+        let recovered = recover_state(&options, true, Some((1, offsets[1]))).unwrap();
         assert_eq!(recovered.next_sequence, 3);
         let records = recovered
             .recovered_batches
@@ -1020,7 +1029,7 @@ mod tests {
         let error = recover_state(&options, false, None).unwrap_err();
         assert!(matches!(
             error,
-            LogError::Corruption { path, message }
+            WalError::Corruption { path, message }
                 if path == renamed_path
                     && message == "physical record segment number mismatch"
         ));

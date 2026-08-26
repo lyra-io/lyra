@@ -1,7 +1,7 @@
 //! Application of durable WAL records to a downstream state owner.
 
-use super::error::LogError;
-use super::{SegmentOffset, Sequence};
+use super::Sequence;
+use super::error::WalError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -15,7 +15,8 @@ const APPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRecord {
     sequence: Sequence,
-    offset: SegmentOffset,
+    segment_number: u64,
+    offset: u64,
     payload: Bytes,
 }
 
@@ -25,8 +26,13 @@ impl PublishRecord {
         self.sequence
     }
 
-    /// Returns the physical position used to resume WAL recovery after this record.
-    pub fn offset(&self) -> SegmentOffset {
+    /// Returns the number of the segment containing this record.
+    pub fn segment_number(&self) -> u64 {
+        self.segment_number
+    }
+
+    /// Returns the record's byte position used to resume WAL recovery.
+    pub fn offset(&self) -> u64 {
         self.offset
     }
 
@@ -43,15 +49,18 @@ pub struct PublishBatch {
 }
 
 impl PublishBatch {
-    pub(super) fn new(records: &[(Sequence, SegmentOffset, Bytes)]) -> Self {
+    pub(super) fn new(records: &[(Sequence, u64, u64, Bytes)]) -> Self {
         Self {
             records: records
                 .iter()
-                .map(|(sequence, offset, payload)| PublishRecord {
-                    sequence: *sequence,
-                    offset: *offset,
-                    payload: payload.clone(),
-                })
+                .map(
+                    |(sequence, segment_number, offset, payload)| PublishRecord {
+                        sequence: *sequence,
+                        segment_number: *segment_number,
+                        offset: *offset,
+                        payload: payload.clone(),
+                    },
+                )
                 .collect(),
         }
     }
@@ -85,13 +94,13 @@ pub trait PublishTarget: Send + Sync + 'static {
     ///
     /// Implementations should persist this offset atomically with the state
     /// produced by [`apply`](Self::apply). Recovery resumes after this record.
-    fn applied_offset(&self) -> Option<SegmentOffset> {
+    fn applied_offset(&self) -> Option<(u64, u64)> {
         None
     }
 
-    async fn apply(&self, batch: PublishBatch) -> Result<(), LogError>;
+    async fn apply(&self, batch: PublishBatch) -> Result<(), WalError>;
 
-    async fn close(&self) -> Result<(), LogError> {
+    async fn close(&self) -> Result<(), WalError> {
         Ok(())
     }
 }
