@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 const MACOS_BUFFER_ALIGNMENT: usize = 4096;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirectVfs {
     // Immutable state
     root: PathBuf,
@@ -170,6 +170,8 @@ impl IoFile for DirectFile {
     fn sync(&self) -> Result<()> {
         self.file.sync_data()
     }
+
+    fn discard_cache(&self, _end: u64) {}
 }
 
 struct AlignedBuffer {

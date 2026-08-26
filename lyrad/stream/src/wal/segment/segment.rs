@@ -2,185 +2,154 @@
 
 use super::codec::{decode_record, encode_record};
 use super::{Segment, WalError, make_segment_path};
+use crate::vfs::{IoFile, OpenOptions, Vfs, VfsFile, VfsI};
 use bytes::Bytes;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Result as IoResult, Seek, SeekFrom, Write};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, Read, Result as IoResult};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// State shared by all handles to one segment.
 #[derive(Debug)]
-struct FileHandle {
+struct SegmentInner {
     // Immutable state
-    path: PathBuf,
-    file: File,
+    number: u64,
+    file: VfsFile,
+    max_size: u64,
 
     // Mutable state
-    evicted_position: AtomicU64,
+    write_position: AtomicU64,
 }
 
-impl FileHandle {
-    fn create(path: &Path) -> Result<Self, WalError> {
-        Self::open0(path, true)
+impl SegmentInner {
+    fn create(vfs: &VfsI, path: &Path, number: u64, max_size: u64) -> Result<Self, WalError> {
+        Self::open0(vfs, path, number, max_size, 0, true)
     }
 
-    fn open(path: &Path) -> Result<Self, WalError> {
-        Self::open0(path, false)
+    fn open(
+        vfs: &VfsI,
+        path: &Path,
+        number: u64,
+        max_size: u64,
+        write_position: u64,
+    ) -> Result<Self, WalError> {
+        Self::open0(vfs, path, number, max_size, write_position, false)
     }
 
-    fn open0(path: &Path, create_new: bool) -> Result<Self, WalError> {
-        let mut options = OpenOptions::new();
-        options.read(true).append(true).create_new(create_new);
-        let file = options.open(path)?;
+    fn open0(
+        vfs: &VfsI,
+        path: &Path,
+        number: u64,
+        max_size: u64,
+        write_position: u64,
+        create_new: bool,
+    ) -> Result<Self, WalError> {
+        let options = if create_new {
+            OpenOptions::CreateNew
+        } else {
+            OpenOptions::Existing
+        };
+        let file = vfs.open(path, options)?;
         Ok(Self {
             // Immutable state
-            path: path.to_path_buf(),
+            number,
             file,
+            max_size,
 
             // Mutable state
-            evicted_position: AtomicU64::new(0),
+            write_position: AtomicU64::new(write_position),
         })
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.file.path()
     }
 
     fn size(&self) -> Result<u64, WalError> {
-        Ok(self.file.metadata()?.len())
-    }
-
-    fn reader(&self) -> Result<File, WalError> {
-        Ok(self.file.try_clone()?)
-    }
-
-    fn append(&self, bytes: &[u8]) -> Result<(), WalError> {
-        (&self.file).write_all(bytes)?;
-        Ok(())
-    }
-
-    fn truncate(&self, size: u64) -> Result<(), WalError> {
-        self.file.set_len(size)?;
-        Ok(())
-    }
-
-    fn sync(&self, end: u64) -> IoResult<()> {
-        self.file.sync_data()?;
-        self.discard_cache(end);
-        Ok(())
-    }
-
-    fn discard_cache(&self, end: u64) {
-        self.discard_cache0(end);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn discard_cache0(&self, end: u64) {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size <= 0 {
-            tracing::warn!(path = %self.path.display(), "failed to determine page size for WAL cache eviction");
-            return;
-        }
-        let page_size = page_size as u64;
-        let aligned_end = end - end % page_size;
-        let start = self.evicted_position.load(Ordering::Acquire);
-        if aligned_end <= start {
-            return;
-        }
-
-        let Ok(offset) = libc::off_t::try_from(start) else {
-            tracing::warn!(path = %self.path.display(), start, "WAL cache eviction offset exceeds the platform limit");
-            return;
-        };
-        let Ok(length) = libc::off_t::try_from(aligned_end - start) else {
-            tracing::warn!(path = %self.path.display(), start, aligned_end, "WAL cache eviction length exceeds the platform limit");
-            return;
-        };
-        let status = unsafe {
-            libc::posix_fadvise(
-                self.file.as_raw_fd(),
-                offset,
-                length,
-                libc::POSIX_FADV_DONTNEED,
-            )
-        };
-        if status == 0 {
-            self.evicted_position.store(aligned_end, Ordering::Release);
-        } else {
-            tracing::warn!(
-                path = %self.path.display(),
-                start,
-                aligned_end,
-                error = %std::io::Error::from_raw_os_error(status),
-                "failed to evict synced WAL pages from the page cache"
-            );
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn discard_cache0(&self, _end: u64) {
-        let _ = self.evicted_position.load(Ordering::Relaxed);
+        Ok(self.file.size()?)
     }
 }
 
+struct SegmentReader<'a> {
+    file: &'a VfsFile,
+    position: u64,
+    end: u64,
+}
+
+impl Read for SegmentReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> IoResult<usize> {
+        if output.is_empty() || self.position >= self.end {
+            return Ok(0);
+        }
+        let output_len = u64::try_from(output.len()).unwrap_or(u64::MAX);
+        let length = usize::try_from((self.end - self.position).min(output_len)).unwrap();
+        let bytes = self.file.read_at(self.position, length)?;
+        output[..length].copy_from_slice(&bytes);
+        self.position += length as u64;
+        Ok(length)
+    }
+}
+
+/// A cheap, cloneable handle to one buffered WAL segment.
 #[derive(Debug, Clone)]
 pub(in crate::wal) struct FileSegment {
     // Immutable state
-    number: u64,
-    file: Arc<FileHandle>,
-    max_size: u64,
-
-    // Mutable state
-    write_position: u64,
+    inner: Arc<SegmentInner>,
 }
 
 impl PartialEq for FileSegment {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.file, &other.file)
+        // Sync deduplication is based on shared segment identity.
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
 impl Eq for FileSegment {}
 
 impl FileSegment {
-    pub(in crate::wal) fn create(dir: &Path, number: u64, max_size: u64) -> Result<Self, WalError> {
+    pub(in crate::wal) fn create(
+        vfs: &VfsI,
+        dir: &Path,
+        number: u64,
+        max_size: u64,
+    ) -> Result<Self, WalError> {
         u32::try_from(number).map_err(|_| WalError::SegmentNumberTooLarge(number))?;
-        let file = Arc::new(FileHandle::create(&make_segment_path(dir, number))?);
+        let inner = Arc::new(SegmentInner::create(
+            vfs,
+            &make_segment_path(dir, number),
+            number,
+            max_size,
+        )?);
         Ok(Self {
             // Immutable state
-            number,
-            file,
-            max_size,
-
-            // Mutable state
-            write_position: 0,
+            inner,
         })
     }
 
     pub(in crate::wal) fn open(
+        vfs: &VfsI,
         path: &Path,
         number: u64,
         max_size: u64,
         write_position: u64,
     ) -> Result<Self, WalError> {
         u32::try_from(number).map_err(|_| WalError::SegmentNumberTooLarge(number))?;
-        let file = Arc::new(FileHandle::open(path)?);
-        if write_position > max_size || file.size()? != write_position {
+        let inner = Arc::new(SegmentInner::open(
+            vfs,
+            path,
+            number,
+            max_size,
+            write_position,
+        )?);
+        if write_position > max_size || inner.size()? != write_position {
             return Err(WalError::corruption(
-                file.path(),
+                inner.path(),
                 "recovered WAL segment position is inconsistent",
             ));
         }
         Ok(Self {
             // Immutable state
-            number,
-            file,
-            max_size,
-
-            // Mutable state
-            write_position,
+            inner,
         })
     }
 }
@@ -189,31 +158,37 @@ impl Segment for FileSegment {
     /// Reads complete records whose combined payload size does not exceed
     /// `max_bytes`, returning the next unread position and the payloads.
     fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError> {
-        if position > self.write_position {
+        let write_position = self.inner.write_position.load(Ordering::Acquire);
+        if position > write_position {
             return Err(WalError::corruption(
-                self.file.path(),
+                self.inner.path(),
                 format!(
                     "position {position} is outside segment {} with size {}",
-                    self.number, self.write_position
+                    self.inner.number, write_position
                 ),
             ));
         }
 
-        let mut reader = BufReader::new(self.file.reader()?);
-        reader.seek(SeekFrom::Start(position))?;
+        let mut reader = BufReader::new(SegmentReader {
+            file: &self.inner.file,
+            position,
+            end: write_position,
+        });
         let mut position = position;
         let mut payload_bytes = 0usize;
         let mut records = Vec::new();
-        while position < self.write_position {
+        while position < write_position {
             let decoded = decode_record(
                 &mut reader,
-                self.file.path(),
-                self.number,
+                self.inner.path(),
+                self.inner.number,
                 position,
-                self.write_position,
+                write_position,
             );
             let (next_position, payload) = match decoded {
                 Ok(decoded) => decoded,
+                // Return already decoded records first. A subsequent read from
+                // this position will surface the boundary error.
                 Err(_) if !records.is_empty() => break,
                 Err(error) => return Err(error),
             };
@@ -235,49 +210,66 @@ impl Segment for FileSegment {
             position = next_position;
         }
 
-        self.file.discard_cache(position);
+        self.inner.file.discard_cache(position);
         Ok((position, records))
     }
 
     fn sync(&self) -> Result<(), WalError> {
-        self.file.sync(self.write_position)?;
+        // Capture the eviction boundary before syncing so a concurrent later
+        // append cannot make us evict bytes that this call may not have synced.
+        let write_position = self.inner.write_position.load(Ordering::Acquire);
+        self.inner.file.sync()?;
+        self.inner.file.discard_cache(write_position);
         Ok(())
     }
 
-    fn append(&mut self, payload: &[u8]) -> Result<(), WalError> {
-        let encoded = encode_record(self.number, self.write_position, payload)?;
+    fn append(&self, payload: &[u8]) -> Result<(), WalError> {
+        let write_position = self.inner.write_position.load(Ordering::Relaxed);
+        let encoded = encode_record(self.inner.number, write_position, payload)?;
         let encoded_size = u64::try_from(encoded.len()).map_err(|_| WalError::PositionExhausted)?;
-        let next_position = self
-            .write_position
+        let next_position = write_position
             .checked_add(encoded_size)
             .ok_or(WalError::PositionExhausted)?;
-        if next_position > self.max_size {
-            if self.write_position == 0 {
+        if next_position > self.inner.max_size {
+            if write_position == 0 {
                 return Err(WalError::RecordTooLarge {
                     size: encoded_size,
-                    max: self.max_size,
+                    max: self.inner.max_size,
                 });
             }
             return Err(WalError::SegmentFull);
         }
 
-        self.file.append(&encoded)?;
-        self.write_position = next_position;
-        Ok(())
-    }
-
-    fn truncate(&mut self, position: u64) -> Result<(), WalError> {
-        if position > self.write_position {
+        let appended_at = self.inner.file.append(&encoded)?;
+        if appended_at != write_position {
             return Err(WalError::corruption(
-                self.file.path(),
+                self.inner.path(),
                 format!(
-                    "cannot truncate segment {} from {} to {position}",
-                    self.number, self.write_position
+                    "segment {} appended at {appended_at}, expected {write_position}",
+                    self.inner.number
                 ),
             ));
         }
-        self.file.truncate(position)?;
-        self.write_position = position;
+        // Advance only after the entire encoded record has been accepted.
+        self.inner
+            .write_position
+            .store(next_position, Ordering::Release);
+        Ok(())
+    }
+
+    fn truncate(&self, position: u64) -> Result<(), WalError> {
+        let write_position = self.inner.write_position.load(Ordering::Acquire);
+        if position > write_position {
+            return Err(WalError::corruption(
+                self.inner.path(),
+                format!(
+                    "cannot truncate segment {} from {} to {position}",
+                    self.inner.number, write_position
+                ),
+            ));
+        }
+        self.inner.file.truncate(position)?;
+        self.inner.write_position.store(position, Ordering::Release);
         Ok(())
     }
 }
@@ -285,11 +277,13 @@ impl Segment for FileSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::{MemoryVfs, StandardVfs, VfsI};
 
     #[test]
     fn appends_and_reads_records_without_metadata_envelopes() {
         let dir = tempfile::tempdir().unwrap();
-        let mut segment = FileSegment::create(dir.path(), 1, 4096).unwrap();
+        let vfs = VfsI::Standard(StandardVfs);
+        let segment = FileSegment::create(&vfs, dir.path(), 1, 4096).unwrap();
         segment.append(b"first").unwrap();
         segment.append(b"second").unwrap();
         segment.sync().unwrap();
@@ -304,9 +298,25 @@ mod tests {
     }
 
     #[test]
+    fn clones_observe_the_shared_append_position() {
+        let vfs = VfsI::Memory(MemoryVfs::default());
+        let dir = Path::new("/wal");
+        vfs.create_dir(dir).unwrap();
+        let cloned_vfs = vfs.clone();
+        let segment = FileSegment::create(&cloned_vfs, dir, 1, 4096).unwrap();
+        let cloned = segment.clone();
+
+        segment.append(b"record").unwrap();
+
+        let (_, records) = cloned.read(0, 6).unwrap();
+        assert_eq!(records, vec![Bytes::from_static(b"record")]);
+    }
+
+    #[test]
     fn maximum_size_has_no_external_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let mut segment = FileSegment::create(dir.path(), 1, 16).unwrap();
+        let vfs = VfsI::Standard(StandardVfs);
+        let segment = FileSegment::create(&vfs, dir.path(), 1, 16).unwrap();
         segment.append(b"first").unwrap();
         assert_eq!(segment.append(b"second"), Err(WalError::SegmentFull));
         assert_eq!(
@@ -320,7 +330,8 @@ mod tests {
     #[test]
     fn read_rejects_a_first_record_larger_than_the_byte_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut segment = FileSegment::create(dir.path(), 1, 4096).unwrap();
+        let vfs = VfsI::Standard(StandardVfs);
+        let segment = FileSegment::create(&vfs, dir.path(), 1, 4096).unwrap();
         segment.append(b"record").unwrap();
 
         assert!(matches!(

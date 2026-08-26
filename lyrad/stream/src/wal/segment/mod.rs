@@ -1,8 +1,8 @@
 //! Buffered WAL segment files and RocksDB-style record framing.
 
+use crate::vfs::{Vfs, VfsI};
 use bytes::Bytes;
 use std::ffi::OsStr;
-use std::fs::File;
 use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 
@@ -15,24 +15,37 @@ pub(super) use segment::FileSegment;
 
 const SEGMENT_EXTENSION: &str = "seg";
 
+/// One append-only WAL segment.
+///
+/// Positions are physical byte offsets in the encoded segment file. The WAL
+/// owns rotation and recovery; a segment only appends, reads, synchronizes, or
+/// truncates its own file. The caller must serialize append and truncate calls.
 pub(super) trait Segment {
+    /// Reads complete logical records starting at `position` without exceeding
+    /// `max_bytes` of decoded payload, and returns the next unread position.
     fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError>;
 
+    /// Makes all bytes visible before synchronization durable.
     fn sync(&self) -> Result<(), WalError>;
 
-    fn append(&mut self, payload: &[u8]) -> Result<(), WalError>;
+    /// Appends one logical record or returns [`WalError::SegmentFull`] without
+    /// modifying the segment when rotation is required.
+    fn append(&self, payload: &[u8]) -> Result<(), WalError>;
 
-    fn truncate(&mut self, position: u64) -> Result<(), WalError>;
+    /// Removes bytes at and after `position`.
+    fn truncate(&self, position: u64) -> Result<(), WalError>;
 }
 
 pub(in crate::wal) fn make_segment_path(dir: &Path, segment_number: u64) -> PathBuf {
     dir.join(format!("{segment_number:010}.{SEGMENT_EXTENSION}"))
 }
 
-pub(in crate::wal) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
+pub(in crate::wal) fn list_segments(
+    vfs: &VfsI,
+    dir: &Path,
+) -> Result<Vec<(u64, PathBuf)>, WalError> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+    for path in vfs.list(dir)? {
         if path.extension() != Some(OsStr::new(SEGMENT_EXTENSION)) {
             continue;
         }
@@ -60,8 +73,9 @@ pub(in crate::wal) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, W
     Ok(files)
 }
 
-pub(in crate::wal) fn sync_all(dir: &Path) -> IoResult<()> {
-    File::open(dir)?.sync_all()
+/// Persists segment creation and other directory-entry changes.
+pub(in crate::wal) fn sync_all(vfs: &VfsI, dir: &Path) -> IoResult<()> {
+    vfs.sync(dir)
 }
 
 #[cfg(test)]
@@ -74,7 +88,8 @@ mod tests {
         let path = dir.path().join("1.seg");
         std::fs::write(&path, []).unwrap();
 
-        let error = list_segments(dir.path()).unwrap_err();
+        let vfs = crate::vfs::VfsI::Standard(crate::vfs::StandardVfs);
+        let error = list_segments(&vfs, dir.path()).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption {

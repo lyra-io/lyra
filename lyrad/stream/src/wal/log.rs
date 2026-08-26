@@ -8,6 +8,7 @@ use super::{
     Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, MAX_PENDING_PUBLISH_BATCH_NUM, PublishTarget,
     Sequence, WAL_SEGMENT_SIZE,
 };
+use crate::vfs::{StandardVfs, Vfs, VfsI};
 use async_trait::async_trait;
 use bytes::Bytes;
 use meta::utils::directory_lock::DirectoryLock;
@@ -143,7 +144,8 @@ impl SegmentLog {
         options: LogOptions,
         target: Option<Arc<dyn PublishTarget>>,
     ) -> Result<Arc<Self>, WalError> {
-        tokio::fs::create_dir_all(&options.dir).await?;
+        let vfs = VfsI::Standard(StandardVfs);
+        vfs.create_dir(&options.dir)?;
 
         let context = CancellationToken::new();
         let (operation_tx, operation_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
@@ -161,8 +163,9 @@ impl SegmentLog {
         let sync_handle = ThreadBuilder::new().name("lyra-wal-sync".into()).spawn({
             let dir = options.dir.clone();
             let synced_tx = synced_tx.clone();
+            let vfs = vfs.clone();
             move || {
-                sync_loop(sync_rx, dir.as_path(), synced_tx);
+                sync_loop(sync_rx, vfs, dir.as_path(), synced_tx);
                 tracing::info!("WAL sync thread exited");
                 let _ = sync_done_tx.send(());
             }
@@ -175,6 +178,7 @@ impl SegmentLog {
         let writer_handle = match ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
             let options = options.clone();
             let advanced_tx = advanced_tx.clone();
+            let vfs = vfs.clone();
             move || {
                 match DirectoryLock::acquire(options.dir.join(LOCK_FILE_NAME))
                     .map_err(|error| {
@@ -185,7 +189,7 @@ impl SegmentLog {
                         }
                     })
                     .and_then(|directory_lock| {
-                        recover_state(&options, recover_records, applied_sequence)
+                        recover_state(&vfs, &options, recover_records, applied_sequence)
                             .map(|recovered| (directory_lock, recovered))
                     }) {
                     Ok((directory_lock, mut recovered)) => {
@@ -200,6 +204,7 @@ impl SegmentLog {
                                 sync_tx,
                                 pending_tx,
                                 advanced_tx,
+                                vfs,
                                 options,
                                 recovered,
                             );
@@ -483,6 +488,7 @@ fn writer_loop(
     sync_tx: mpsc::Sender<Operation>,
     pending_publish_tx: Option<mpsc::Sender<PublishBatch>>,
     advanced_sequence: watch::Sender<Sequence>,
+    vfs: VfsI,
     options: LogOptions,
     recovered: RecoveredState,
 ) {
@@ -528,6 +534,7 @@ fn writer_loop(
                                         )
                                     })?;
                                 active_segment = Some(FileSegment::create(
+                                    &vfs,
                                     &options.dir,
                                     number,
                                     WAL_SEGMENT_SIZE,
@@ -536,7 +543,7 @@ fn writer_loop(
                                 directory_dirty = true;
                             }
 
-                            match active_segment.as_mut().unwrap().append(&record) {
+                            match active_segment.as_ref().unwrap().append(&record) {
                                 Ok(()) => break,
                                 Err(WalError::SegmentFull) => {
                                     dirty_segments.push(active_segment.take().unwrap());
@@ -602,6 +609,7 @@ fn writer_loop(
 
 fn sync_loop(
     mut sync_rx: mpsc::Receiver<Operation>,
+    vfs: VfsI,
     dir: &Path,
     synced_sequence: watch::Sender<Sequence>,
 ) {
@@ -632,7 +640,7 @@ fn sync_loop(
         }
 
         if let Some(last_sequence) = last_sequence {
-            match perform_sync(&segments, sync_dir, dir) {
+            match perform_sync(&segments, sync_dir, &vfs, dir) {
                 Ok(()) => {
                     synced_sequence.send_replace(last_sequence + 1);
                 }
@@ -652,6 +660,7 @@ fn sync_loop(
 /// Scans the WAL, repairs a truncated final record, and restores the final
 /// segment as the active buffered segment.
 fn recover_state(
+    vfs: &VfsI,
     options: &LogOptions,
     collect_records: bool,
     applied_sequence: Option<Sequence>,
@@ -659,7 +668,7 @@ fn recover_state(
     let mut next_sequence = 0;
     let mut max_segment_number: u64 = 0;
     let mut recovered_batches = Vec::new();
-    let segment_files = list_segments(&options.dir)?;
+    let segment_files = list_segments(vfs, &options.dir)?;
     let segment_count = segment_files.len();
     let mut active_segment = None;
     let mut applied_found = applied_sequence.is_none();
@@ -679,7 +688,7 @@ fn recover_state(
             });
         }
 
-        let mut segment = FileSegment::open(&path, file_number, WAL_SEGMENT_SIZE, file_size)?;
+        let segment = FileSegment::open(vfs, &path, file_number, WAL_SEGMENT_SIZE, file_size)?;
         let mut position = 0;
         let mut recovered_records = Vec::new();
 
@@ -776,7 +785,12 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn perform_sync(segments: &[FileSegment], sync_dir: bool, dir: &Path) -> Result<(), WalError> {
+fn perform_sync(
+    segments: &[FileSegment],
+    sync_dir: bool,
+    vfs: &VfsI,
+    dir: &Path,
+) -> Result<(), WalError> {
     let mut previous = None;
     for segment in segments.iter().rev() {
         if previous.is_some_and(|previous| previous == segment) {
@@ -786,7 +800,7 @@ fn perform_sync(segments: &[FileSegment], sync_dir: bool, dir: &Path) -> Result<
         previous = Some(segment);
     }
     if sync_dir {
-        sync_all(dir)?;
+        sync_all(vfs, dir)?;
     }
     Ok(())
 }
@@ -805,6 +819,7 @@ mod tests {
         records: &[(Sequence, Bytes)],
         max_records_size: u64,
     ) -> Result<(), WalError> {
+        let vfs = VfsI::Standard(StandardVfs);
         let mut next_segment_number = 1;
         let mut active_segment: Option<FileSegment> = None;
         let mut dirty_segments = Vec::new();
@@ -816,13 +831,14 @@ mod tests {
             loop {
                 if active_segment.is_none() {
                     active_segment = Some(FileSegment::create(
+                        &vfs,
                         &options.dir,
                         next_segment_number,
                         max_records_size,
                     )?);
                     next_segment_number += 1;
                 }
-                match active_segment.as_mut().unwrap().append(&record) {
+                match active_segment.as_ref().unwrap().append(&record) {
                     Ok(()) => break,
                     Err(WalError::SegmentFull) => {
                         dirty_segments.push(active_segment.take().unwrap());
@@ -834,7 +850,7 @@ mod tests {
         if let Some(segment) = active_segment.as_ref() {
             dirty_segments.push(segment.clone());
         }
-        perform_sync(&dirty_segments, true, &options.dir)?;
+        perform_sync(&dirty_segments, true, &vfs, &options.dir)?;
         Ok(())
     }
 
@@ -856,7 +872,12 @@ mod tests {
             .collect();
         seed_segments(&options, &payloads, 147);
 
-        assert_eq!(list_segments(dir.path()).unwrap().len(), 4);
+        assert_eq!(
+            list_segments(&VfsI::Standard(StandardVfs), dir.path())
+                .unwrap()
+                .len(),
+            4
+        );
         let log = SegmentLog::open(options).await.unwrap();
         assert_eq!(log.append(Bytes::from_static(b"next")).await.unwrap(), 4);
         log.close().await;
@@ -878,7 +899,7 @@ mod tests {
         let payloads = vec![Bytes::from(vec![0x11; 128]), Bytes::from(vec![0x22; 128])];
         seed_segments(&options, &payloads, 147);
 
-        let files = list_segments(dir.path()).unwrap();
+        let files = list_segments(&VfsI::Standard(StandardVfs), dir.path()).unwrap();
         assert_eq!(files.len(), 2);
         OpenOptions::new()
             .write(true)
@@ -899,7 +920,9 @@ mod tests {
         let payloads = vec![Bytes::from(vec![0x11; 128]), Bytes::from(vec![0x22; 128])];
         seed_segments(&options, &payloads, WAL_SEGMENT_SIZE);
 
-        let path = list_segments(dir.path()).unwrap()[0].1.clone();
+        let path = list_segments(&VfsI::Standard(StandardVfs), dir.path()).unwrap()[0]
+            .1
+            .clone();
         OpenOptions::new()
             .write(true)
             .open(&path)
@@ -931,7 +954,9 @@ mod tests {
         let options = standard_options(dir.path());
         seed_segments(&options, &[Bytes::from_static(b"record")], WAL_SEGMENT_SIZE);
 
-        let path = list_segments(dir.path()).unwrap()[0].1.clone();
+        let path = list_segments(&VfsI::Standard(StandardVfs), dir.path()).unwrap()[0]
+            .1
+            .clone();
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[11] ^= 0xFF;
         std::fs::write(&path, bytes).unwrap();
@@ -957,7 +982,7 @@ mod tests {
 
         seed_records(&options, &records, WAL_SEGMENT_SIZE).unwrap();
 
-        let error = recover_state(&options, false, None).unwrap_err();
+        let error = recover_state(&VfsI::Standard(StandardVfs), &options, false, None).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption { message, .. }
@@ -976,7 +1001,8 @@ mod tests {
         ];
         seed_records(&options, &records, WAL_SEGMENT_SIZE).unwrap();
 
-        let recovered = recover_state(&options, true, Some(1)).unwrap();
+        let recovered =
+            recover_state(&VfsI::Standard(StandardVfs), &options, true, Some(1)).unwrap();
         assert_eq!(recovered.next_sequence, 3);
         let records = recovered
             .recovered_batches
@@ -994,7 +1020,8 @@ mod tests {
         let options = standard_options(dir.path());
         seed_segments(&options, &[Bytes::from_static(b"record")], WAL_SEGMENT_SIZE);
 
-        let error = recover_state(&options, true, Some(1)).unwrap_err();
+        let error =
+            recover_state(&VfsI::Standard(StandardVfs), &options, true, Some(1)).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption { message, .. }
@@ -1007,11 +1034,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let options = standard_options(dir.path());
         seed_segments(&options, &[Bytes::from_static(b"record")], WAL_SEGMENT_SIZE);
-        let (_, original_path) = list_segments(dir.path()).unwrap().pop().unwrap();
+        let (_, original_path) = list_segments(&VfsI::Standard(StandardVfs), dir.path())
+            .unwrap()
+            .pop()
+            .unwrap();
         let renamed_path = dir.path().join("0000000002.seg");
         std::fs::rename(original_path, &renamed_path).unwrap();
 
-        let error = recover_state(&options, false, None).unwrap_err();
+        let error = recover_state(&VfsI::Standard(StandardVfs), &options, false, None).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption { path, message }

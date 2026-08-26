@@ -141,6 +141,8 @@ impl IoFile for MemoryFile {
     fn sync(&self) -> Result<()> {
         Ok(())
     }
+
+    fn discard_cache(&self, _end: u64) {}
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Virtual filesystem interfaces reserved for stream storage.
+//! Virtual filesystem interfaces used by stream storage and WAL segments.
 
 mod direct;
 mod memory;
@@ -19,6 +19,14 @@ pub enum VfsFile {
     Memory(MemoryFile),
     Standard(StandardFile),
     Direct(DirectFile),
+}
+
+/// One of the supported virtual filesystem implementations.
+#[derive(Debug, Clone)]
+pub enum VfsI {
+    Memory(MemoryVfs),
+    Standard(StandardVfs),
+    Direct(DirectVfs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +54,10 @@ pub trait IoFile: Debug + Send + Sync {
     fn truncate(&self, size: u64) -> Result<()>;
 
     fn sync(&self) -> Result<()>;
+
+    /// Advises the operating system that cached bytes before `end` are no
+    /// longer needed. Implementations without a page cache may do nothing.
+    fn discard_cache(&self, end: u64);
 }
 
 /// Filesystem namespace and file-opening operations needed by segments.
@@ -62,6 +74,56 @@ pub trait Vfs: Debug + Send + Sync {
     fn remove(&self, path: &Path) -> Result<()>;
 
     fn sync(&self, dir: &Path) -> Result<()>;
+}
+
+impl Vfs for VfsI {
+    fn alignment(&self) -> Option<u64> {
+        match self {
+            Self::Memory(vfs) => vfs.alignment(),
+            Self::Standard(vfs) => vfs.alignment(),
+            Self::Direct(vfs) => vfs.alignment(),
+        }
+    }
+
+    fn create_dir(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Memory(vfs) => vfs.create_dir(path),
+            Self::Standard(vfs) => vfs.create_dir(path),
+            Self::Direct(vfs) => vfs.create_dir(path),
+        }
+    }
+
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<VfsFile> {
+        match self {
+            Self::Memory(vfs) => vfs.open(path, options),
+            Self::Standard(vfs) => vfs.open(path, options),
+            Self::Direct(vfs) => vfs.open(path, options),
+        }
+    }
+
+    fn list(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        match self {
+            Self::Memory(vfs) => vfs.list(dir),
+            Self::Standard(vfs) => vfs.list(dir),
+            Self::Direct(vfs) => vfs.list(dir),
+        }
+    }
+
+    fn remove(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Memory(vfs) => vfs.remove(path),
+            Self::Standard(vfs) => vfs.remove(path),
+            Self::Direct(vfs) => vfs.remove(path),
+        }
+    }
+
+    fn sync(&self, dir: &Path) -> Result<()> {
+        match self {
+            Self::Memory(vfs) => vfs.sync(dir),
+            Self::Standard(vfs) => vfs.sync(dir),
+            Self::Direct(vfs) => vfs.sync(dir),
+        }
+    }
 }
 
 impl IoFile for VfsFile {
@@ -110,6 +172,14 @@ impl IoFile for VfsFile {
             Self::Memory(file) => file.sync(),
             Self::Standard(file) => file.sync(),
             Self::Direct(file) => file.sync(),
+        }
+    }
+
+    fn discard_cache(&self, end: u64) {
+        match self {
+            Self::Memory(file) => file.discard_cache(end),
+            Self::Standard(file) => file.discard_cache(end),
+            Self::Direct(file) => file.discard_cache(end),
         }
     }
 }

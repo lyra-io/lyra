@@ -4,13 +4,15 @@ use super::{IoFile, OpenOptions, Vfs, VfsFile};
 use bytes::Bytes;
 use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::io::{Error, ErrorKind, Result};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct StandardVfs;
 
 #[derive(Debug)]
@@ -21,6 +23,7 @@ pub struct StandardFile {
 
     // Mutable state
     append_position: AtomicU64,
+    evicted_position: AtomicU64,
 }
 
 impl Vfs for StandardVfs {
@@ -44,6 +47,7 @@ impl Vfs for StandardVfs {
             path: path.to_path_buf(),
             file,
             append_position,
+            evicted_position: AtomicU64::new(0),
         }))
     }
 
@@ -101,6 +105,61 @@ impl IoFile for StandardFile {
 
     fn sync(&self) -> Result<()> {
         self.file.sync_data()
+    }
+
+    fn discard_cache(&self, end: u64) {
+        self.discard_cache0(end);
+    }
+}
+
+impl StandardFile {
+    #[cfg(target_os = "linux")]
+    fn discard_cache0(&self, end: u64) {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            tracing::warn!(path = %self.path.display(), "failed to determine page size for cache eviction");
+            return;
+        }
+        let page_size = page_size as u64;
+        // Keep the partial tail page cached because later appends may modify it.
+        let aligned_end = end - end % page_size;
+        let start = self.evicted_position.load(Ordering::Acquire);
+        if aligned_end <= start {
+            return;
+        }
+
+        let Ok(offset) = libc::off_t::try_from(start) else {
+            tracing::warn!(path = %self.path.display(), start, "cache eviction offset exceeds the platform limit");
+            return;
+        };
+        let Ok(length) = libc::off_t::try_from(aligned_end - start) else {
+            tracing::warn!(path = %self.path.display(), start, aligned_end, "cache eviction length exceeds the platform limit");
+            return;
+        };
+        let status = unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                offset,
+                length,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        if status == 0 {
+            self.evicted_position.store(aligned_end, Ordering::Release);
+        } else {
+            tracing::warn!(
+                path = %self.path.display(),
+                start,
+                aligned_end,
+                error = %Error::from_raw_os_error(status),
+                "failed to evict synced file pages from the page cache"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn discard_cache0(&self, _end: u64) {
+        let _ = self.evicted_position.load(Ordering::Relaxed);
     }
 }
 
