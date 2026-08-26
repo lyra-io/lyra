@@ -4,10 +4,7 @@ use super::error::WalError;
 use super::ops::{AppendOp, Operation, SyncOp};
 use super::options::LogOptions;
 use super::segment::{FileSegment, Segment, list_segments, sync_all};
-use super::{
-    Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, MAX_PENDING_PUBLISH_BATCH_NUM, PublishTarget,
-    Sequence, WAL_SEGMENT_SIZE,
-};
+use super::{Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, Sequence, WAL_SEGMENT_SIZE};
 use crate::vfs::{StandardVfs, Vfs, VfsI};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,70 +17,15 @@ use std::sync::Arc;
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
-
-/// A contiguous, ordered batch of WAL records.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishBatch {
-    first_sequence: Sequence,
-    payloads: Vec<Bytes>,
-}
-
-impl PublishBatch {
-    fn new(records: &[(Sequence, Bytes)]) -> Self {
-        let first_sequence = records.first().expect("publish batches are never empty").0;
-        debug_assert!(
-            records
-                .windows(2)
-                .all(|records| records[0].0.checked_add(1) == Some(records[1].0))
-        );
-        Self {
-            first_sequence,
-            payloads: records.iter().map(|(_, payload)| payload.clone()).collect(),
-        }
-    }
-
-    /// Returns each sequence and payload in order.
-    pub fn records(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (Sequence, &Bytes)> + ExactSizeIterator + '_ {
-        self.payloads
-            .iter()
-            .enumerate()
-            .map(move |(index, payload)| {
-                let sequence = self
-                    .first_sequence
-                    .checked_add(index as Sequence)
-                    .expect("publish batch sequence range is valid");
-                (sequence, payload)
-            })
-    }
-
-    /// Returns the first sequence in the batch.
-    pub fn first_sequence(&self) -> Sequence {
-        self.first_sequence
-    }
-
-    /// Returns the last sequence in the batch.
-    pub fn last_sequence(&self) -> Sequence {
-        self.first_sequence
-            .checked_add(self.payloads.len() as Sequence - 1)
-            .expect("publish batch sequence range is valid")
-    }
-}
 
 /// A buffered write-ahead log backed by Lyra's segment format.
 ///
 /// A dedicated writer thread assigns sequences and advances the highest
 /// written sequence. A second dedicated thread groups synchronization work and
-/// advances the highest durable sequence. When a [`PublishTarget`] is
-/// configured, a Tokio task forwards records only after they are durable.
+/// advances the highest durable sequence.
 pub struct SegmentLog {
     // Control state
-    context: CancellationToken,
     workers: Mutex<Option<WorkerThreads>>,
-    tasks: Mutex<Option<JoinSet<()>>>,
     close_lock: Mutex<()>,
 
     // Immutable state
@@ -91,14 +33,12 @@ pub struct SegmentLog {
     advanced_sequence: watch::Receiver<Sequence>,
     synced_sequence: watch::Receiver<Sequence>,
     sync: bool,
-    target: Option<Arc<dyn PublishTarget>>,
 
     // Mutable state
     state: RwLock<Lifecycle>,
 }
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
-const APPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_FILE_NAME: &str = ".lyra-wal.lock";
 const RECOVERY_READ_SIZE: usize = WAL_SEGMENT_SIZE as usize;
 
@@ -118,7 +58,6 @@ struct RecoveredState {
     // Immutable state
     next_sequence: Sequence,
     next_segment_number: u64,
-    recovered_batches: Vec<PublishBatch>,
     active_segment: Option<FileSegment>,
 }
 
@@ -128,36 +67,13 @@ impl SegmentLog {
     /// Existing segments are scanned to restore sequence numbering. A valid
     /// final segment remains active for subsequent appends.
     pub async fn open(options: LogOptions) -> Result<Arc<Self>, WalError> {
-        Self::open0(options, None).await
-    }
-
-    /// Opens the WAL, applies recovered records to `target`, and applies new
-    /// batches after their last sequence becomes durable.
-    pub async fn open_with_target(
-        options: LogOptions,
-        target: Arc<dyn PublishTarget>,
-    ) -> Result<Arc<Self>, WalError> {
-        Self::open0(options, Some(target)).await
-    }
-
-    async fn open0(
-        options: LogOptions,
-        target: Option<Arc<dyn PublishTarget>>,
-    ) -> Result<Arc<Self>, WalError> {
         let vfs = VfsI::Standard(StandardVfs);
         vfs.create_dir(&options.dir)?;
 
-        let context = CancellationToken::new();
         let (operation_tx, operation_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
         let (sync_tx, sync_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
         let (advanced_tx, advanced_sequence) = watch::channel(0);
         let (synced_tx, synced_sequence) = watch::channel(0);
-        let (pending_tx, pending_rx) = if target.is_some() {
-            let (tx, rx) = mpsc::channel(MAX_PENDING_PUBLISH_BATCH_NUM);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
 
         let (sync_done_tx, sync_done) = oneshot::channel();
         let sync_handle = ThreadBuilder::new().name("lyra-wal-sync".into()).spawn({
@@ -173,8 +89,6 @@ impl SegmentLog {
 
         let (writer_started_tx, writer_started) = oneshot::channel();
         let (writer_done_tx, writer_done) = oneshot::channel();
-        let recover_records = pending_tx.is_some();
-        let applied_sequence = target.as_ref().and_then(|target| target.applied_sequence());
         let writer_handle = match ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
             let options = options.clone();
             let advanced_tx = advanced_tx.clone();
@@ -189,20 +103,14 @@ impl SegmentLog {
                         }
                     })
                     .and_then(|directory_lock| {
-                        recover_state(&vfs, &options, recover_records, applied_sequence)
-                            .map(|recovered| (directory_lock, recovered))
+                        recover_state(&vfs, &options).map(|recovered| (directory_lock, recovered))
                     }) {
-                    Ok((directory_lock, mut recovered)) => {
+                    Ok((directory_lock, recovered)) => {
                         let last_sequence = recovered.next_sequence.checked_sub(1);
-                        let recovered_batches = std::mem::take(&mut recovered.recovered_batches);
-                        if writer_started_tx
-                            .send(Ok((last_sequence, recovered_batches)))
-                            .is_ok()
-                        {
+                        if writer_started_tx.send(Ok(last_sequence)).is_ok() {
                             writer_loop(
                                 operation_rx,
                                 sync_tx,
-                                pending_tx,
                                 advanced_tx,
                                 vfs,
                                 options,
@@ -227,12 +135,11 @@ impl SegmentLog {
             }
         };
 
-        let recovered_batches = match writer_started.await {
-            Ok(Ok((last_sequence, recovered_batches))) => {
+        match writer_started.await {
+            Ok(Ok(last_sequence)) => {
                 let sequence = last_sequence.map_or(0, |sequence| sequence + 1);
                 advanced_tx.send_replace(sequence);
                 synced_tx.send_replace(sequence);
-                recovered_batches
             }
             Ok(Err(error)) => {
                 let _ = writer_done.await;
@@ -252,34 +159,9 @@ impl SegmentLog {
                 let _ = sync_handle.join();
                 return Err(WalError::Worker(error));
             }
-        };
-
-        if let Some(target) = &target {
-            for batch in recovered_batches {
-                if let Err(error) = target.apply(batch).await {
-                    context.cancel();
-                    let _ = operation_tx.send(Operation::Close).await;
-                    let _ = writer_done.await;
-                    let _ = sync_done.await;
-                    let _ = writer_handle.join();
-                    let _ = sync_handle.join();
-                    return Err(error);
-                }
-            }
-        }
-
-        let mut tasks = JoinSet::new();
-        if let (Some(target), Some(pending_rx)) = (target.clone(), pending_rx) {
-            tasks.spawn(apply_after_sync(
-                context.clone(),
-                pending_rx,
-                synced_sequence.clone(),
-                target,
-            ));
         }
 
         Ok(Arc::new(Self {
-            context,
             workers: Mutex::new(Some(WorkerThreads {
                 writer: WorkerThread {
                     handle: Some(writer_handle),
@@ -290,13 +172,11 @@ impl SegmentLog {
                     done: sync_done,
                 },
             })),
-            tasks: Mutex::new(Some(tasks)),
             close_lock: Mutex::new(()),
             operation_tx,
             advanced_sequence,
             synced_sequence,
             sync: options.sync,
-            target,
             state: RwLock::new(Lifecycle::Running),
         }))
     }
@@ -346,7 +226,6 @@ impl Log for SegmentLog {
             *state = Lifecycle::Closing;
         }
 
-        self.context.cancel();
         log_ignore!(
             "send-writer-close",
             self.operation_tx
@@ -365,14 +244,6 @@ impl Log for SegmentLog {
             }
         }
         drop(workers_guard);
-
-        close_tasks(&self.tasks).await;
-        if let Some(target) = &self.target {
-            match tokio::time::timeout(CLOSE_TIMEOUT, target.close()).await {
-                Ok(result) => log_ignore!("close-publish-target", result),
-                Err(error) => log_ignore!("close-publish-target-timeout", Err::<(), _>(error)),
-            }
-        }
 
         *self.state.write().await = Lifecycle::Closed;
     }
@@ -408,67 +279,6 @@ fn finish_worker(name: &'static str, worker: &mut WorkerThread, stopped: bool) {
     }
 }
 
-async fn close_tasks(tasks: &Mutex<Option<JoinSet<()>>>) {
-    let mut tasks_guard = tasks.lock().await;
-    let Some(tasks) = tasks_guard.as_mut() else {
-        return;
-    };
-    let drain = async {
-        while let Some(result) = tasks.join_next().await {
-            log_ignore!("join-background-task", result);
-        }
-    };
-    if let Err(error) = tokio::time::timeout(CLOSE_TIMEOUT, drain).await {
-        tracing::error!(error = %error, "background task close timed out; aborting tasks");
-        tasks.abort_all();
-        while let Some(result) = tasks.join_next().await {
-            log_ignore!("join-aborted-background-task", result);
-        }
-    }
-    tasks_guard.take();
-}
-
-async fn apply_after_sync(
-    context: CancellationToken,
-    mut pending_rx: mpsc::Receiver<PublishBatch>,
-    synced_sequence: watch::Receiver<Sequence>,
-    target: Arc<dyn PublishTarget>,
-) {
-    while let Some(batch) = pending_rx.recv().await {
-        let required_sequence = batch.last_sequence();
-        if let Err(error) = wait_for_sequence(synced_sequence.clone(), required_sequence).await {
-            tracing::error!(
-                required_sequence,
-                error = %error,
-                "synced-sequence watcher closed before an apply batch became durable"
-            );
-            break;
-        }
-
-        loop {
-            match target.apply(batch.clone()).await {
-                Ok(()) => break,
-                Err(error) if context.is_cancelled() => {
-                    tracing::error!(
-                        sequence = required_sequence,
-                        error = %error,
-                        "apply failed during close and was ignored"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        sequence = required_sequence,
-                        error = %error,
-                        "apply failed; it will be retried"
-                    );
-                    tokio::time::sleep(APPLY_RETRY_DELAY).await;
-                }
-            }
-        }
-    }
-}
-
 async fn wait_for_sequence(
     mut progress: watch::Receiver<Sequence>,
     required_sequence: Sequence,
@@ -486,7 +296,6 @@ async fn wait_for_sequence(
 fn writer_loop(
     mut operation_rx: mpsc::Receiver<Operation>,
     sync_tx: mpsc::Sender<Operation>,
-    pending_publish_tx: Option<mpsc::Sender<PublishBatch>>,
     advanced_sequence: watch::Sender<Sequence>,
     vfs: VfsI,
     options: LogOptions,
@@ -495,7 +304,6 @@ fn writer_loop(
     let RecoveredState {
         mut next_sequence,
         mut next_segment_number,
-        recovered_batches: _,
         mut active_segment,
     } = recovered;
     let mut dirty_segments = Vec::new();
@@ -576,18 +384,6 @@ fn writer_loop(
 
                     advanced_sequence.send_replace(incremented_sequence);
                     let _ = append_op.sequence_tx.send(Ok(sequence));
-
-                    if let Some(pending_publish_tx) = &pending_publish_tx
-                        && let Err(error) = pending_publish_tx.blocking_send(PublishBatch {
-                            first_sequence: sequence,
-                            payloads: vec![append_op.payload],
-                        })
-                    {
-                        tracing::error!(
-                            error = %error,
-                            "pending-publish queue closed; record was not published"
-                        );
-                    }
                 }
                 Operation::Sync(_) => unreachable!("sync operation sent to WAL writer"),
                 Operation::Close => {
@@ -659,19 +455,12 @@ fn sync_loop(
 
 /// Scans the WAL, repairs a truncated final record, and restores the final
 /// segment as the active buffered segment.
-fn recover_state(
-    vfs: &VfsI,
-    options: &LogOptions,
-    collect_records: bool,
-    applied_sequence: Option<Sequence>,
-) -> Result<RecoveredState, WalError> {
+fn recover_state(vfs: &VfsI, options: &LogOptions) -> Result<RecoveredState, WalError> {
     let mut next_sequence = 0;
     let mut max_segment_number: u64 = 0;
-    let mut recovered_batches = Vec::new();
     let segment_files = list_segments(vfs, &options.dir)?;
     let segment_count = segment_files.len();
     let mut active_segment = None;
-    let mut applied_found = applied_sequence.is_none();
 
     for (index, (file_number, path)) in segment_files.into_iter().enumerate() {
         let final_segment = index + 1 == segment_count;
@@ -690,8 +479,6 @@ fn recover_state(
 
         let segment = FileSegment::open(vfs, &path, file_number, WAL_SEGMENT_SIZE, file_size)?;
         let mut position = 0;
-        let mut recovered_records = Vec::new();
-
         while position < file_size {
             let (next_position, records) = match segment.read(position, RECOVERY_READ_SIZE) {
                 Ok(records) => records,
@@ -729,30 +516,12 @@ fn recover_state(
                 next_sequence = next_sequence
                     .checked_add(1)
                     .ok_or_else(|| WalError::Worker("WAL sequence space exhausted".into()))?;
-                if applied_sequence == Some(sequence) {
-                    applied_found = true;
-                }
-                if collect_records && applied_sequence.is_none_or(|applied| sequence > applied) {
-                    recovered_records.push((sequence, record.slice(8..)));
-                }
             }
             position = next_position;
-        }
-        if !recovered_records.is_empty() {
-            recovered_batches.push(PublishBatch::new(&recovered_records));
         }
         if final_segment {
             active_segment = Some(segment);
         }
-    }
-
-    if let Some(sequence) = applied_sequence
-        && !applied_found
-    {
-        return Err(WalError::Corruption {
-            path: options.dir.clone(),
-            message: format!("applied WAL sequence {sequence} does not identify a record"),
-        });
     }
 
     let next_segment_number = max_segment_number
@@ -762,7 +531,6 @@ fn recover_state(
         // Immutable state
         next_sequence,
         next_segment_number,
-        recovered_batches,
         active_segment,
     })
 }
@@ -982,50 +750,11 @@ mod tests {
 
         seed_records(&options, &records, WAL_SEGMENT_SIZE).unwrap();
 
-        let error = recover_state(&VfsI::Standard(StandardVfs), &options, false, None).unwrap_err();
+        let error = recover_state(&VfsI::Standard(StandardVfs), &options).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption { message, .. }
                 if message == "expected WAL sequence 1, found 2"
-        ));
-    }
-
-    #[test]
-    fn recovery_collects_records_after_the_applied_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let options = standard_options(dir.path());
-        let records = [
-            (0, Bytes::from_static(b"zero")),
-            (1, Bytes::from_static(b"one")),
-            (2, Bytes::from_static(b"two")),
-        ];
-        seed_records(&options, &records, WAL_SEGMENT_SIZE).unwrap();
-
-        let recovered =
-            recover_state(&VfsI::Standard(StandardVfs), &options, true, Some(1)).unwrap();
-        assert_eq!(recovered.next_sequence, 3);
-        let records = recovered
-            .recovered_batches
-            .iter()
-            .flat_map(PublishBatch::records)
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].0, 2);
-        assert_eq!(records[0].1, &Bytes::from_static(b"two"));
-    }
-
-    #[test]
-    fn recovery_rejects_an_unknown_applied_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let options = standard_options(dir.path());
-        seed_segments(&options, &[Bytes::from_static(b"record")], WAL_SEGMENT_SIZE);
-
-        let error =
-            recover_state(&VfsI::Standard(StandardVfs), &options, true, Some(1)).unwrap_err();
-        assert!(matches!(
-            error,
-            WalError::Corruption { message, .. }
-                if message == "applied WAL sequence 1 does not identify a record"
         ));
     }
 
@@ -1041,7 +770,7 @@ mod tests {
         let renamed_path = dir.path().join("0000000002.seg");
         std::fs::rename(original_path, &renamed_path).unwrap();
 
-        let error = recover_state(&VfsI::Standard(StandardVfs), &options, false, None).unwrap_err();
+        let error = recover_state(&VfsI::Standard(StandardVfs), &options).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption { path, message }
