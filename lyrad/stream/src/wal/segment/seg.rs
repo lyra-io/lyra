@@ -1,10 +1,11 @@
 //! Buffered WAL segment implementation.
 
 use super::codec::{decode_record, encode_record};
+use super::seg_reader::SegmentReader;
 use super::{Segment, WalError, make_segment_path};
 use crate::vfs::{IoFile, OpenOptions, Vfs, VfsFile, VfsI};
 use bytes::Bytes;
-use std::io::{BufReader, Read, Result as IoResult};
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,26 +68,6 @@ impl SegmentInner {
 
     fn size(&self) -> Result<u64, WalError> {
         Ok(self.file.size()?)
-    }
-}
-
-struct SegmentReader<'a> {
-    file: &'a VfsFile,
-    position: u64,
-    end: u64,
-}
-
-impl Read for SegmentReader<'_> {
-    fn read(&mut self, output: &mut [u8]) -> IoResult<usize> {
-        if output.is_empty() || self.position >= self.end {
-            return Ok(0);
-        }
-        let output_len = u64::try_from(output.len()).unwrap_or(u64::MAX);
-        let length = usize::try_from((self.end - self.position).min(output_len)).unwrap();
-        let bytes = self.file.read_at(self.position, length)?;
-        output[..length].copy_from_slice(&bytes);
-        self.position += length as u64;
-        Ok(length)
     }
 }
 

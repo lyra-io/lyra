@@ -7,11 +7,11 @@ use std::io::Result as IoResult;
 use std::path::{Path, PathBuf};
 
 mod codec;
-#[allow(clippy::module_inception)]
-mod segment;
+mod seg;
+mod seg_reader;
 
 pub(super) use super::WalError;
-pub(super) use segment::FileSegment;
+pub(super) use seg::FileSegment;
 
 const SEGMENT_EXTENSION: &str = "seg";
 
