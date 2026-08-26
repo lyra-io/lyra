@@ -16,8 +16,6 @@ pub(super) use segment::FileSegment;
 const SEGMENT_EXTENSION: &str = "seg";
 
 pub(super) trait Segment {
-    fn sequence(&self) -> u64;
-
     fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError>;
 
     fn sync(&self) -> Result<(), WalError>;
@@ -31,7 +29,7 @@ pub(in crate::wal) fn make_segment_path(dir: &Path, segment_number: u64) -> Path
     dir.join(format!("{segment_number:010}.{SEGMENT_EXTENSION}"))
 }
 
-pub(in crate::wal) fn list_segment_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
+pub(in crate::wal) fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -76,7 +74,7 @@ mod tests {
         let path = dir.path().join("1.seg");
         std::fs::write(&path, []).unwrap();
 
-        let error = list_segment_files(dir.path()).unwrap_err();
+        let error = list_segments(dir.path()).unwrap_err();
         assert!(matches!(
             error,
             WalError::Corruption {

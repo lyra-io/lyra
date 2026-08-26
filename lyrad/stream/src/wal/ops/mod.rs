@@ -6,18 +6,15 @@ use super::segment::FileSegment;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
-pub type SyncWaiter = (Sequence, oneshot::Sender<Result<Sequence, WalError>>);
-
 pub struct AppendOp {
     pub payload: Bytes,
-    pub response: oneshot::Sender<Result<Sequence, WalError>>,
+    pub sequence_tx: oneshot::Sender<Result<Sequence, WalError>>,
 }
 
 pub struct SyncOp {
     pub segments: Vec<FileSegment>,
     pub sync_directory: bool,
     pub last_sequence: Sequence,
-    pub waiters: Vec<SyncWaiter>,
 }
 
 pub(super) enum Operation {

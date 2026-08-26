@@ -136,6 +136,14 @@ pub(in crate::wal) struct FileSegment {
     write_position: u64,
 }
 
+impl PartialEq for FileSegment {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
+    }
+}
+
+impl Eq for FileSegment {}
+
 impl FileSegment {
     pub(in crate::wal) fn create(dir: &Path, number: u64, max_size: u64) -> Result<Self, WalError> {
         u32::try_from(number).map_err(|_| WalError::SegmentNumberTooLarge(number))?;
@@ -178,10 +186,6 @@ impl FileSegment {
 }
 
 impl Segment for FileSegment {
-    fn sequence(&self) -> u64 {
-        self.number
-    }
-
     /// Reads complete records whose combined payload size does not exceed
     /// `max_bytes`, returning the next unread position and the payloads.
     fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError> {
