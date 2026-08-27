@@ -66,6 +66,14 @@ struct RecoveredState {
     active_segment: Option<FileSegment>,
 }
 
+struct PendingAppend {
+    // Immutable state
+    sequence: Sequence,
+    sequence_bytes: [u8; 8],
+    payload: Bytes,
+    handle: AppendHandle,
+}
+
 impl SegmentLog {
     /// Opens the WAL at `options.dir`.
     ///
@@ -305,10 +313,12 @@ fn writer_loop(
         mut active_segment,
     } = recovered;
     let mut operations = Vec::with_capacity(MAX_INFLIGHT_APPEND_NUM);
+    let mut pending = VecDeque::with_capacity(MAX_INFLIGHT_APPEND_NUM);
     let mut record = Vec::new();
 
     loop {
         operations.clear();
+        pending.clear();
         let received = operation_rx.blocking_recv_many(&mut operations, MAX_INFLIGHT_APPEND_NUM);
         if received == 0 {
             break;
@@ -329,89 +339,140 @@ fn writer_loop(
                         break;
                     };
                     next_sequence = incremented_sequence;
-
-                    record.clear();
-                    record.reserve(8 + payload.len());
-                    record.extend_from_slice(&sequence.to_le_bytes());
-                    record.extend_from_slice(&payload);
-                    let write_result = (|| -> Result<(), WalError> {
-                        loop {
-                            if active_segment.is_none() {
-                                let number = next_segment_number;
-                                let incremented_number =
-                                    number.checked_add(1).ok_or_else(|| {
-                                        WalError::Worker(
-                                            "WAL segment number space exhausted".into(),
-                                        )
-                                    })?;
-                                active_segment = Some(FileSegment::create(
-                                    &vfs,
-                                    &options.dir,
-                                    number,
-                                    WAL_SEGMENT_SIZE,
-                                )?);
-                                next_segment_number = incremented_number;
-                            }
-
-                            match active_segment.as_ref().unwrap().append(&record) {
-                                Ok(()) => break,
-                                Err(WalError::SegmentFull) => {
-                                    let segment = active_segment.take().unwrap();
-                                    dirty_segments
-                                        .lock()
-                                        .unwrap()
-                                        .push_back(segment.sync_handle());
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = write_result {
-                        tracing::error!(sequence, error = %error, "WAL write failed");
-                        handle.finish(Err(error));
-                        stop_writer = true;
-                        break;
-                    }
-
-                    let completion = (sequence, handle);
-                    match completion_tx.try_send(completion) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(completion)) => {
-                            // Wake the syncer before blocking so it can drain
-                            // the bounded completion queue.
-                            if let Some(advanced_sequence) = batch_advanced_sequence.take() {
-                                let active = active_segment.as_ref().map(FileSegment::sync_handle);
-                                if advanced_tx.send((Some(advanced_sequence), active)).is_err() {
-                                    let error = WalError::Worker("WAL sync thread stopped".into());
-                                    tracing::error!(sequence, error = %error);
-                                    completion.1.finish(Err(error));
-                                    stop_writer = true;
-                                    break;
-                                }
-                            }
-                            if let Err(send_error) = completion_tx.blocking_send(completion) {
-                                let error = WalError::Worker("WAL sync thread stopped".into());
-                                tracing::error!(sequence, error = %error);
-                                send_error.0.1.finish(Err(error));
-                                stop_writer = true;
-                                break;
-                            }
-                        }
-                        Err(TrySendError::Closed(completion)) => {
-                            let error = WalError::Worker("WAL sync thread stopped".into());
-                            tracing::error!(sequence, error = %error);
-                            completion.1.finish(Err(error));
-                            stop_writer = true;
-                            break;
-                        }
-                    }
-                    batch_advanced_sequence = Some(sequence);
+                    pending.push_back(PendingAppend {
+                        // Immutable state
+                        sequence,
+                        sequence_bytes: sequence.to_le_bytes(),
+                        payload,
+                        handle,
+                    });
                 }
                 Operation::Close => {
                     operation_rx.close();
                     write_then_close = true;
                 }
+            }
+        }
+
+        while !pending.is_empty() {
+            if active_segment.is_none() {
+                let number = next_segment_number;
+                let Some(incremented_number) = number.checked_add(1) else {
+                    let error = WalError::Worker("WAL segment number space exhausted".into());
+                    tracing::error!(error = %error);
+                    for append in pending.drain(..) {
+                        append.handle.finish(Err(error.clone()));
+                    }
+                    stop_writer = true;
+                    break;
+                };
+                match FileSegment::create(&vfs, &options.dir, number, WAL_SEGMENT_SIZE) {
+                    Ok(segment) => {
+                        active_segment = Some(segment);
+                        next_segment_number = incremented_number;
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "WAL segment creation failed");
+                        for append in pending.drain(..) {
+                            append.handle.finish(Err(error.clone()));
+                        }
+                        stop_writer = true;
+                        break;
+                    }
+                }
+            }
+
+            let append_result = if pending.len() == 1 {
+                let append = pending.front().unwrap();
+                record.clear();
+                record.reserve(append.sequence_bytes.len() + append.payload.len());
+                record.extend_from_slice(&append.sequence_bytes);
+                record.extend_from_slice(&append.payload);
+                active_segment.as_ref().unwrap().append(&record).map(|()| 1)
+            } else {
+                active_segment.as_ref().unwrap().append_batch(
+                    pending
+                        .iter()
+                        .map(|append| (append.sequence_bytes.as_slice(), append.payload.as_ref())),
+                )
+            };
+            let appended = match append_result {
+                Ok(0) => {
+                    let error = WalError::Worker("WAL segment batch made no progress".into());
+                    tracing::error!(error = %error);
+                    for append in pending.drain(..) {
+                        append.handle.finish(Err(error.clone()));
+                    }
+                    stop_writer = true;
+                    break;
+                }
+                Ok(appended) => appended,
+                Err(WalError::SegmentFull) => {
+                    let segment = active_segment.take().unwrap();
+                    dirty_segments
+                        .lock()
+                        .unwrap()
+                        .push_back(segment.sync_handle());
+                    continue;
+                }
+                Err(error) => {
+                    let sequence = pending.front().unwrap().sequence;
+                    tracing::error!(sequence, error = %error, "WAL write failed");
+                    for append in pending.drain(..) {
+                        append.handle.finish(Err(error.clone()));
+                    }
+                    stop_writer = true;
+                    break;
+                }
+            };
+
+            for _ in 0..appended {
+                let append = pending.pop_front().unwrap();
+                let completion = (append.sequence, append.handle);
+                match completion_tx.try_send(completion) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(completion)) => {
+                        // Wake the syncer before blocking so it can drain
+                        // the bounded completion queue.
+                        if let Some(advanced_sequence) = batch_advanced_sequence.take() {
+                            let active = active_segment.as_ref().map(FileSegment::sync_handle);
+                            if advanced_tx.send((Some(advanced_sequence), active)).is_err() {
+                                let error = WalError::Worker("WAL sync thread stopped".into());
+                                tracing::error!(sequence = completion.0, error = %error);
+                                completion.1.finish(Err(error.clone()));
+                                for append in pending.drain(..) {
+                                    append.handle.finish(Err(error.clone()));
+                                }
+                                stop_writer = true;
+                                break;
+                            }
+                        }
+                        if let Err(send_error) = completion_tx.blocking_send(completion) {
+                            let error = WalError::Worker("WAL sync thread stopped".into());
+                            tracing::error!(sequence = send_error.0.0, error = %error);
+                            send_error.0.1.finish(Err(error.clone()));
+                            for append in pending.drain(..) {
+                                append.handle.finish(Err(error.clone()));
+                            }
+                            stop_writer = true;
+                            break;
+                        }
+                    }
+                    Err(TrySendError::Closed(completion)) => {
+                        let error = WalError::Worker("WAL sync thread stopped".into());
+                        tracing::error!(sequence = completion.0, error = %error);
+                        completion.1.finish(Err(error.clone()));
+                        for append in pending.drain(..) {
+                            append.handle.finish(Err(error.clone()));
+                        }
+                        stop_writer = true;
+                        break;
+                    }
+                }
+                batch_advanced_sequence = Some(append.sequence);
+            }
+            if stop_writer {
+                break;
             }
         }
 

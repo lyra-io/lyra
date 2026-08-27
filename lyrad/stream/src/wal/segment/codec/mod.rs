@@ -17,4 +17,4 @@
 mod crc;
 mod record;
 
-pub(super) use record::{decode_record, encode_record};
+pub(super) use record::{decode_record, encode_record_parts};

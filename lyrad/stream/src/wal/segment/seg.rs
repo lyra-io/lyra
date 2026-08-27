@@ -1,6 +1,6 @@
 //! Buffered WAL segment implementation.
 
-use super::codec::{decode_record, encode_record};
+use super::codec::{decode_record, encode_record_parts};
 use super::seg_reader::SegmentReader;
 use super::{Segment, WalError, make_segment_path};
 use crate::vfs::{IoFile, OpenOptions, Vfs, VfsFile, VfsI};
@@ -146,6 +146,68 @@ impl FileSegment {
             inner: Arc::clone(&self.inner),
         }
     }
+
+    /// Appends as many complete records as fit using one file write and
+    /// returns the number accepted before the segment boundary.
+    pub(in crate::wal) fn append_batch<'a>(
+        &self,
+        records: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> Result<usize, WalError> {
+        let write_position = self.inner.write_position.load(Ordering::Relaxed);
+        let mut next_position = write_position;
+        let mut encoded = Vec::new();
+        let mut appended = 0;
+
+        for (prefix, payload) in records {
+            let encoded_start = encoded.len();
+            encode_record_parts(
+                &mut encoded,
+                self.inner.number,
+                next_position,
+                prefix,
+                payload,
+            )?;
+            let encoded_size = u64::try_from(encoded.len() - encoded_start)
+                .map_err(|_| WalError::PositionExhausted)?;
+            let record_end = next_position
+                .checked_add(encoded_size)
+                .ok_or(WalError::PositionExhausted)?;
+            if record_end > self.inner.max_size {
+                encoded.truncate(encoded_start);
+                if appended == 0 {
+                    if write_position == 0 {
+                        return Err(WalError::RecordTooLarge {
+                            size: encoded_size,
+                            max: self.inner.max_size,
+                        });
+                    }
+                    return Err(WalError::SegmentFull);
+                }
+                break;
+            }
+            next_position = record_end;
+            appended += 1;
+        }
+
+        if appended == 0 {
+            return Ok(0);
+        }
+        let appended_at = self.inner.file.append(&encoded)?;
+        if appended_at != write_position {
+            return Err(WalError::corruption(
+                self.inner.path(),
+                format!(
+                    "segment {} appended at {appended_at}, expected {write_position}",
+                    self.inner.number
+                ),
+            ));
+        }
+        // Advance only after the entire encoded batch has been accepted.
+        self.inner
+            .write_position
+            .store(next_position, Ordering::Release);
+        Ok(appended)
+    }
 }
 
 impl SegmentSyncHandle {
@@ -220,36 +282,8 @@ impl Segment for FileSegment {
     }
 
     fn append(&self, payload: &[u8]) -> Result<(), WalError> {
-        let write_position = self.inner.write_position.load(Ordering::Relaxed);
-        let encoded = encode_record(self.inner.number, write_position, payload)?;
-        let encoded_size = u64::try_from(encoded.len()).map_err(|_| WalError::PositionExhausted)?;
-        let next_position = write_position
-            .checked_add(encoded_size)
-            .ok_or(WalError::PositionExhausted)?;
-        if next_position > self.inner.max_size {
-            if write_position == 0 {
-                return Err(WalError::RecordTooLarge {
-                    size: encoded_size,
-                    max: self.inner.max_size,
-                });
-            }
-            return Err(WalError::SegmentFull);
-        }
-
-        let appended_at = self.inner.file.append(&encoded)?;
-        if appended_at != write_position {
-            return Err(WalError::corruption(
-                self.inner.path(),
-                format!(
-                    "segment {} appended at {appended_at}, expected {write_position}",
-                    self.inner.number
-                ),
-            ));
-        }
-        // Advance only after the entire encoded record has been accepted.
-        self.inner
-            .write_position
-            .store(next_position, Ordering::Release);
+        let appended = self.append_batch(std::iter::once((&[][..], payload)))?;
+        debug_assert_eq!(appended, 1);
         Ok(())
     }
 
@@ -291,6 +325,36 @@ mod tests {
         let (next_position, records) = segment.read(next_position, 6).unwrap();
         assert_eq!(records, vec![Bytes::from_static(b"second")]);
         assert_eq!(next_position, 33);
+    }
+
+    #[test]
+    fn appends_multiple_records_with_one_batch() {
+        let vfs = VfsI::Memory(MemoryVfs::default());
+        let dir = Path::new("/wal");
+        vfs.create_dir(dir).unwrap();
+        let segment = FileSegment::create(&vfs, dir, 1, 4096).unwrap();
+        let records = [(&b"pre"[..], &b"fix"[..]), (&b""[..], &b"second"[..])];
+
+        assert_eq!(segment.append_batch(records), Ok(2));
+        let (_, records) = segment.read(0, 12).unwrap();
+        assert_eq!(
+            records,
+            vec![Bytes::from_static(b"prefix"), Bytes::from_static(b"second")]
+        );
+    }
+
+    #[test]
+    fn batch_stops_before_the_segment_limit() {
+        let vfs = VfsI::Memory(MemoryVfs::default());
+        let dir = Path::new("/wal");
+        vfs.create_dir(dir).unwrap();
+        let segment = FileSegment::create(&vfs, dir, 1, 16).unwrap();
+        let records = [(&b""[..], &b"first"[..]), (&b""[..], &b"second"[..])];
+
+        assert_eq!(segment.append_batch(records), Ok(1));
+        assert_eq!(segment.append(b"second"), Err(WalError::SegmentFull));
+        let (_, records) = segment.read(0, 5).unwrap();
+        assert_eq!(records, vec![Bytes::from_static(b"first")]);
     }
 
     #[test]

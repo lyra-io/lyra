@@ -30,20 +30,40 @@ impl RecordType {
     }
 }
 
+#[cfg(test)]
 pub fn encode_record(
     segment_number: u64,
     start_position: u64,
     payload: &[u8],
 ) -> Result<Vec<u8>, WalError> {
+    let mut output = Vec::with_capacity(payload.len().saturating_add(HEADER_SIZE));
+    encode_record_parts(&mut output, segment_number, start_position, &[], payload)?;
+    Ok(output)
+}
+
+pub fn encode_record_parts(
+    output: &mut Vec<u8>,
+    segment_number: u64,
+    start_position: u64,
+    prefix: &[u8],
+    payload: &[u8],
+) -> Result<(), WalError> {
     let segment_number = u32::try_from(segment_number)
         .map_err(|_| WalError::SegmentNumberTooLarge(segment_number))?;
-    let mut output = Vec::with_capacity(payload.len().saturating_add(HEADER_SIZE));
+    let output_start = output.len();
+    let payload_size = prefix
+        .len()
+        .checked_add(payload.len())
+        .ok_or(WalError::PositionExhausted)?;
     let mut consumed = 0;
     let mut first = true;
 
     loop {
         let absolute_position = start_position
-            .checked_add(u64::try_from(output.len()).map_err(|_| WalError::PositionExhausted)?)
+            .checked_add(
+                u64::try_from(output.len() - output_start)
+                    .map_err(|_| WalError::PositionExhausted)?,
+            )
             .ok_or(WalError::PositionExhausted)?;
         let position_in_block = usize::try_from(absolute_position % BLOCK_SIZE as u64)
             .map_err(|_| WalError::PositionExhausted)?;
@@ -54,26 +74,59 @@ pub fn encode_record(
         }
 
         let available = block_remaining - HEADER_SIZE;
-        let fragment_size = (payload.len() - consumed).min(available);
-        let last = consumed + fragment_size == payload.len();
+        let fragment_size = (payload_size - consumed).min(available);
+        let last = consumed + fragment_size == payload_size;
         let record_type = match (first, last) {
             (true, true) => RecordType::Full,
             (true, false) => RecordType::First,
             (false, true) => RecordType::Last,
             (false, false) => RecordType::Middle,
         };
-        encode_fragment(
-            &mut output,
+        encode_fragment_parts(
+            output,
             record_type,
             segment_number,
-            &payload[consumed..consumed + fragment_size],
+            prefix,
+            payload,
+            consumed,
+            fragment_size,
         );
         consumed += fragment_size;
         if last {
-            return Ok(output);
+            return Ok(());
         }
         first = false;
     }
+}
+
+fn encode_fragment_parts(
+    output: &mut Vec<u8>,
+    record_type: RecordType,
+    segment_number: u32,
+    prefix: &[u8],
+    payload: &[u8],
+    consumed: usize,
+    fragment_size: usize,
+) {
+    let header_start = output.len();
+    output.resize(header_start + HEADER_SIZE, 0);
+    let fragment_end = consumed + fragment_size;
+    if consumed < prefix.len() {
+        output.extend_from_slice(&prefix[consumed..fragment_end.min(prefix.len())]);
+    }
+    if fragment_end > prefix.len() {
+        let payload_start = consumed.saturating_sub(prefix.len());
+        let payload_end = fragment_end - prefix.len();
+        output.extend_from_slice(&payload[payload_start..payload_end]);
+    }
+
+    let fragment_start = header_start + HEADER_SIZE;
+    let checksum = calculate_checksum(record_type as u8, segment_number, &output[fragment_start..]);
+    output[header_start..header_start + 4].copy_from_slice(&checksum.to_le_bytes());
+    output[header_start + 4..header_start + 6]
+        .copy_from_slice(&(fragment_size as u16).to_le_bytes());
+    output[header_start + 6] = record_type as u8;
+    output[header_start + 7..header_start + 11].copy_from_slice(&segment_number.to_le_bytes());
 }
 
 pub fn decode_record(
@@ -168,25 +221,6 @@ pub fn decode_record(
             }
         }
     }
-}
-
-fn encode_fragment(
-    output: &mut Vec<u8>,
-    record_type: RecordType,
-    segment_number: u32,
-    payload: &[u8],
-) {
-    debug_assert!(payload.len() <= u16::MAX as usize);
-    let header_start = output.len();
-    output.resize(header_start + HEADER_SIZE, 0);
-    output.extend_from_slice(payload);
-
-    let checksum = calculate_checksum(record_type as u8, segment_number, payload);
-    output[header_start..header_start + 4].copy_from_slice(&checksum.to_le_bytes());
-    output[header_start + 4..header_start + 6]
-        .copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    output[header_start + 6] = record_type as u8;
-    output[header_start + 7..header_start + 11].copy_from_slice(&segment_number.to_le_bytes());
 }
 
 fn decode_fragment(
@@ -285,6 +319,47 @@ mod tests {
     }
 
     #[test]
+    fn record_parts_round_trip_across_fragments() {
+        let prefix = [0xAB; 8];
+        let payload = vec![0xCD; BLOCK_SIZE];
+        let mut encoded = Vec::new();
+        encode_record_parts(&mut encoded, 1, 0, &prefix, &payload).unwrap();
+
+        let file_end = encoded.len() as u64;
+        let (_, decoded) = decode_record(
+            &mut Cursor::new(encoded),
+            Path::new("segment"),
+            1,
+            0,
+            file_end,
+        )
+        .unwrap();
+        let mut expected = prefix.to_vec();
+        expected.extend_from_slice(&payload);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn record_parts_match_contiguous_encoding_at_block_boundaries() {
+        let prefix = [0xAB; 8];
+        for start_position in [
+            0,
+            BLOCK_SIZE as u64 - 5,
+            BLOCK_SIZE as u64 - HEADER_SIZE as u64,
+        ] {
+            for payload_size in [0, 1, BLOCK_SIZE, BLOCK_SIZE * 2] {
+                let payload = vec![0xCD; payload_size];
+                let mut contiguous = prefix.to_vec();
+                contiguous.extend_from_slice(&payload);
+                let expected = encode_record(1, start_position, &contiguous).unwrap();
+                let mut actual = Vec::new();
+                encode_record_parts(&mut actual, 1, start_position, &prefix, &payload).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
     fn truncated_logical_record_is_distinct_from_corruption() {
         let record = Bytes::from(vec![0xCD; BLOCK_SIZE]);
         let mut encoded = encode_record(1, 0, &record).unwrap();
@@ -303,8 +378,7 @@ mod tests {
 
     #[test]
     fn physical_record_round_trip() {
-        let mut encoded = Vec::new();
-        encode_fragment(&mut encoded, RecordType::Full, 7, b"payload");
+        let encoded = encode_record(7, 0, b"payload").unwrap();
 
         let encoded_size = encoded.len();
         let (record_type, payload, consumed) = decode_fragment(
