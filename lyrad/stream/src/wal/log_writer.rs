@@ -12,7 +12,6 @@ use crate::vfs::{Vfs, VfsI};
 use bytes::Bytes;
 use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
-use meta::utils::promise::Promise;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -165,21 +164,17 @@ impl LogWriter {
         }
     }
 
-    pub(super) fn append(&self, payload: Bytes) -> Promise<Sequence, WalError> {
-        let (handle, promise) = Promise::new();
+    pub(super) fn write(&self, append_op: AppendOp) {
         let Ok(state) = self.state.try_read() else {
-            handle.finish(Err(WalError::Closed));
-            return promise;
+            append_op.handle.finish(Err(WalError::Closed));
+            return;
         };
         if *state != Lifecycle::Running {
-            handle.finish(Err(WalError::Closed));
-            return promise;
+            append_op.handle.finish(Err(WalError::Closed));
+            return;
         }
 
-        match self
-            .operation_tx
-            .try_send(Operation::Append(AppendOp { payload, handle }))
-        {
+        match self.operation_tx.try_send(Operation::Append(append_op)) {
             Ok(()) => {}
             Err(TrySendError::Full(Operation::Append(append_op))) => {
                 append_op.handle.finish(Err(WalError::QueueFull));
@@ -189,7 +184,6 @@ impl LogWriter {
             }
             Err(_) => unreachable!("append queue returned a non-append operation"),
         }
-        promise
     }
 
     pub(super) async fn close(&self) {

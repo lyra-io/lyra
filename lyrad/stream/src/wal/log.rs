@@ -3,6 +3,7 @@
 use super::error::WalError;
 use super::log_syncer::LogSyncer;
 use super::log_writer::LogWriter;
+use super::ops::AppendOp;
 use super::options::LogOptions;
 use super::{Log, Sequence};
 use crate::vfs::{StandardVfs, VfsI};
@@ -41,7 +42,9 @@ impl SegmentLog {
 #[async_trait]
 impl Log for SegmentLog {
     fn append(&self, payload: Bytes) -> Promise<Sequence, WalError> {
-        self.writer.append(payload)
+        let (handle, promise) = Promise::new();
+        self.writer.write(AppendOp { payload, handle });
+        promise
     }
 
     async fn close(&self) {
