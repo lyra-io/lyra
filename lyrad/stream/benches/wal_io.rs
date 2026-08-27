@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stream::{Log, LogOptions, SegmentLog};
@@ -8,23 +9,25 @@ async fn main() {
     let records = env_usize("WAL_BENCH_RECORDS", 10_000);
     let payload_size = env_usize("WAL_BENCH_PAYLOAD", 1024);
     let concurrency = env_usize("WAL_BENCH_CONCURRENCY", 32).max(1);
+    let inflight = env_usize("WAL_BENCH_INFLIGHT", 16).max(1);
 
     println!(
-        "WAL benchmark: records={records}, payload={payload_size}B, concurrency={concurrency}, target={}",
+        "WAL benchmark: records={records}, payload={payload_size}B, concurrency={concurrency}, inflight={inflight}, target={}",
         std::env::consts::OS,
     );
 
-    run(records, payload_size, concurrency).await;
+    run("await-each", records, payload_size, concurrency, 1).await;
+    run("eager-window", records, payload_size, concurrency, inflight).await;
 }
 
-async fn run(records: usize, payload_size: usize, concurrency: usize) {
+async fn run(name: &str, records: usize, payload_size: usize, concurrency: usize, inflight: usize) {
     let dir = tempfile::tempdir().expect("create benchmark directory");
     let options = LogOptions::new(dir.path(), true);
 
     let wal = match SegmentLog::open(options).await {
         Ok(wal) => wal,
         Err(error) => {
-            println!("buffered: SKIPPED ({error})");
+            println!("{name}: SKIPPED ({error})");
             return;
         }
     };
@@ -37,9 +40,18 @@ async fn run(records: usize, payload_size: usize, concurrency: usize) {
         let count = records / concurrency + usize::from(worker < records % concurrency);
         tasks.push(tokio::spawn(async move {
             let mut latencies = Vec::with_capacity(count);
+            let mut pending = VecDeque::with_capacity(inflight);
             for _ in 0..count {
                 let append_started = Instant::now();
-                wal.append(payload.clone()).await?;
+                pending.push_back((append_started, wal.append(payload.clone())));
+                if pending.len() == inflight {
+                    let (append_started, promise) = pending.pop_front().unwrap();
+                    promise.await?;
+                    latencies.push(append_started.elapsed());
+                }
+            }
+            while let Some((append_started, promise)) = pending.pop_front() {
+                promise.await?;
                 latencies.push(append_started.elapsed());
             }
             Ok::<_, stream::WalError>(latencies)
@@ -52,7 +64,7 @@ async fn run(records: usize, payload_size: usize, concurrency: usize) {
             Ok(worker_latencies) => latencies.extend(worker_latencies),
             Err(error) => {
                 wal.close().await;
-                println!("buffered: SKIPPED ({error})");
+                println!("{name}: SKIPPED ({error})");
                 return;
             }
         }
@@ -64,7 +76,7 @@ async fn run(records: usize, payload_size: usize, concurrency: usize) {
     let operations_per_second = records as f64 / elapsed.as_secs_f64();
     let mib_per_second = operations_per_second * payload_size as f64 / (1024.0 * 1024.0);
     println!(
-        "buffered: {:.0} ops/s, {:.2} MiB/s, p50={:?}, p95={:?}, p99={:?}, elapsed={:?}",
+        "{name}: {:.0} ops/s, {:.2} MiB/s, p50={:?}, p95={:?}, p99={:?}, elapsed={:?}",
         operations_per_second,
         mib_per_second,
         percentile(&latencies, 50),
