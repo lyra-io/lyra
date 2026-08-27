@@ -4,17 +4,17 @@ use super::Sequence;
 use super::error::WalError;
 use super::segment::FileSegment;
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use meta::utils::promise::PromiseHandle;
 
 pub struct AppendOp {
     pub payload: Bytes,
-    pub result_tx: oneshot::Sender<Result<Sequence, WalError>>,
+    pub handle: PromiseHandle<Sequence, WalError>,
 }
 
 pub struct SyncOp {
     pub segments: Vec<FileSegment>,
     pub sync_directory: bool,
-    pub completion: Option<(Sequence, oneshot::Sender<Result<Sequence, WalError>>)>,
+    pub completion: Option<(Sequence, PromiseHandle<Sequence, WalError>)>,
 }
 
 pub(super) enum Operation {

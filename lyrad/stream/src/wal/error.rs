@@ -1,6 +1,6 @@
 //! Errors produced by the stream storage write-ahead log.
 
-use meta::utils::promise::PromiseDisconnected;
+use meta::utils::promise::PromiseCanceled;
 use std::io::Error;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -78,8 +78,8 @@ impl From<Error> for WalError {
     }
 }
 
-impl From<PromiseDisconnected> for WalError {
-    fn from(_: PromiseDisconnected) -> Self {
+impl From<PromiseCanceled> for WalError {
+    fn from(_: PromiseCanceled) -> Self {
         Self::Closed
     }
 }

@@ -169,26 +169,26 @@ impl Log for SegmentLog {
     /// The returned promise follows the log's configured sync policy. Dropping
     /// it discards only the result and does not cancel the accepted append.
     fn append(&self, payload: Bytes) -> Promise<Sequence, WalError> {
-        let (result_tx, promise) = Promise::new();
+        let (handle, promise) = Promise::new();
         let Ok(state) = self.state.try_read() else {
-            let _ = result_tx.send(Err(WalError::Closed));
+            handle.finish(Err(WalError::Closed));
             return promise;
         };
         if *state != Lifecycle::Running {
-            let _ = result_tx.send(Err(WalError::Closed));
+            handle.finish(Err(WalError::Closed));
             return promise;
         }
 
         match self
             .operation_tx
-            .try_send(Operation::Append(AppendOp { payload, result_tx }))
+            .try_send(Operation::Append(AppendOp { payload, handle }))
         {
             Ok(()) => {}
             Err(TrySendError::Full(Operation::Append(append_op))) => {
-                let _ = append_op.result_tx.send(Err(WalError::QueueFull));
+                append_op.handle.finish(Err(WalError::QueueFull));
             }
             Err(TrySendError::Closed(Operation::Append(append_op))) => {
-                let _ = append_op.result_tx.send(Err(WalError::Closed));
+                append_op.handle.finish(Err(WalError::Closed));
             }
             Err(_) => unreachable!("append queue returned a non-append operation"),
         }
@@ -288,12 +288,12 @@ fn writer_loop(
         for operation in operations {
             match operation {
                 Operation::Append(append_op) => {
-                    let AppendOp { payload, result_tx } = append_op;
-                    let mut result_tx = Some(result_tx);
+                    let AppendOp { payload, handle } = append_op;
+                    let mut handle = Some(handle);
                     let sequence = next_sequence;
                     let Some(incremented_sequence) = sequence.checked_add(1) else {
                         let error = WalError::Worker("WAL sequence space exhausted".into());
-                        let _ = result_tx.take().unwrap().send(Err(error));
+                        handle.take().unwrap().finish(Err(error));
                         break 'writer;
                     };
                     next_sequence = incremented_sequence;
@@ -333,7 +333,7 @@ fn writer_loop(
                     })();
                     if let Err(error) = write_result {
                         tracing::error!(sequence, error = %error, "WAL write failed");
-                        let _ = result_tx.take().unwrap().send(Err(error));
+                        handle.take().unwrap().finish(Err(error));
                         break 'writer;
                     }
 
@@ -343,7 +343,7 @@ fn writer_loop(
                     let sync_op = SyncOp {
                         segments: std::mem::take(&mut dirty_segments),
                         sync_directory: std::mem::take(&mut directory_dirty),
-                        completion: options.sync.then(|| (sequence, result_tx.take().unwrap())),
+                        completion: options.sync.then(|| (sequence, handle.take().unwrap())),
                     };
                     if let Err(send_error) = sync_tx.blocking_send(Operation::Sync(sync_op)) {
                         let error = WalError::Worker("WAL sync thread stopped".into());
@@ -351,16 +351,16 @@ fn writer_loop(
                         let Operation::Sync(mut sync_op) = send_error.0 else {
                             unreachable!("sync queue returned a non-sync operation")
                         };
-                        let result_tx = result_tx
+                        let handle = handle
                             .take()
-                            .or_else(|| sync_op.completion.take().map(|(_, result_tx)| result_tx))
+                            .or_else(|| sync_op.completion.take().map(|(_, handle)| handle))
                             .unwrap();
-                        let _ = result_tx.send(Err(error));
+                        handle.finish(Err(error));
                         break 'writer;
                     }
 
-                    if let Some(result_tx) = result_tx {
-                        let _ = result_tx.send(Ok(sequence));
+                    if let Some(handle) = handle {
+                        handle.finish(Ok(sequence));
                     }
                 }
                 Operation::Sync(_) => unreachable!("sync operation sent to WAL writer"),
@@ -411,14 +411,14 @@ fn sync_loop(mut sync_rx: mpsc::Receiver<Operation>, vfs: VfsI, dir: &Path) {
         if !segments.is_empty() {
             match perform_sync(&segments, sync_dir, &vfs, dir) {
                 Ok(()) => {
-                    for (sequence, result_tx) in completions {
-                        let _ = result_tx.send(Ok(sequence));
+                    for (sequence, handle) in completions {
+                        handle.finish(Ok(sequence));
                     }
                 }
                 Err(error) => {
                     tracing::error!(error = %error, "WAL sync failed");
-                    for (_, result_tx) in completions {
-                        let _ = result_tx.send(Err(error.clone()));
+                    for (_, handle) in completions {
+                        handle.finish(Err(error.clone()));
                     }
                     break;
                 }
