@@ -1,19 +1,29 @@
 //! WAL append and recovery event loop.
 
 use super::error::WalError;
+use super::log_syncer::LogSyncHandle;
 use super::ops::{
     AdvancedSequence, AppendCompletion, AppendHandle, AppendOp, DirtySegmentQueue, Operation,
 };
 use super::options::LogOptions;
 use super::segment::{FileSegment, Segment, list_segments};
-use super::{MAX_INFLIGHT_APPEND_NUM, Sequence, WAL_SEGMENT_SIZE};
-use crate::vfs::VfsI;
+use super::{Lifecycle, MAX_INFLIGHT_APPEND_NUM, Sequence, WAL_SEGMENT_SIZE};
+use crate::vfs::{Vfs, VfsI};
 use bytes::Bytes;
+use meta::utils::directory_lock::DirectoryLock;
+use meta::utils::logging::utils::log_ignore;
+use meta::utils::promise::Promise;
+use std::any::Any;
 use std::collections::VecDeque;
+use std::io::ErrorKind;
 use std::path::Path;
+use std::thread::{Builder as ThreadBuilder, JoinHandle};
+use std::time::Duration;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCK_FILE_NAME: &str = ".lyra-wal.lock";
 const RECOVERY_READ_SIZE: usize = WAL_SEGMENT_SIZE as usize;
 
 #[derive(Debug)]
@@ -32,8 +42,27 @@ struct PendingAppend {
     handle: AppendHandle,
 }
 
-/// Assigns sequences and appends accepted operations to WAL segments.
+/// Controls WAL append admission and the writer thread.
 pub(super) struct LogWriter {
+    // Control state
+    worker: Mutex<Option<WriterWorker>>,
+    close_lock: Mutex<()>,
+
+    // Immutable state
+    operation_tx: mpsc::Sender<Operation>,
+
+    // Mutable state
+    state: RwLock<Lifecycle>,
+}
+
+struct WriterWorker {
+    // Control state
+    handle: Option<JoinHandle<()>>,
+    done: oneshot::Receiver<()>,
+}
+
+/// Assigns sequences and appends accepted operations to WAL segments.
+struct WriterLoop {
     // Control state
     operation_rx: mpsc::Receiver<Operation>,
 
@@ -54,7 +83,162 @@ pub(super) struct LogWriter {
 }
 
 impl LogWriter {
-    pub(super) fn new(
+    pub(super) async fn new(
+        vfs: VfsI,
+        options: LogOptions,
+        sync_handle: LogSyncHandle,
+    ) -> Result<Self, WalError> {
+        vfs.create_dir(&options.dir)?;
+        let (operation_tx, operation_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
+        let LogSyncHandle {
+            advanced_tx,
+            dirty_segments,
+            completion_tx,
+        } = sync_handle;
+        let (started_tx, started) = oneshot::channel();
+        let (done_tx, done) = oneshot::channel();
+        let handle = ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
+            move || {
+                match DirectoryLock::acquire(options.dir.join(LOCK_FILE_NAME))
+                    .map_err(|error| {
+                        if error.kind() == ErrorKind::WouldBlock {
+                            WalError::Locked(options.dir.clone())
+                        } else {
+                            error.into()
+                        }
+                    })
+                    .and_then(|directory_lock| {
+                        WriterLoop::new(
+                            operation_rx,
+                            advanced_tx,
+                            dirty_segments,
+                            completion_tx,
+                            vfs,
+                            options,
+                        )
+                        .map(|writer_loop| (directory_lock, writer_loop))
+                    }) {
+                    Ok((directory_lock, writer_loop)) => {
+                        if started_tx.send(Ok(())).is_ok() {
+                            writer_loop.run();
+                        }
+                        drop(directory_lock);
+                    }
+                    Err(error) => {
+                        let _ = started_tx.send(Err(error));
+                    }
+                }
+                tracing::info!("WAL writer thread exited");
+                let _ = done_tx.send(());
+            }
+        })?;
+
+        match started.await {
+            Ok(Ok(())) => Ok(Self {
+                // Control state
+                worker: Mutex::new(Some(WriterWorker {
+                    handle: Some(handle),
+                    done,
+                })),
+                close_lock: Mutex::new(()),
+
+                // Immutable state
+                operation_tx,
+
+                // Mutable state
+                state: RwLock::new(Lifecycle::Running),
+            }),
+            Ok(Err(error)) => {
+                let _ = done.await;
+                let _ = handle.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = done.await;
+                let error = handle
+                    .join()
+                    .err()
+                    .map(panic_message)
+                    .unwrap_or_else(|| "WAL writer thread stopped during startup".into());
+                Err(WalError::Worker(error))
+            }
+        }
+    }
+
+    pub(super) fn append(&self, payload: Bytes) -> Promise<Sequence, WalError> {
+        let (handle, promise) = Promise::new();
+        let Ok(state) = self.state.try_read() else {
+            handle.finish(Err(WalError::Closed));
+            return promise;
+        };
+        if *state != Lifecycle::Running {
+            handle.finish(Err(WalError::Closed));
+            return promise;
+        }
+
+        match self
+            .operation_tx
+            .try_send(Operation::Append(AppendOp { payload, handle }))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(Operation::Append(append_op))) => {
+                append_op.handle.finish(Err(WalError::QueueFull));
+            }
+            Err(TrySendError::Closed(Operation::Append(append_op))) => {
+                append_op.handle.finish(Err(WalError::Closed));
+            }
+            Err(_) => unreachable!("append queue returned a non-append operation"),
+        }
+        promise
+    }
+
+    pub(super) async fn close(&self) {
+        let _close_guard = self.close_lock.lock().await;
+        {
+            let mut state = self.state.write().await;
+            if *state == Lifecycle::Closed {
+                return;
+            }
+            *state = Lifecycle::Closing;
+        }
+        log_ignore!(
+            "send-writer-close",
+            self.operation_tx
+                .send(Operation::Close)
+                .await
+                .map_err(|_| WalError::Closed)
+        );
+
+        let mut worker_guard = self.worker.lock().await;
+        if let Some(mut worker) = worker_guard.take() {
+            let stopped = match tokio::time::timeout(CLOSE_TIMEOUT, &mut worker.done).await {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    tracing::error!(worker = "writer", error = %error, "worker completion signal failed");
+                    true
+                }
+                Err(error) => {
+                    tracing::error!(worker = "writer", error = %error, "worker close timed out; detaching it");
+                    false
+                }
+            };
+            if let Some(handle) = worker.handle.take()
+                && stopped
+            {
+                log_ignore!(
+                    "join-writer-worker",
+                    handle.join().map_err(|panic| {
+                        WalError::Worker(format!("writer: {}", panic_message(panic)))
+                    })
+                );
+            }
+        }
+        *self.state.write().await = Lifecycle::Closed;
+    }
+}
+
+impl WriterLoop {
+    fn new(
         operation_rx: mpsc::Receiver<Operation>,
         advanced_tx: watch::Sender<AdvancedSequence>,
         dirty_segments: DirtySegmentQueue,
@@ -88,7 +272,7 @@ impl LogWriter {
         })
     }
 
-    pub(super) fn run(self) {
+    fn run(self) {
         let Self {
             mut operation_rx,
             advanced_tx,
@@ -368,6 +552,16 @@ fn decode_sequence(path: &Path, record: &[u8]) -> Result<Sequence, WalError> {
         message: "record shorter than the sequence prefix".into(),
     })?;
     Ok(u64::from_le_bytes(prefix.try_into().unwrap()))
+}
+
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "WAL writer thread panicked".into()
+    }
 }
 
 #[cfg(test)]
