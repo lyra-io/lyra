@@ -37,7 +37,7 @@ pub fn encode_record(
 ) -> Result<Vec<u8>, WalError> {
     let segment_number = u32::try_from(segment_number)
         .map_err(|_| WalError::SegmentNumberTooLarge(segment_number))?;
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(payload.len().saturating_add(HEADER_SIZE));
     let mut consumed = 0;
     let mut first = true;
 
