@@ -32,6 +32,20 @@ async fn appends_return_sequential_sequences() {
     wal.close().await;
 }
 
+#[tokio::test]
+async fn submitted_promises_complete_in_sequence_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = open_wal(standard_options(dir.path())).await.unwrap();
+    let promises: Vec<_> = (0..256u64)
+        .map(|value| wal.append(Bytes::copy_from_slice(&value.to_le_bytes())))
+        .collect();
+
+    for (expected, promise) in promises.into_iter().enumerate() {
+        assert_eq!(promise.await.unwrap(), expected as u64);
+    }
+    wal.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_callers_receive_unique_ordered_sequences() {
     let dir = tempfile::tempdir().unwrap();

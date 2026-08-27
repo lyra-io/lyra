@@ -2,23 +2,17 @@
 
 use super::Sequence;
 use super::error::WalError;
-use super::segment::FileSegment;
 use bytes::Bytes;
 use meta::utils::promise::PromiseHandle;
 
+pub(super) type AppendHandle = PromiseHandle<Sequence, WalError>;
+
 pub struct AppendOp {
     pub payload: Bytes,
-    pub handle: PromiseHandle<Sequence, WalError>,
-}
-
-pub struct SyncOp {
-    pub segments: Vec<FileSegment>,
-    pub sync_directory: bool,
-    pub completion: Option<(Sequence, PromiseHandle<Sequence, WalError>)>,
+    pub handle: AppendHandle,
 }
 
 pub(super) enum Operation {
     Append(AppendOp),
-    Sync(SyncOp),
     Close,
 }

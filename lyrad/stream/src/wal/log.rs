@@ -1,9 +1,9 @@
 //! Stateful write-ahead log implementation.
 
 use super::error::WalError;
-use super::ops::{AppendOp, Operation, SyncOp};
+use super::ops::{AppendHandle, AppendOp, Operation};
 use super::options::LogOptions;
-use super::segment::{FileSegment, Segment, list_segments, sync_all};
+use super::segment::{FileSegment, Segment, SegmentSyncHandle, list_segments, sync_all};
 use super::{Lifecycle, Log, MAX_INFLIGHT_APPEND_NUM, Sequence, WAL_SEGMENT_SIZE};
 use crate::vfs::{StandardVfs, Vfs, VfsI};
 use async_trait::async_trait;
@@ -12,13 +12,15 @@ use meta::utils::directory_lock::DirectoryLock;
 use meta::utils::logging::utils::log_ignore;
 use meta::utils::promise::Promise;
 use std::any::Any;
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::Duration;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
 /// A buffered write-ahead log backed by Lyra's segment format.
 ///
@@ -40,6 +42,10 @@ pub struct SegmentLog {
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_FILE_NAME: &str = ".lyra-wal.lock";
 const RECOVERY_READ_SIZE: usize = WAL_SEGMENT_SIZE as usize;
+
+type AdvancedSequence = (Option<Sequence>, Option<SegmentSyncHandle>);
+type AppendCompletion = (Sequence, AppendHandle);
+type DirtySegmentQueue = Arc<StdMutex<VecDeque<SegmentSyncHandle>>>;
 
 struct WorkerThreads {
     writer: WorkerThread,
@@ -70,14 +76,27 @@ impl SegmentLog {
         vfs.create_dir(&options.dir)?;
 
         let (operation_tx, operation_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
-        let (sync_tx, sync_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
+        let (completion_tx, completion_rx) = mpsc::channel(MAX_INFLIGHT_APPEND_NUM);
+        let (advanced_tx, advanced_rx) = watch::channel((None, None));
+        let dirty_segments = Arc::new(StdMutex::new(VecDeque::new()));
 
         let (sync_done_tx, sync_done) = oneshot::channel();
         let sync_handle = ThreadBuilder::new().name("lyra-wal-sync".into()).spawn({
             let dir = options.dir.clone();
             let vfs = vfs.clone();
+            let dirty_segments = Arc::clone(&dirty_segments);
+            let wait_for_sync = options.sync;
+            let runtime = RuntimeHandle::current();
             move || {
-                sync_loop(sync_rx, vfs, dir.as_path());
+                sync_loop(
+                    advanced_rx,
+                    dirty_segments,
+                    completion_rx,
+                    wait_for_sync,
+                    vfs,
+                    dir.as_path(),
+                    runtime,
+                );
                 tracing::info!("WAL sync thread exited");
                 let _ = sync_done_tx.send(());
             }
@@ -88,6 +107,7 @@ impl SegmentLog {
         let writer_handle = match ThreadBuilder::new().name("lyra-wal-writer".into()).spawn({
             let options = options.clone();
             let vfs = vfs.clone();
+            let dirty_segments = Arc::clone(&dirty_segments);
             move || {
                 match DirectoryLock::acquire(options.dir.join(LOCK_FILE_NAME))
                     .map_err(|error| {
@@ -102,7 +122,15 @@ impl SegmentLog {
                     }) {
                     Ok((directory_lock, recovered)) => {
                         if writer_started_tx.send(Ok(())).is_ok() {
-                            writer_loop(operation_rx, sync_tx, vfs, options, recovered);
+                            writer_loop(
+                                operation_rx,
+                                advanced_tx,
+                                dirty_segments,
+                                completion_tx,
+                                vfs,
+                                options,
+                                recovered,
+                            );
                         }
                         drop(directory_lock);
                     }
@@ -264,7 +292,9 @@ fn finish_worker(name: &'static str, worker: &mut WorkerThread, stopped: bool) {
 
 fn writer_loop(
     mut operation_rx: mpsc::Receiver<Operation>,
-    sync_tx: mpsc::Sender<Operation>,
+    advanced_tx: watch::Sender<AdvancedSequence>,
+    dirty_segments: DirtySegmentQueue,
+    completion_tx: mpsc::Sender<AppendCompletion>,
     vfs: VfsI,
     options: LogOptions,
     recovered: RecoveredState,
@@ -274,8 +304,6 @@ fn writer_loop(
         mut next_segment_number,
         mut active_segment,
     } = recovered;
-    let mut dirty_segments = Vec::new();
-    let mut directory_dirty = false;
 
     'writer: loop {
         let mut operations = Vec::new();
@@ -318,13 +346,16 @@ fn writer_loop(
                                     WAL_SEGMENT_SIZE,
                                 )?);
                                 next_segment_number = incremented_number;
-                                directory_dirty = true;
                             }
 
                             match active_segment.as_ref().unwrap().append(&record) {
                                 Ok(()) => break,
                                 Err(WalError::SegmentFull) => {
-                                    dirty_segments.push(active_segment.take().unwrap());
+                                    let segment = active_segment.take().unwrap();
+                                    dirty_segments
+                                        .lock()
+                                        .unwrap()
+                                        .push_back(segment.sync_handle());
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -337,33 +368,21 @@ fn writer_loop(
                         break 'writer;
                     }
 
-                    if let Some(segment) = active_segment.as_ref() {
-                        dirty_segments.push(segment.clone());
-                    }
-                    let sync_op = SyncOp {
-                        segments: std::mem::take(&mut dirty_segments),
-                        sync_directory: std::mem::take(&mut directory_dirty),
-                        completion: options.sync.then(|| (sequence, handle.take().unwrap())),
-                    };
-                    if let Err(send_error) = sync_tx.blocking_send(Operation::Sync(sync_op)) {
+                    if let Err(send_error) =
+                        completion_tx.blocking_send((sequence, handle.take().unwrap()))
+                    {
                         let error = WalError::Worker("WAL sync thread stopped".into());
                         tracing::error!(sequence, error = %error);
-                        let Operation::Sync(mut sync_op) = send_error.0 else {
-                            unreachable!("sync queue returned a non-sync operation")
-                        };
-                        let handle = handle
-                            .take()
-                            .or_else(|| sync_op.completion.take().map(|(_, handle)| handle))
-                            .unwrap();
-                        handle.finish(Err(error));
+                        send_error.0.1.finish(Err(error));
                         break 'writer;
                     }
-
-                    if let Some(handle) = handle {
-                        handle.finish(Ok(sequence));
+                    let active = active_segment.as_ref().map(FileSegment::sync_handle);
+                    if advanced_tx.send((Some(sequence), active)).is_err() {
+                        let error = WalError::Worker("WAL sync thread stopped".into());
+                        tracing::error!(sequence, error = %error);
+                        break 'writer;
                     }
                 }
-                Operation::Sync(_) => unreachable!("sync operation sent to WAL writer"),
                 Operation::Close => {
                     operation_rx.close();
                     write_then_close = true;
@@ -375,58 +394,76 @@ fn writer_loop(
             break;
         }
     }
-
-    if sync_tx.blocking_send(Operation::Close).is_err() {
-        tracing::error!("sync-operation queue closed before the close operation was delivered");
-    }
 }
 
-fn sync_loop(mut sync_rx: mpsc::Receiver<Operation>, vfs: VfsI, dir: &Path) {
-    loop {
-        let mut operations = Vec::new();
-        let received = sync_rx.blocking_recv_many(&mut operations, MAX_INFLIGHT_APPEND_NUM);
-        if received == 0 {
-            break;
-        }
+fn sync_loop(
+    mut advanced_rx: watch::Receiver<AdvancedSequence>,
+    dirty_segments: DirtySegmentQueue,
+    mut completion_rx: mpsc::Receiver<AppendCompletion>,
+    wait_for_sync: bool,
+    vfs: VfsI,
+    dir: &Path,
+    runtime: RuntimeHandle,
+) {
+    let mut previous_active_segment = None;
+    let mut deferred_completion: Option<AppendCompletion> = None;
+    while runtime.block_on(advanced_rx.changed()).is_ok() {
+        let (advanced_sequence, active_segment) = advanced_rx.borrow_and_update().clone();
+        let Some(advanced_sequence) = advanced_sequence else {
+            continue;
+        };
+        let sync_directory = active_segment != previous_active_segment;
+        previous_active_segment = active_segment.clone();
 
-        let mut segments = Vec::new();
-        let mut sync_dir = false;
+        let mut segments: Vec<_> = dirty_segments.lock().unwrap().drain(..).collect();
+        segments.extend(active_segment);
+
         let mut completions = Vec::new();
-        let mut closing = false;
-        for operation in operations {
-            match operation {
-                Operation::Sync(sync_op) => {
-                    segments.extend(sync_op.segments);
-                    sync_dir |= sync_op.sync_directory;
-                    completions.extend(sync_op.completion);
-                }
-                Operation::Append(_) => unreachable!("append operation sent to WAL sync worker"),
-                Operation::Close => {
-                    sync_rx.close();
-                    closing = true;
+        if let Some(completion) = deferred_completion.take() {
+            if completion.0 <= advanced_sequence {
+                completions.push(completion);
+            } else {
+                deferred_completion = Some(completion);
+            }
+        }
+        if deferred_completion.is_none() {
+            loop {
+                match completion_rx.try_recv() {
+                    Ok(completion) if completion.0 <= advanced_sequence => {
+                        completions.push(completion);
+                    }
+                    Ok(completion) => {
+                        deferred_completion = Some(completion);
+                        break;
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
             }
         }
 
-        if !segments.is_empty() {
-            match perform_sync(&segments, sync_dir, &vfs, dir) {
-                Ok(()) => {
-                    for (sequence, handle) in completions {
-                        handle.finish(Ok(sequence));
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(error = %error, "WAL sync failed");
-                    for (_, handle) in completions {
-                        handle.finish(Err(error.clone()));
-                    }
-                    break;
-                }
+        if !wait_for_sync {
+            for (sequence, handle) in completions.drain(..) {
+                handle.finish(Ok(sequence));
             }
         }
-
-        if closing {
+        if let Err(error) = perform_sync(&segments, sync_directory, &vfs, dir) {
+            tracing::error!(error = %error, "WAL sync failed");
+            for (_, handle) in completions {
+                handle.finish(Err(error.clone()));
+            }
+            if let Some((_, handle)) = deferred_completion.take() {
+                handle.finish(Err(error.clone()));
+            }
+            completion_rx.close();
+            while let Some((_, handle)) = completion_rx.blocking_recv() {
+                handle.finish(Err(error.clone()));
+            }
             break;
+        }
+        if wait_for_sync {
+            for (sequence, handle) in completions {
+                handle.finish(Ok(sequence));
+            }
         }
     }
 }
@@ -463,7 +500,7 @@ fn recover_state(vfs: &VfsI, options: &LogOptions) -> Result<RecoveredState, Wal
                 Err(WalError::Truncated { .. }) if final_segment => {
                     if position < file_size {
                         segment.truncate(position)?;
-                        segment.sync()?;
+                        segment.sync_handle().sync()?;
                     }
                     tracing::warn!(
                         path = %path.display(),
@@ -532,7 +569,7 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 }
 
 fn perform_sync(
-    segments: &[FileSegment],
+    segments: &[SegmentSyncHandle],
     sync_dir: bool,
     vfs: &VfsI,
     dir: &Path,
@@ -587,14 +624,14 @@ mod tests {
                 match active_segment.as_ref().unwrap().append(&record) {
                     Ok(()) => break,
                     Err(WalError::SegmentFull) => {
-                        dirty_segments.push(active_segment.take().unwrap());
+                        dirty_segments.push(active_segment.take().unwrap().sync_handle());
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
         if let Some(segment) = active_segment.as_ref() {
-            dirty_segments.push(segment.clone());
+            dirty_segments.push(segment.sync_handle());
         }
         perform_sync(&dirty_segments, true, &vfs, &options.dir)?;
         Ok(())

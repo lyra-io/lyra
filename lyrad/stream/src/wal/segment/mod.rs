@@ -11,22 +11,19 @@ mod seg;
 mod seg_reader;
 
 pub(super) use super::WalError;
-pub(super) use seg::FileSegment;
+pub(super) use seg::{FileSegment, SegmentSyncHandle};
 
 const SEGMENT_EXTENSION: &str = "seg";
 
 /// One append-only WAL segment.
 ///
 /// Positions are physical byte offsets in the encoded segment file. The WAL
-/// owns rotation and recovery; a segment only appends, reads, synchronizes, or
-/// truncates its own file. The caller must serialize append and truncate calls.
+/// owns rotation and recovery; a segment only appends, reads, or truncates its
+/// own file. The caller must serialize append and truncate calls.
 pub(super) trait Segment {
     /// Reads complete logical records starting at `position` without exceeding
     /// `max_bytes` of decoded payload, and returns the next unread position.
     fn read(&self, position: u64, max_bytes: usize) -> Result<(u64, Vec<Bytes>), WalError>;
-
-    /// Makes all bytes visible before synchronization durable.
-    fn sync(&self) -> Result<(), WalError>;
 
     /// Appends one logical record or returns [`WalError::SegmentFull`] without
     /// modifying the segment when rotation is required.

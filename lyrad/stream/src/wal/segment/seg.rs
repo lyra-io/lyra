@@ -78,14 +78,20 @@ pub(in crate::wal) struct FileSegment {
     inner: Arc<SegmentInner>,
 }
 
-impl PartialEq for FileSegment {
+/// A cheap, cloneable capability for synchronizing one WAL segment.
+#[derive(Debug, Clone)]
+pub(in crate::wal) struct SegmentSyncHandle {
+    // Immutable state
+    inner: Arc<SegmentInner>,
+}
+
+impl PartialEq for SegmentSyncHandle {
     fn eq(&self, other: &Self) -> bool {
-        // Sync deduplication is based on shared segment identity.
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
-impl Eq for FileSegment {}
+impl Eq for SegmentSyncHandle {}
 
 impl FileSegment {
     pub(in crate::wal) fn create(
@@ -132,6 +138,24 @@ impl FileSegment {
             // Immutable state
             inner,
         })
+    }
+
+    pub(in crate::wal) fn sync_handle(&self) -> SegmentSyncHandle {
+        SegmentSyncHandle {
+            // Immutable state
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl SegmentSyncHandle {
+    pub(in crate::wal) fn sync(&self) -> Result<(), WalError> {
+        // Capture the eviction boundary before syncing so a concurrent later
+        // append cannot make us evict bytes that this call may not have synced.
+        let write_position = self.inner.write_position.load(Ordering::Acquire);
+        self.inner.file.sync()?;
+        self.inner.file.discard_cache(write_position);
+        Ok(())
     }
 }
 
@@ -193,15 +217,6 @@ impl Segment for FileSegment {
 
         self.inner.file.discard_cache(position);
         Ok((position, records))
-    }
-
-    fn sync(&self) -> Result<(), WalError> {
-        // Capture the eviction boundary before syncing so a concurrent later
-        // append cannot make us evict bytes that this call may not have synced.
-        let write_position = self.inner.write_position.load(Ordering::Acquire);
-        self.inner.file.sync()?;
-        self.inner.file.discard_cache(write_position);
-        Ok(())
     }
 
     fn append(&self, payload: &[u8]) -> Result<(), WalError> {
@@ -267,7 +282,7 @@ mod tests {
         let segment = FileSegment::create(&vfs, dir.path(), 1, 4096).unwrap();
         segment.append(b"first").unwrap();
         segment.append(b"second").unwrap();
-        segment.sync().unwrap();
+        segment.sync_handle().sync().unwrap();
 
         let (next_position, records) = segment.read(0, 5).unwrap();
         assert_eq!(records, vec![Bytes::from_static(b"first")]);
