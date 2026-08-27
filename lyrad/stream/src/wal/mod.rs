@@ -2,6 +2,8 @@
 
 mod error;
 mod log;
+mod log_syncer;
+mod log_writer;
 mod ops;
 mod options;
 mod segment;
