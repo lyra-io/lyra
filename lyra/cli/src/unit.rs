@@ -12,8 +12,8 @@ const DEFAULT_PID_FILE: &str = "lyra-unit.pid";
 /// Placeholder for the unit runtime.
 ///
 /// The original `Unit` (gRPC service over storage) lived in the monolithic
-/// `lyrad` crate and was removed when storage split into the `meta`/`stream`/
-/// `tiered` crates. It has not been ported yet, so startup fails fast with a
+/// `lyrad` crate and was removed when storage split into the `meta` and
+/// `stream` crates. It has not been ported yet, so startup fails fast with a
 /// clear message instead of silently doing nothing.
 pub struct Unit;
 

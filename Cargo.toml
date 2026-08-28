@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+    "lyrad/function",
     "lyrad/meta",
+    "lyrad/sql",
     "lyrad/stream",
-    "lyrad/tiered",
+    "lyrad/table",
     "lyra/liblyra",
     "lyra/cli",
 ]
