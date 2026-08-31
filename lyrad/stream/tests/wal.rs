@@ -203,13 +203,23 @@ async fn write_failure_does_not_strand_its_caller() {
     let wal = open_wal(standard_options(&wal_dir)).await.unwrap();
     std::fs::rename(&wal_dir, moved_dir).unwrap();
 
-    let result = tokio::time::timeout(
+    let first_error = tokio::time::timeout(
         Duration::from_secs(5),
         wal.append(Bytes::from_static(b"blocked")),
     )
     .await
-    .expect("append timed out");
-    assert!(matches!(result, Err(WalError::Io(_))));
+    .expect("first append timed out")
+    .unwrap_err();
+    assert!(matches!(first_error, WalError::Io(_)));
+
+    let second_error = tokio::time::timeout(
+        Duration::from_secs(5),
+        wal.append(Bytes::from_static(b"also blocked")),
+    )
+    .await
+    .expect("second append timed out")
+    .unwrap_err();
+    assert_eq!(second_error, first_error);
 
     tokio::time::timeout(Duration::from_secs(5), wal.close())
         .await

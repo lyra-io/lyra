@@ -23,29 +23,15 @@ struct SegmentInner {
 }
 
 impl SegmentInner {
-    fn create(vfs: &VfsI, path: &Path, number: u64, max_size: u64) -> Result<Self, WalError> {
-        Self::open0(vfs, path, number, max_size, 0, true)
-    }
-
     fn open(
         vfs: &VfsI,
         path: &Path,
         number: u64,
         max_size: u64,
         write_position: u64,
+        create_if_missing: bool,
     ) -> Result<Self, WalError> {
-        Self::open0(vfs, path, number, max_size, write_position, false)
-    }
-
-    fn open0(
-        vfs: &VfsI,
-        path: &Path,
-        number: u64,
-        max_size: u64,
-        write_position: u64,
-        create_new: bool,
-    ) -> Result<Self, WalError> {
-        let options = if create_new {
+        let options = if create_if_missing {
             OpenOptions::CreateNew
         } else {
             OpenOptions::Existing
@@ -101,11 +87,13 @@ impl FileSegment {
         max_size: u64,
     ) -> Result<Self, WalError> {
         u32::try_from(number).map_err(|_| WalError::SegmentNumberTooLarge(number))?;
-        let inner = Arc::new(SegmentInner::create(
+        let inner = Arc::new(SegmentInner::open(
             vfs,
             &make_segment_path(dir, number),
             number,
             max_size,
+            0,
+            true,
         )?);
         Ok(Self {
             // Immutable state
@@ -127,6 +115,7 @@ impl FileSegment {
             number,
             max_size,
             write_position,
+            false,
         )?);
         if write_position > max_size || inner.size()? != write_position {
             return Err(WalError::corruption(

@@ -3,7 +3,7 @@
 use super::error::WalError;
 use super::log_syncer::LogSyncHandle;
 use super::ops::{
-    AdvancedSequence, AppendCompletion, AppendHandle, AppendOp, DirtySegmentQueue, Operation,
+    AdvancedSequence, AppendCompletion, AppendOp, AppendPromiseHandle, DirtySegmentQueue, Operation,
 };
 use super::options::LogOptions;
 use super::segment::{FileSegment, Segment, list_segments};
@@ -38,7 +38,7 @@ struct PendingAppend {
     sequence: Sequence,
     sequence_bytes: [u8; 8],
     payload: Bytes,
-    handle: AppendHandle,
+    handle: AppendPromiseHandle,
 }
 
 /// Controls WAL append admission and the writer thread.
@@ -282,6 +282,7 @@ impl WriterLoop {
             mut record,
         } = self;
 
+        let mut writer_error: Option<WalError> = None;
         loop {
             operations.clear();
             pending.clear();
@@ -292,18 +293,21 @@ impl WriterLoop {
             }
 
             let mut write_then_close = false;
-            let mut stop_writer = false;
             let mut batch_advanced_sequence = None;
             for operation in operations.drain(..) {
                 match operation {
                     Operation::Append(append_op) => {
                         let AppendOp { payload, handle } = append_op;
+                        if let Some(error) = writer_error.as_ref() {
+                            handle.finish(Err(error.clone()));
+                            continue;
+                        }
                         let sequence = next_sequence;
                         let Some(incremented_sequence) = sequence.checked_add(1) else {
                             let error = WalError::Worker("WAL sequence space exhausted".into());
-                            handle.finish(Err(error));
-                            stop_writer = true;
-                            break;
+                            handle.finish(Err(error.clone()));
+                            writer_error = Some(error);
+                            continue;
                         };
                         next_sequence = incremented_sequence;
                         pending.push_back(PendingAppend {
@@ -330,7 +334,7 @@ impl WriterLoop {
                         for append in pending.drain(..) {
                             append.handle.finish(Err(error.clone()));
                         }
-                        stop_writer = true;
+                        writer_error = Some(error);
                         break;
                     };
                     match FileSegment::create(&vfs, &options.dir, number, WAL_SEGMENT_SIZE) {
@@ -343,7 +347,7 @@ impl WriterLoop {
                             for append in pending.drain(..) {
                                 append.handle.finish(Err(error.clone()));
                             }
-                            stop_writer = true;
+                            writer_error = Some(error);
                             break;
                         }
                     }
@@ -370,7 +374,7 @@ impl WriterLoop {
                         for append in pending.drain(..) {
                             append.handle.finish(Err(error.clone()));
                         }
-                        stop_writer = true;
+                        writer_error = Some(error);
                         break;
                     }
                     Ok(appended) => appended,
@@ -388,7 +392,7 @@ impl WriterLoop {
                         for append in pending.drain(..) {
                             append.handle.finish(Err(error.clone()));
                         }
-                        stop_writer = true;
+                        writer_error = Some(error);
                         break;
                     }
                 };
@@ -410,7 +414,7 @@ impl WriterLoop {
                                     for append in pending.drain(..) {
                                         append.handle.finish(Err(error.clone()));
                                     }
-                                    stop_writer = true;
+                                    writer_error = Some(error);
                                     break;
                                 }
                             }
@@ -421,7 +425,7 @@ impl WriterLoop {
                                 for append in pending.drain(..) {
                                     append.handle.finish(Err(error.clone()));
                                 }
-                                stop_writer = true;
+                                writer_error = Some(error);
                                 break;
                             }
                         }
@@ -432,14 +436,11 @@ impl WriterLoop {
                             for append in pending.drain(..) {
                                 append.handle.finish(Err(error.clone()));
                             }
-                            stop_writer = true;
+                            writer_error = Some(error);
                             break;
                         }
                     }
                     batch_advanced_sequence = Some(append.sequence);
-                }
-                if stop_writer {
-                    break;
                 }
             }
 
@@ -448,10 +449,10 @@ impl WriterLoop {
                 if advanced_tx.send((Some(advanced_sequence), active)).is_err() {
                     let error = WalError::Worker("WAL sync thread stopped".into());
                     tracing::error!(advanced_sequence, error = %error);
-                    stop_writer = true;
+                    writer_error = Some(error);
                 }
             }
-            if write_then_close || stop_writer {
+            if write_then_close {
                 break;
             }
         }
