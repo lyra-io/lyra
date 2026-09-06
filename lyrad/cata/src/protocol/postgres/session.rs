@@ -1,7 +1,7 @@
-use crate::postgres::DataFusionStatement;
-use crate::postgres::parser::{CataQueryParser, to_pgwire_error};
-use crate::query::{CatalogStatement, parse_catalog_statement};
+use super::DataFusionStatement;
+use super::parser::{CataQueryParser, to_pgwire_error};
 use crate::service::SecretService;
+use crate::sql::{CatalogStatement, parse_catalog_statement};
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use datafusion_postgres::DfSessionService;

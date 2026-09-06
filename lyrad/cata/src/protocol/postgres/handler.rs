@@ -1,4 +1,4 @@
-use crate::postgres::CataSessionService;
+use super::CataSessionService;
 use datafusion::prelude::SessionContext;
 use datafusion_postgres::pgwire::api::PgWireServerHandlers;
 use datafusion_postgres::pgwire::api::auth::StartupHandler;

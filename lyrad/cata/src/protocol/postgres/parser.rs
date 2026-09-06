@@ -1,6 +1,6 @@
+use super::DataFusionStatement;
 use crate::CataError;
-use crate::postgres::DataFusionStatement;
-use crate::query::parse_catalog_statement;
+use crate::sql::parse_catalog_statement;
 use async_trait::async_trait;
 use datafusion_postgres::Parser as DataFusionParser;
 use datafusion_postgres::pgwire::api::portal::Format;

@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::query::{CatalogStatement, CreateSecret};
+use crate::sql::{CatalogStatement, CreateSecret};
 use datafusion::sql::sqlparser::ast::{DollarQuotedString, Value};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;

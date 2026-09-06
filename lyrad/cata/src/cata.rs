@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::options::CataOptions;
-use crate::planner::SqlPlanner;
-use crate::postgres::PostgresServer;
+use crate::protocol::PostgresServer;
+use crate::sql::SqlPlanner;
 use datafusion::logical_expr::LogicalPlan;
 use meta::metadata::Metadata;
 use std::sync::Arc;

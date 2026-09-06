@@ -1,4 +1,4 @@
-use crate::query::CreateSecret;
+use crate::sql::CreateSecret;
 use crate::{CataError, Result};
 use meta::metadata::{Metadata, MetadataError, MetadataPutCondition};
 use meta::proto::pb_catalog::Secret;

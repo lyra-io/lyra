@@ -1,6 +1,6 @@
+use super::handler::PostgresHandler;
 use crate::Result;
 use crate::options::PostgresOptions;
-use crate::postgres::handler::PostgresHandler;
 use datafusion::prelude::SessionContext;
 use datafusion_postgres::{ServerOptions, serve_with_handlers};
 use meta::metadata::Metadata;
