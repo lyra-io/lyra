@@ -4,4 +4,16 @@ version = "0.1.0"
 edition = "2024"
 resolver = "3"
 
+[[bin]]
+name = "lyra-cata"
+path = "src/main.rs"
+
 [dependencies]
+clap = { workspace = true }
+datafusion = { workspace = true }
+datafusion-pg-catalog = { workspace = true }
+datafusion-postgres = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
