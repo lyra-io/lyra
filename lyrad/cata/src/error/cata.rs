@@ -35,8 +35,29 @@ pub enum CataError {
     #[error("database {0:?} does not exist")]
     DatabaseNotFound(String),
 
+    #[error("database {0:?} already exists")]
+    DatabaseAlreadyExists(String),
+
+    #[error("database {0:?} changed concurrently")]
+    DatabaseChanged(String),
+
+    #[error("database {0:?} is the current or default database")]
+    DatabaseInUse(String),
+
+    #[error("database {0:?} is not empty")]
+    DatabaseNotEmpty(String),
+
     #[error("schema {schema:?} does not exist in database {database:?}")]
     SchemaNotFound { database: String, schema: String },
+
+    #[error("schema {schema:?} already exists in database {database:?}")]
+    SchemaAlreadyExists { database: String, schema: String },
+
+    #[error("schema {schema:?} changed concurrently in database {database:?}")]
+    SchemaChanged { database: String, schema: String },
+
+    #[error("schema {schema:?} is not empty in database {database:?}")]
+    SchemaNotEmpty { database: String, schema: String },
 
     #[error("PostgreSQL server failed: {0}")]
     Server(#[from] io::Error),

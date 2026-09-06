@@ -8,8 +8,15 @@ pub(crate) fn to_pgwire_error(error: CataError) -> PgWireError {
         CataError::SecretNotFound(_) => ("ERROR", "42704"),
         CataError::SecretChanged(_) => ("ERROR", "40001"),
         CataError::SecretInUse { .. } => ("ERROR", "2BP01"),
-        CataError::DatabaseNotFound(_) => ("FATAL", "3D000"),
+        CataError::DatabaseNotFound(_) => ("ERROR", "3D000"),
+        CataError::DatabaseAlreadyExists(_) => ("ERROR", "42P04"),
+        CataError::DatabaseChanged(_) => ("ERROR", "40001"),
+        CataError::DatabaseInUse(_) => ("ERROR", "55006"),
+        CataError::DatabaseNotEmpty(_) => ("ERROR", "2BP01"),
         CataError::SchemaNotFound { .. } => ("ERROR", "3F000"),
+        CataError::SchemaAlreadyExists { .. } => ("ERROR", "42P06"),
+        CataError::SchemaChanged { .. } => ("ERROR", "40001"),
+        CataError::SchemaNotEmpty { .. } => ("ERROR", "2BP01"),
         _ => ("ERROR", "XX000"),
     };
     PgWireError::UserError(Box::new(ErrorInfo::new(

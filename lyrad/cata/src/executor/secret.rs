@@ -1,3 +1,4 @@
+use super::matches_like;
 use crate::sql::{AlterSecret, CreateSecret, DropSecret, SecretName, ShowSecrets};
 use crate::{CataError, Result};
 use meta::metadata::{
@@ -184,7 +185,7 @@ impl SecretExecutor {
                     .filter(|secret| {
                         statement
                             .like()
-                            .is_none_or(|pattern| like0(&secret.value().name, pattern))
+                            .is_none_or(|pattern| matches_like(&secret.value().name, pattern))
                     })
                     .map(|secret| format!("{schema}.{}", secret.value().name)),
             );
@@ -235,59 +236,5 @@ impl SecretExecutor {
             .schema()
             .or_else(|| schemas.first().map(String::as_str))
             .unwrap_or(DEFAULT_SCHEMA_NAME)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum LikeToken {
-    Any,
-    One,
-    Literal(char),
-}
-
-fn like0(value: &str, pattern: &str) -> bool {
-    let mut tokens = Vec::new();
-    let mut chars = pattern.chars();
-    while let Some(character) = chars.next() {
-        tokens.push(match character {
-            '%' => LikeToken::Any,
-            '_' => LikeToken::One,
-            '\\' => LikeToken::Literal(chars.next().unwrap_or('\\')),
-            character => LikeToken::Literal(character),
-        });
-    }
-
-    let value = value.chars().collect::<Vec<_>>();
-    let mut matched = vec![false; value.len() + 1];
-    matched[0] = true;
-    for token in tokens {
-        let mut next = vec![false; value.len() + 1];
-        if matches!(token, LikeToken::Any) {
-            next[0] = matched[0];
-        }
-        for index in 1..=value.len() {
-            next[index] = match token {
-                LikeToken::Any => next[index - 1] || matched[index],
-                LikeToken::One => matched[index - 1],
-                LikeToken::Literal(character) => {
-                    matched[index - 1] && value[index - 1] == character
-                }
-            };
-        }
-        matched = next;
-    }
-    matched[value.len()]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matches_sql_like_patterns() {
-        assert!(like0("kafka_password", "kafka%"));
-        assert!(like0("secret1", "secret_"));
-        assert!(like0("literal_percent%", r"literal\_percent\%"));
-        assert!(!like0("Kafka_password", "kafka%"));
     }
 }

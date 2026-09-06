@@ -2,8 +2,9 @@ use crate::Result;
 use crate::error::to_pgwire_error;
 use crate::handler::{DatabaseHandles, client_database};
 use crate::sql::{
-    AlterSecret, CatalogStatement, CreateSecret, DropSecret, SecretName, SecretStatement,
-    ShowSecrets,
+    AlterDatabase, AlterSchema, AlterSecret, CatalogStatement, CreateDatabase, CreateSchema,
+    CreateSecret, DatabaseStatement, DropDatabase, DropSchema, DropSecret, SchemaName,
+    SchemaStatement, SecretName, SecretStatement, ShowDatabases, ShowSchemas, ShowSecrets,
 };
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
@@ -32,39 +33,90 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
         let secret = parse_secret_name0(&mut parser)?;
         parser.expect_keyword(Keyword::VALUE)?;
         let value = parse_secret_value0(&mut parser, "CREATE SECRET")?;
-        SecretStatement::Create(CreateSecret::new(secret, value, if_not_exists))
+        CatalogStatement::Secret(SecretStatement::Create(CreateSecret::new(
+            secret,
+            value,
+            if_not_exists,
+        )))
+    } else if parser.parse_keywords(&[Keyword::CREATE, Keyword::DATABASE]) {
+        let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+        CatalogStatement::Database(DatabaseStatement::Create(CreateDatabase::new(
+            parse_identifier0(&mut parser)?,
+            if_not_exists,
+        )))
+    } else if parser.parse_keywords(&[Keyword::CREATE, Keyword::SCHEMA]) {
+        let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+        CatalogStatement::Schema(SchemaStatement::Create(CreateSchema::new(
+            parse_schema_name0(&mut parser)?,
+            if_not_exists,
+        )))
     } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::SECRET]) {
         let secret = parse_secret_name0(&mut parser)?;
         parser.expect_keyword(Keyword::VALUE)?;
         let value = parse_secret_value0(&mut parser, "ALTER SECRET")?;
-        SecretStatement::Alter(AlterSecret::new(secret, value))
+        CatalogStatement::Secret(SecretStatement::Alter(AlterSecret::new(secret, value)))
+    } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::DATABASE]) {
+        let name = parse_identifier0(&mut parser)?;
+        parser.expect_keywords(&[Keyword::RENAME, Keyword::TO])?;
+        CatalogStatement::Database(DatabaseStatement::Alter(AlterDatabase::new(
+            name,
+            parse_identifier0(&mut parser)?,
+        )))
+    } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::SCHEMA]) {
+        let schema = parse_schema_name0(&mut parser)?;
+        parser.expect_keywords(&[Keyword::RENAME, Keyword::TO])?;
+        CatalogStatement::Schema(SchemaStatement::Alter(AlterSchema::new(
+            schema,
+            parse_identifier0(&mut parser)?,
+        )))
     } else if parser.parse_keywords(&[Keyword::DROP, Keyword::SECRET]) {
         let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        SecretStatement::Drop(DropSecret::new(parse_secret_name0(&mut parser)?, if_exists))
+        CatalogStatement::Secret(SecretStatement::Drop(DropSecret::new(
+            parse_secret_name0(&mut parser)?,
+            if_exists,
+        )))
+    } else if parser.parse_keywords(&[Keyword::DROP, Keyword::DATABASE]) {
+        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        CatalogStatement::Database(DatabaseStatement::Drop(DropDatabase::new(
+            parse_identifier0(&mut parser)?,
+            if_exists,
+        )))
+    } else if parser.parse_keywords(&[Keyword::DROP, Keyword::SCHEMA]) {
+        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let schema = parse_schema_name0(&mut parser)?;
+        let cascade = parser.parse_keyword(Keyword::CASCADE);
+        CatalogStatement::Schema(SchemaStatement::Drop(DropSchema::new(
+            schema, if_exists, cascade,
+        )))
     } else if parser.parse_keyword(Keyword::SHOW) {
         let object = parse_identifier0(&mut parser)?;
-        if !object.eq_ignore_ascii_case("secrets") {
-            return Ok(None);
+        match object.as_str() {
+            "databases" => CatalogStatement::Database(DatabaseStatement::Show(ShowDatabases::new(
+                parse_like0(&mut parser, "SHOW DATABASES")?,
+            ))),
+            "schemas" => CatalogStatement::Schema(SchemaStatement::Show(ShowSchemas::new(
+                parse_like0(&mut parser, "SHOW SCHEMAS")?,
+            ))),
+            "secrets" => {
+                let schema = if parser.parse_keyword(Keyword::FROM) {
+                    Some(parse_identifier0(&mut parser)?)
+                } else {
+                    None
+                };
+                CatalogStatement::Secret(SecretStatement::Show(ShowSecrets::new(
+                    schema,
+                    parse_like0(&mut parser, "SHOW SECRETS")?,
+                )))
+            }
+            _ => return Ok(None),
         }
-
-        let schema = if parser.parse_keyword(Keyword::FROM) {
-            Some(parse_identifier0(&mut parser)?)
-        } else {
-            None
-        };
-        let like = if parser.parse_keyword(Keyword::LIKE) {
-            Some(parse_secret_pattern0(&mut parser)?)
-        } else {
-            None
-        };
-        SecretStatement::Show(ShowSecrets::new(schema, like))
     } else {
         return Ok(None);
     };
 
     let _ = parser.consume_token(&Token::SemiColon);
     parser.expect_token(&Token::EOF)?;
-    Ok(Some(CatalogStatement::Secret(statement)))
+    Ok(Some(statement))
 }
 
 fn parse_secret_value0(parser: &mut Parser, statement: &str) -> Result<Vec<u8>> {
@@ -82,13 +134,26 @@ fn parse_secret_value0(parser: &mut Parser, statement: &str) -> Result<Vec<u8>> 
     Ok(value)
 }
 
-fn parse_secret_pattern0(parser: &mut Parser) -> Result<String> {
+fn parse_like0(parser: &mut Parser, statement: &str) -> Result<Option<String>> {
+    if !parser.parse_keyword(Keyword::LIKE) {
+        return Ok(None);
+    }
+
     match parser.parse_value()?.value {
-        Value::SingleQuotedString(value) | Value::EscapedStringLiteral(value) => Ok(value),
-        _ => Err(ParserError::ParserError(
-            "SHOW SECRETS LIKE pattern must be a string literal".to_string(),
-        )
+        Value::SingleQuotedString(value) | Value::EscapedStringLiteral(value) => Ok(Some(value)),
+        _ => Err(ParserError::ParserError(format!(
+            "{statement} LIKE pattern must be a string literal"
+        ))
         .into()),
+    }
+}
+
+fn parse_schema_name0(parser: &mut Parser) -> Result<SchemaName> {
+    let first = parse_identifier0(parser)?;
+    if parser.consume_token(&Token::Period) {
+        Ok(SchemaName::new(Some(first), parse_identifier0(parser)?))
+    } else {
+        Ok(SchemaName::new(None, first))
     }
 }
 
@@ -110,7 +175,7 @@ fn parse_identifier0(parser: &mut Parser) -> Result<String> {
     }
 }
 
-pub(crate) fn show_secrets_fields(column_format: Option<&Format>) -> Vec<FieldInfo> {
+pub(crate) fn show_names_fields(column_format: Option<&Format>) -> Vec<FieldInfo> {
     let format = column_format
         .map(|format| format.format_for(0))
         .unwrap_or(FieldFormat::Text);
@@ -177,13 +242,13 @@ impl QueryParser for CataQueryParser {
         column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
         if let Some(statement) = parse_catalog_statement(&statement.0).map_err(to_pgwire_error)? {
-            return if matches!(
-                statement,
-                CatalogStatement::Secret(SecretStatement::Show(_))
-            ) {
-                Ok(show_secrets_fields(column_format))
-            } else {
-                Ok(Vec::new())
+            return match statement {
+                CatalogStatement::Database(DatabaseStatement::Show(_))
+                | CatalogStatement::Schema(SchemaStatement::Show(_))
+                | CatalogStatement::Secret(SecretStatement::Show(_)) => {
+                    Ok(show_names_fields(column_format))
+                }
+                _ => Ok(Vec::new()),
             };
         }
 
@@ -195,6 +260,113 @@ impl QueryParser for CataQueryParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_create_database() {
+        let statement = parse_catalog_statement("CREATE DATABASE IF NOT EXISTS Analytics")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Database(DatabaseStatement::Create(statement)) = statement else {
+            panic!("expected CREATE DATABASE")
+        };
+        assert_eq!(statement.name(), "analytics");
+        assert!(statement.if_not_exists());
+    }
+
+    #[test]
+    fn parses_alter_database_rename() {
+        let statement = parse_catalog_statement("ALTER DATABASE analytics RENAME TO warehouse")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Database(DatabaseStatement::Alter(statement)) = statement else {
+            panic!("expected ALTER DATABASE")
+        };
+        assert_eq!(statement.name(), "analytics");
+        assert_eq!(statement.new_name(), "warehouse");
+    }
+
+    #[test]
+    fn parses_drop_database() {
+        let statement = parse_catalog_statement("DROP DATABASE IF EXISTS analytics")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Database(DatabaseStatement::Drop(statement)) = statement else {
+            panic!("expected DROP DATABASE")
+        };
+        assert_eq!(statement.name(), "analytics");
+        assert!(statement.if_exists());
+    }
+
+    #[test]
+    fn parses_show_databases_like_pattern() {
+        let statement = parse_catalog_statement("SHOW DATABASES LIKE 'analytics%'")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Database(DatabaseStatement::Show(statement)) = statement else {
+            panic!("expected SHOW DATABASES")
+        };
+        assert_eq!(statement.like(), Some("analytics%"));
+    }
+
+    #[test]
+    fn parses_create_qualified_schema() {
+        let statement = parse_catalog_statement("CREATE SCHEMA IF NOT EXISTS Analytics.Events")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Schema(SchemaStatement::Create(statement)) = statement else {
+            panic!("expected CREATE SCHEMA")
+        };
+        assert_eq!(statement.schema().database(), Some("analytics"));
+        assert_eq!(statement.schema().name(), "events");
+        assert!(statement.if_not_exists());
+    }
+
+    #[test]
+    fn parses_alter_qualified_schema_rename() {
+        let statement =
+            parse_catalog_statement("ALTER SCHEMA analytics.events RENAME TO archived_events")
+                .unwrap()
+                .unwrap();
+
+        let CatalogStatement::Schema(SchemaStatement::Alter(statement)) = statement else {
+            panic!("expected ALTER SCHEMA")
+        };
+        assert_eq!(statement.schema().database(), Some("analytics"));
+        assert_eq!(statement.schema().name(), "events");
+        assert_eq!(statement.new_name(), "archived_events");
+    }
+
+    #[test]
+    fn parses_drop_schema_cascade() {
+        let statement = parse_catalog_statement("DROP SCHEMA IF EXISTS analytics.events CASCADE")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Schema(SchemaStatement::Drop(statement)) = statement else {
+            panic!("expected DROP SCHEMA")
+        };
+        assert_eq!(statement.schema().database(), Some("analytics"));
+        assert_eq!(statement.schema().name(), "events");
+        assert!(statement.if_exists());
+        assert!(statement.cascade());
+    }
+
+    #[test]
+    fn parses_show_schemas_like_pattern() {
+        let statement = parse_catalog_statement("SHOW SCHEMAS LIKE 'event%'")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::Schema(SchemaStatement::Show(statement)) = statement else {
+            panic!("expected SHOW SCHEMAS")
+        };
+        assert_eq!(statement.like(), Some("event%"));
+    }
 
     #[test]
     fn parses_create_secret() {

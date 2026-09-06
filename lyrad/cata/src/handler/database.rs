@@ -35,6 +35,10 @@ impl DatabaseHandles {
         &self.default
     }
 
+    pub(crate) fn remove(&self, database: &str) {
+        self.handles.remove(database);
+    }
+
     fn handle0(database: &str) -> Result<Arc<DfSessionService>> {
         let planner = SqlPlanner::new(database)?;
         Ok(Arc::new(DfSessionService::new(Arc::clone(
