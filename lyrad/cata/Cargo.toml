@@ -9,10 +9,12 @@ name = "lyra-cata"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 clap = { workspace = true }
 datafusion = { workspace = true }
 datafusion-pg-catalog = { workspace = true }
 datafusion-postgres = { workspace = true }
+futures-util = { workspace = true }
 meta = { path = "../meta" }
 thiserror = { workspace = true }
 tokio = { workspace = true }

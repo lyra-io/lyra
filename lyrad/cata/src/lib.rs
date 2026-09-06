@@ -8,6 +8,7 @@ pub mod config;
 mod error;
 mod planner;
 mod postgres;
+mod query;
 mod service;
 
 pub use error::{CataError, Result};

@@ -1,4 +1,5 @@
 use datafusion::error::DataFusionError;
+use datafusion::sql::sqlparser::parser::ParserError;
 use meta::metadata::MetadataError;
 use std::io;
 use thiserror::Error;
@@ -7,6 +8,9 @@ pub type Result<T> = std::result::Result<T, CataError>;
 
 #[derive(Debug, Error)]
 pub enum CataError {
+    #[error("invalid SQL: {0}")]
+    Sql(#[from] ParserError),
+
     #[error("failed to plan SQL: {0}")]
     Plan(#[from] DataFusionError),
 
@@ -15,6 +19,9 @@ pub enum CataError {
 
     #[error(transparent)]
     Metadata(#[from] MetadataError),
+
+    #[error("secret {0:?} already exists")]
+    SecretAlreadyExists(String),
 
     #[error("PostgreSQL server failed: {0}")]
     Server(#[from] io::Error),

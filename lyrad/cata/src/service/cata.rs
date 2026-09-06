@@ -34,6 +34,7 @@ impl Cata {
     pub async fn serve(&self) -> Result<()> {
         PostgresServer::new(
             Arc::clone(self.planner.context()),
+            Arc::clone(&self.metadata),
             self.options.postgres().clone(),
         )
         .serve()
