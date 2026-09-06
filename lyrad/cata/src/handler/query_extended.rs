@@ -1,5 +1,5 @@
 use super::QueryHandler;
-use super::client_database;
+use super::{client_database, client_schemas};
 use crate::error::to_pgwire_error;
 use crate::sql::{CataQueryParser, DataFusionStatement, parse_catalog_statement};
 use async_trait::async_trait;
@@ -36,9 +36,17 @@ impl ExtendedQueryHandler for QueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let database = client_database(client).to_string();
+        let schemas = client_schemas(client);
         let sql = &portal.statement.statement.0;
         if let Some(statement) = parse_catalog_statement(sql).map_err(to_pgwire_error)? {
-            return self.execute(&database, statement).await;
+            return self
+                .execute(
+                    &database,
+                    &schemas,
+                    statement,
+                    Some(&portal.result_column_format),
+                )
+                .await;
         }
 
         let datafusion = self.databases.get(&database).map_err(to_pgwire_error)?;

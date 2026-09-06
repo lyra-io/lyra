@@ -23,6 +23,15 @@ pub enum CataError {
     #[error("secret {0:?} already exists")]
     SecretAlreadyExists(String),
 
+    #[error("secret {0:?} does not exist")]
+    SecretNotFound(String),
+
+    #[error("secret {0:?} changed concurrently")]
+    SecretChanged(String),
+
+    #[error("cannot drop secret {secret:?} because connection {connection:?} depends on it")]
+    SecretInUse { secret: String, connection: String },
+
     #[error("database {0:?} does not exist")]
     DatabaseNotFound(String),
 

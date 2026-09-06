@@ -1,5 +1,5 @@
 use super::QueryHandler;
-use super::client_database;
+use super::{client_database, client_schemas};
 use crate::error::to_pgwire_error;
 use crate::sql::parse_catalog_statement;
 use async_trait::async_trait;
@@ -22,8 +22,11 @@ impl SimpleQueryHandler for QueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let database = client_database(client).to_string();
+        let schemas = client_schemas(client);
         if let Some(statement) = parse_catalog_statement(query).map_err(to_pgwire_error)? {
-            return Ok(vec![self.execute(&database, statement).await?]);
+            return Ok(vec![
+                self.execute(&database, &schemas, statement, None).await?,
+            ]);
         }
 
         let datafusion = self.databases.get(&database).map_err(to_pgwire_error)?;
