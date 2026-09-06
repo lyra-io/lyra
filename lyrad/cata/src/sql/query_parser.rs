@@ -1,0 +1,61 @@
+use crate::error::to_pgwire_error;
+use crate::sql::parse_catalog_statement;
+use async_trait::async_trait;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::sqlparser::ast::Statement;
+use datafusion_postgres::Parser as DataFusionParser;
+use datafusion_postgres::pgwire::api::portal::Format;
+use datafusion_postgres::pgwire::api::results::FieldInfo;
+use datafusion_postgres::pgwire::api::stmt::QueryParser;
+use datafusion_postgres::pgwire::api::{ClientInfo, Type};
+use datafusion_postgres::pgwire::error::PgWireResult;
+use std::sync::Arc;
+
+pub(crate) type DataFusionStatement = (String, Option<(Statement, LogicalPlan)>);
+
+pub(crate) struct CataQueryParser {
+    // Immutable state
+    datafusion: Arc<DataFusionParser>,
+}
+
+impl CataQueryParser {
+    pub(crate) fn new(datafusion: Arc<DataFusionParser>) -> Self {
+        Self { datafusion }
+    }
+}
+
+#[async_trait]
+impl QueryParser for CataQueryParser {
+    type Statement = DataFusionStatement;
+
+    async fn parse_sql<C>(
+        &self,
+        client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        if parse_catalog_statement(sql)
+            .map_err(to_pgwire_error)?
+            .is_some()
+        {
+            return Ok((sql.to_string(), None));
+        }
+
+        self.datafusion.parse_sql(client, sql, types).await
+    }
+
+    fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        self.datafusion.get_parameter_types(statement)
+    }
+
+    fn get_result_schema(
+        &self,
+        statement: &Self::Statement,
+        column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        self.datafusion.get_result_schema(statement, column_format)
+    }
+}

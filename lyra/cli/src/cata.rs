@@ -1,5 +1,5 @@
 use cata::Cata;
-use cata::options::{CataOptions, PostgresOptions};
+use cata::options::CataOptions;
 use clap::Args;
 use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use serde::Deserialize;
@@ -31,12 +31,6 @@ struct MetaOptions {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CataProcessOptions {
-    postgres: PostgresProcessOptions,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PostgresProcessOptions {
     host: String,
     port: u16,
     max_connections: usize,
@@ -46,15 +40,15 @@ pub async fn run(args: CataArgs) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt().with_target(false).try_init();
 
     let options = read_options(&args.config)?;
-    let PostgresProcessOptions {
+    let CataProcessOptions {
         host,
         port,
         max_connections,
-    } = options.cata.postgres;
-    let postgres = PostgresOptions::new(host.clone(), port).with_max_connections(max_connections);
+    } = options.cata;
+    let cata_options = CataOptions::new(host.clone(), port).with_max_connections(max_connections);
     let oxia = OxiaOptions::new(options.meta.service_address, options.meta.namespace);
     let metadata = Arc::new(OxiaMetadata::new(&oxia).await?);
-    let cata = Cata::new(CataOptions::new(postgres), metadata)?;
+    let cata = Cata::new(cata_options, metadata)?;
 
     info!(
         config = %args.config.display(),
@@ -86,7 +80,7 @@ mod tests {
             .expect("lyrad options should parse");
 
         assert_eq!(options.meta.namespace, "default");
-        assert_eq!(options.cata.postgres.host, "127.0.0.1");
-        assert_eq!(options.cata.postgres.port, 5432);
+        assert_eq!(options.cata.host, "127.0.0.1");
+        assert_eq!(options.cata.port, 5432);
     }
 }

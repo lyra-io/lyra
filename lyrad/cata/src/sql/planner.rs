@@ -1,5 +1,4 @@
 use crate::Result;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_pg_catalog::{pg_catalog::context::EmptyContextProvider, setup_pg_catalog};
 use std::sync::Arc;
@@ -23,24 +22,7 @@ impl SqlPlanner {
         Ok(Self { context })
     }
 
-    pub async fn plan(&self, sql: &str) -> Result<LogicalPlan> {
-        Ok(self.context.state().create_logical_plan(sql).await?)
-    }
-
     pub(crate) fn context(&self) -> &Arc<SessionContext> {
         &self.context
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn creates_a_logical_plan_without_executing_it() {
-        let planner = SqlPlanner::new().unwrap();
-        let plan = planner.plan("SELECT 1 + 2 AS result").await.unwrap();
-
-        assert!(plan.display_indent().to_string().contains("Projection"));
     }
 }
