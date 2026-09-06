@@ -1,6 +1,6 @@
 use super::DataFusionStatement;
 use super::parser::{CataQueryParser, to_pgwire_error};
-use crate::service::SecretService;
+use crate::handler::SecretHandler;
 use crate::sql::{CatalogStatement, SecretStatement, parse_catalog_statement};
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
@@ -17,18 +17,18 @@ use meta::metadata::Metadata;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-pub struct CataSessionService {
+pub struct SessionHandler {
     // Immutable state
     datafusion: Arc<DfSessionService>,
     parser: Arc<CataQueryParser>,
-    secrets: SecretService,
+    secrets: SecretHandler,
 }
 
-impl CataSessionService {
+impl SessionHandler {
     pub fn new(context: Arc<SessionContext>, metadata: Arc<dyn Metadata>) -> Self {
         let datafusion = Arc::new(DfSessionService::new(context));
         let parser = Arc::new(CataQueryParser::new(datafusion.query_parser()));
-        let secrets = SecretService::new(metadata);
+        let secrets = SecretHandler::new(metadata);
         Self {
             datafusion,
             parser,
@@ -50,7 +50,7 @@ impl CataSessionService {
 }
 
 #[async_trait]
-impl SimpleQueryHandler for CataSessionService {
+impl SimpleQueryHandler for SessionHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -67,7 +67,7 @@ impl SimpleQueryHandler for CataSessionService {
 }
 
 #[async_trait]
-impl ExtendedQueryHandler for CataSessionService {
+impl ExtendedQueryHandler for SessionHandler {
     type Statement = DataFusionStatement;
     type QueryParser = CataQueryParser;
 

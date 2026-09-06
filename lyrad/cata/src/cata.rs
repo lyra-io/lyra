@@ -1,8 +1,9 @@
 use crate::Result;
 use crate::options::CataOptions;
-use crate::protocol::PostgresServer;
+use crate::protocol::ProtocolHandler;
 use crate::sql::SqlPlanner;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion_postgres::{ServerOptions, serve_with_handlers};
 use meta::metadata::Metadata;
 use std::sync::Arc;
 
@@ -32,12 +33,17 @@ impl Cata {
     }
 
     pub async fn serve(&self) -> Result<()> {
-        PostgresServer::new(
+        let postgres = self.options.postgres();
+        let options = ServerOptions::new()
+            .with_host(postgres.host().to_string())
+            .with_port(postgres.port())
+            .with_max_connections(postgres.max_connections());
+        let handler = Arc::new(ProtocolHandler::new(
             Arc::clone(self.planner.context()),
             Arc::clone(&self.metadata),
-            self.options.postgres().clone(),
-        )
-        .serve()
-        .await
+        ));
+
+        serve_with_handlers(handler, &options).await?;
+        Ok(())
     }
 }

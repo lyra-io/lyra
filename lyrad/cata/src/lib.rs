@@ -7,8 +7,8 @@ pub mod options;
 
 mod cata;
 mod error;
+mod handler;
 mod protocol;
-mod service;
 mod sql;
 
 pub use cata::Cata;

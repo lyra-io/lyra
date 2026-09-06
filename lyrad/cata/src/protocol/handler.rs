@@ -1,4 +1,4 @@
-use super::CataSessionService;
+use super::SessionHandler;
 use datafusion::prelude::SessionContext;
 use datafusion_postgres::pgwire::api::PgWireServerHandlers;
 use datafusion_postgres::pgwire::api::auth::StartupHandler;
@@ -9,27 +9,27 @@ use datafusion_postgres::pgwire::api::{ConnectionManager, ErrorHandler, NoopHand
 use meta::metadata::Metadata;
 use std::sync::Arc;
 
-pub struct PostgresHandler {
+pub struct ProtocolHandler {
     // Control state
     cancel: Arc<DefaultCancelHandler>,
 
     // Immutable state
-    session: Arc<CataSessionService>,
+    session: Arc<SessionHandler>,
     startup: Arc<PostgresStartupHandler>,
 }
 
-impl PostgresHandler {
+impl ProtocolHandler {
     pub fn new(context: Arc<SessionContext>, metadata: Arc<dyn Metadata>) -> Self {
         let connection_manager = Arc::new(ConnectionManager::new());
         Self {
             cancel: Arc::new(DefaultCancelHandler::new(Arc::clone(&connection_manager))),
-            session: Arc::new(CataSessionService::new(context, metadata)),
+            session: Arc::new(SessionHandler::new(context, metadata)),
             startup: Arc::new(PostgresStartupHandler::new(connection_manager)),
         }
     }
 }
 
-impl PgWireServerHandlers for PostgresHandler {
+impl PgWireServerHandlers for ProtocolHandler {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         Arc::clone(&self.session)
     }

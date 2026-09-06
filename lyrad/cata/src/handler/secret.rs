@@ -10,12 +10,12 @@ pub enum CreateSecretOutcome {
     AlreadyExists,
 }
 
-pub struct SecretService {
+pub struct SecretHandler {
     // Immutable state
     metadata: Arc<dyn Metadata>,
 }
 
-impl SecretService {
+impl SecretHandler {
     pub fn new(metadata: Arc<dyn Metadata>) -> Self {
         Self { metadata }
     }
