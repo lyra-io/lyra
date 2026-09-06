@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::sql::{CatalogStatement, CreateSecret};
+use crate::sql::{CatalogStatement, CreateSecret, SecretStatement};
 use datafusion::sql::sqlparser::ast::{DollarQuotedString, Value};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -38,10 +38,8 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
     let _ = parser.consume_token(&Token::SemiColon);
     parser.expect_token(&Token::EOF)?;
 
-    Ok(Some(CatalogStatement::CreateSecret(CreateSecret::new(
-        name,
-        value,
-        if_not_exists,
+    Ok(Some(CatalogStatement::Secret(SecretStatement::Create(
+        CreateSecret::new(name, value, if_not_exists),
     ))))
 }
 
@@ -56,7 +54,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-        let CatalogStatement::CreateSecret(statement) = statement;
+        let CatalogStatement::Secret(SecretStatement::Create(statement)) = statement;
         assert_eq!(statement.name(), "kafka_password");
         assert_eq!(statement.value(), b"s3cr3t");
         assert!(statement.if_not_exists());
@@ -69,7 +67,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-        let CatalogStatement::CreateSecret(statement) = statement;
+        let CatalogStatement::Secret(SecretStatement::Create(statement)) = statement;
         assert_eq!(statement.name(), "Kafka_Password");
         assert_eq!(statement.value(), b"multi\nline");
     }

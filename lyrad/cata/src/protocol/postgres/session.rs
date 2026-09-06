@@ -1,7 +1,7 @@
 use super::DataFusionStatement;
 use super::parser::{CataQueryParser, to_pgwire_error};
 use crate::service::SecretService;
-use crate::sql::{CatalogStatement, parse_catalog_statement};
+use crate::sql::{CatalogStatement, SecretStatement, parse_catalog_statement};
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use datafusion_postgres::DfSessionService;
@@ -38,7 +38,7 @@ impl CataSessionService {
 
     async fn execute(&self, statement: CatalogStatement) -> PgWireResult<Response> {
         match statement {
-            CatalogStatement::CreateSecret(statement) => {
+            CatalogStatement::Secret(SecretStatement::Create(statement)) => {
                 self.secrets
                     .create(&statement)
                     .await

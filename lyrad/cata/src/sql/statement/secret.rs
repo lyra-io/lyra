@@ -1,6 +1,6 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CatalogStatement {
-    CreateSecret(CreateSecret),
+pub enum SecretStatement {
+    Create(CreateSecret),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
