@@ -4,19 +4,14 @@ version = "0.1.0"
 edition = "2024"
 resolver = "3"
 
-[[bin]]
-name = "lyra-cata"
-path = "src/main.rs"
-
 [dependencies]
 async-trait = { workspace = true }
-clap = { workspace = true }
 datafusion = { workspace = true }
 datafusion-pg-catalog = { workspace = true }
 datafusion-postgres = { workspace = true }
 futures-util = { workspace = true }
 meta = { path = "../meta" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
 tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }

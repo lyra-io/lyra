@@ -1,0 +1,8 @@
+[meta]
+service_address = "127.0.0.1:6648"
+namespace = "default"
+
+[cata.postgres]
+host = "127.0.0.1"
+port = 5432
+max_connections = 0

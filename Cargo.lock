@@ -830,7 +830,6 @@ name = "cata"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "clap",
  "datafusion",
  "datafusion-pg-catalog",
  "datafusion-postgres",
@@ -838,8 +837,6 @@ dependencies = [
  "meta",
  "thiserror",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2709,6 +2706,7 @@ dependencies = [
  "clap",
  "futures-util",
  "libc",
+ "meta",
  "serde",
  "tokio",
  "toml",

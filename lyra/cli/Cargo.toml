@@ -16,6 +16,7 @@ arrow-schema = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
+meta = { path = "../../lyrad/meta" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
