@@ -13,25 +13,25 @@ pub(crate) struct Session {
     // Immutable state
     pub(super) datafusion: Arc<DfSessionService>,
     pub(super) parser: Arc<CataQueryParser>,
-    secrets: SecretHandler,
+    secret_handler: SecretHandler,
 }
 
 impl Session {
     pub(crate) fn new(context: Arc<SessionContext>, metadata: Arc<dyn Metadata>) -> Self {
         let datafusion = Arc::new(DfSessionService::new(context));
         let parser = Arc::new(CataQueryParser::new(datafusion.query_parser()));
-        let secrets = SecretHandler::new(metadata);
+        let secret_handler = SecretHandler::new(metadata);
         Self {
             datafusion,
             parser,
-            secrets,
+            secret_handler,
         }
     }
 
     pub(super) async fn execute(&self, statement: CatalogStatement) -> PgWireResult<Response> {
         match statement {
             CatalogStatement::Secret(SecretStatement::Create(statement)) => {
-                self.secrets
+                self.secret_handler
                     .create(&statement)
                     .await
                     .map_err(to_pgwire_error)?;

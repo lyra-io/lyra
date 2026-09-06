@@ -1,10 +1,22 @@
 use crate::Result;
+use crate::error::to_pgwire_error;
 use crate::sql::{CatalogStatement, CreateSecret, SecretStatement};
-use datafusion::sql::sqlparser::ast::{DollarQuotedString, Value};
+use async_trait::async_trait;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::sqlparser::ast::{DollarQuotedString, Statement, Value};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
+use datafusion_postgres::Parser as DataFusionParser;
+use datafusion_postgres::pgwire::api::portal::Format;
+use datafusion_postgres::pgwire::api::results::FieldInfo;
+use datafusion_postgres::pgwire::api::stmt::QueryParser;
+use datafusion_postgres::pgwire::api::{ClientInfo, Type};
+use datafusion_postgres::pgwire::error::PgWireResult;
+use std::sync::Arc;
+
+pub(crate) type DataFusionStatement = (String, Option<(Statement, LogicalPlan)>);
 
 pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
     let dialect = PostgreSqlDialect {};
@@ -41,6 +53,53 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
     Ok(Some(CatalogStatement::Secret(SecretStatement::Create(
         CreateSecret::new(name, value, if_not_exists),
     ))))
+}
+
+pub(crate) struct CataQueryParser {
+    // Immutable state
+    datafusion: Arc<DataFusionParser>,
+}
+
+impl CataQueryParser {
+    pub(crate) fn new(datafusion: Arc<DataFusionParser>) -> Self {
+        Self { datafusion }
+    }
+}
+
+#[async_trait]
+impl QueryParser for CataQueryParser {
+    type Statement = DataFusionStatement;
+
+    async fn parse_sql<C>(
+        &self,
+        client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        if parse_catalog_statement(sql)
+            .map_err(to_pgwire_error)?
+            .is_some()
+        {
+            return Ok((sql.to_string(), None));
+        }
+
+        self.datafusion.parse_sql(client, sql, types).await
+    }
+
+    fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        self.datafusion.get_parameter_types(statement)
+    }
+
+    fn get_result_schema(
+        &self,
+        statement: &Self::Statement,
+        column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        self.datafusion.get_result_schema(statement, column_format)
+    }
 }
 
 #[cfg(test)]
