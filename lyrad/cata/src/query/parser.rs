@@ -22,7 +22,7 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
         identifier.value.to_ascii_lowercase()
     };
 
-    parser.expect_keyword(Keyword::AS)?;
+    parser.expect_keyword(Keyword::VALUE)?;
     let value = match parser.parse_value()?.value {
         Value::SingleQuotedString(value)
         | Value::EscapedStringLiteral(value)
@@ -52,7 +52,7 @@ mod tests {
     #[test]
     fn parses_create_secret() {
         let statement =
-            parse_catalog_statement("CREATE SECRET IF NOT EXISTS Kafka_Password AS 's3cr3t';")
+            parse_catalog_statement("CREATE SECRET IF NOT EXISTS Kafka_Password VALUE 's3cr3t';")
                 .unwrap()
                 .unwrap();
 
@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn preserves_quoted_secret_name() {
         let statement =
-            parse_catalog_statement("CREATE SECRET \"Kafka_Password\" AS $$multi\nline$$")
+            parse_catalog_statement("CREATE SECRET \"Kafka_Password\" VALUE $$multi\nline$$")
                 .unwrap()
                 .unwrap();
 
@@ -81,8 +81,15 @@ mod tests {
 
     #[test]
     fn rejects_non_string_secret_value() {
-        let error = parse_catalog_statement("CREATE SECRET password AS 42").unwrap_err();
+        let error = parse_catalog_statement("CREATE SECRET password VALUE 42").unwrap_err();
 
         assert!(error.to_string().contains("must be a string literal"));
+    }
+
+    #[test]
+    fn rejects_as_before_secret_value() {
+        let error = parse_catalog_statement("CREATE SECRET password AS 's3cr3t'").unwrap_err();
+
+        assert!(error.to_string().contains("VALUE"), "{error}");
     }
 }
