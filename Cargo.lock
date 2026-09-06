@@ -127,6 +127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -824,6 +833,7 @@ dependencies = [
  "datafusion",
  "datafusion-pg-catalog",
  "datafusion-postgres",
+ "meta",
  "thiserror",
  "tokio",
  "tracing",
@@ -1965,6 +1975,9 @@ dependencies = [
 [[package]]
 name = "func"
 version = "0.1.0"
+dependencies = [
+ "meta",
+]
 
 [[package]]
 name = "futures"
@@ -2751,9 +2764,12 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 name = "meta"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
+ "oxia-client",
  "prost",
  "prost-build",
+ "thiserror",
  "tokio",
  "tonic",
  "tonic-build",
@@ -2961,6 +2977,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "oxia-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc4e632f1d124fcb9f087981b9ef8289bca30a9b92e3c50a5eb726c0502dab7a"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "dashmap",
+ "futures",
+ "prost",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-build",
+ "tonic-types",
+ "tracing",
+ "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4142,6 +4180,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic-types"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07439468da24d5f211d3f3bd7b63665d8f45072804457e838a87414a478e2db8"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4733,6 +4782,12 @@ dependencies = [
  "thiserror",
  "zeroize",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

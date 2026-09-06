@@ -2,6 +2,47 @@ syntax = "proto3";
 
 package io.lyra.proto.catalog.v1;
 
+message Connection {
+  string name = 1;
+  map<string, string> options = 2;
+  repeated SecretRef secret_refs = 3;
+}
+
+message Secret {
+  string name = 1;
+  bytes value = 2;
+}
+
+message SecretRef {
+  string name = 1;
+  string data = 2;
+}
+
+message Source {
+  string name = 1;
+  map<string, string> options = 2;
+}
+
+message Sink {
+  string name = 1;
+  map<string, string> options = 2;
+}
+
+message Column {
+  string name = 1;
+  string data_type = 2;
+  bool nullable = 3;
+}
+
+message Table {
+  string name = 1;
+  string source = 2;
+  string sink = 3;
+  repeated Column columns = 4;
+  repeated string primary_key = 5;
+  map<string, string> options = 6;
+}
+
 message StreamMeta {
   string name = 1;
   int64 stream_id = 2;

@@ -3,10 +3,12 @@
 //! Cata parses and plans queries, maintains the cluster view through Oxia,
 //! and distributes execution tasks to Func runtimes.
 
+pub mod config;
+
 mod error;
-mod options;
-mod server;
+mod planner;
+mod postgres;
+mod service;
 
 pub use error::{CataError, Result};
-pub use options::CataOptions;
-pub use server::Cata;
+pub use service::Cata;

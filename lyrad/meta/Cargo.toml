@@ -5,9 +5,12 @@ edition = "2024"
 resolver = "3"
 
 [dependencies]
+async-trait = { workspace = true }
 libc = { workspace = true }
+oxia-client = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [build-dependencies]

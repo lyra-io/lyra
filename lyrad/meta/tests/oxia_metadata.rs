@@ -1,0 +1,136 @@
+use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
+use meta::metadata::{Metadata, MetadataPutCondition};
+use meta::proto::pb_catalog::{Column, Connection, Secret, SecretRef, Sink, Source, Table};
+use std::collections::HashMap;
+use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[tokio::test]
+#[ignore = "requires an Oxia service configured by OXIA_SERVICE_ADDRESS"]
+async fn stores_typed_protobuf_metadata() {
+    let address = env::var("OXIA_SERVICE_ADDRESS").unwrap();
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let secret_name = format!("test-secret-{suffix}");
+    let connection_name = format!("test-connection-{suffix}");
+    let source_name = format!("test-source-{suffix}");
+    let sink_name = format!("test-sink-{suffix}");
+    let table_name = format!("test-table-{suffix}");
+    let metadata = OxiaMetadata::new(&OxiaOptions::new(address, "default"))
+        .await
+        .unwrap();
+
+    let secret_version = metadata
+        .put_secret(
+            Secret {
+                name: secret_name.clone(),
+                value: b"password".to_vec().into(),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
+    let connection_version = metadata
+        .put_connection(
+            Connection {
+                name: connection_name.clone(),
+                options: HashMap::from([
+                    ("type".to_string(), "kafka".to_string()),
+                    ("brokers".to_string(), "localhost:9092".to_string()),
+                ]),
+                secret_refs: vec![SecretRef {
+                    name: "sasl_password".to_string(),
+                    data: secret_name.clone(),
+                }],
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
+    let source_version = metadata
+        .put_source(
+            Source {
+                name: source_name.clone(),
+                options: HashMap::from([
+                    ("connection".to_string(), connection_name.clone()),
+                    ("topic".to_string(), "orders".to_string()),
+                ]),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
+    let sink_version = metadata
+        .put_sink(
+            Sink {
+                name: sink_name.clone(),
+                options: HashMap::from([
+                    ("connection".to_string(), connection_name.clone()),
+                    ("topic".to_string(), "orders-output".to_string()),
+                ]),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
+    let table_version = metadata
+        .put_table(
+            Table {
+                name: table_name.clone(),
+                source: source_name.clone(),
+                sink: sink_name.clone(),
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                }],
+                primary_key: vec!["id".to_string()],
+                options: HashMap::new(),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
+
+    let stored = metadata
+        .get_connection(&connection_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.value().name, connection_name);
+    assert_eq!(stored.value().options["type"], "kafka");
+    assert_eq!(stored.value().secret_refs[0].data, secret_name);
+    assert_eq!(
+        metadata
+            .get_table(&table_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .value()
+            .source,
+        source_name
+    );
+
+    metadata
+        .delete_table(&table_name, Some(table_version))
+        .await
+        .unwrap();
+    metadata
+        .delete_sink(&sink_name, Some(sink_version))
+        .await
+        .unwrap();
+    metadata
+        .delete_source(&source_name, Some(source_version))
+        .await
+        .unwrap();
+    metadata
+        .delete_connection(&connection_name, Some(connection_version))
+        .await
+        .unwrap();
+    metadata
+        .delete_secret(&secret_name, Some(secret_version))
+        .await
+        .unwrap();
+}

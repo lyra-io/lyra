@@ -13,6 +13,7 @@ clap = { workspace = true }
 datafusion = { workspace = true }
 datafusion-pg-catalog = { workspace = true }
 datafusion-postgres = { workspace = true }
+meta = { path = "../meta" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

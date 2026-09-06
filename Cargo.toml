@@ -44,7 +44,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9.8"
 tokio-stream = "0.1"
 serde_json = "1.0"
-liboxia = "0.0.2"
+oxia-client = "0.1.0"
 axum = "0.8"
 memmap2 = "0.9"
 libc = "0.2"

@@ -2,13 +2,13 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5432;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CataOptions {
+pub struct PostgresOptions {
     host: String,
     port: u16,
     max_connections: usize,
 }
 
-impl CataOptions {
+impl PostgresOptions {
     pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
             host: host.into(),
@@ -35,7 +35,7 @@ impl CataOptions {
     }
 }
 
-impl Default for CataOptions {
+impl Default for PostgresOptions {
     fn default() -> Self {
         Self::new(DEFAULT_HOST, DEFAULT_PORT)
     }
@@ -46,8 +46,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_postgresql_address() {
-        let options = CataOptions::default();
+    fn defaults_to_the_postgresql_address() {
+        let options = PostgresOptions::default();
 
         assert_eq!(options.host(), "127.0.0.1");
         assert_eq!(options.port(), 5432);
@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn constructs_custom_options() {
-        let options = CataOptions::new("0.0.0.0", 15432).with_max_connections(128);
+        let options = PostgresOptions::new("0.0.0.0", 15432).with_max_connections(128);
 
         assert_eq!(options.host(), "0.0.0.0");
         assert_eq!(options.port(), 15432);

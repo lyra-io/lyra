@@ -1,7 +1,8 @@
-//! Lyra protocol definitions.
+//! Shared Lyra metadata and protocol contracts.
 //!
-//! The generated gRPC service and message types for the Lyra wire protocol,
-//! compiled from the `.proto` sources in `proto/` at build time.
+//! This crate provides protobuf types shared by Cata and Func, together with
+//! the metadata interface and its Oxia-backed implementation.
 
+pub mod metadata;
 pub mod proto;
 pub mod utils;
