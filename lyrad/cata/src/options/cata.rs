@@ -1,4 +1,4 @@
-use crate::config::PostgresOptions;
+use crate::options::PostgresOptions;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CataOptions {

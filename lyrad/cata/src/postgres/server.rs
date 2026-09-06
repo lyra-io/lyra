@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::config::PostgresOptions;
+use crate::options::PostgresOptions;
 use crate::postgres::handler::PostgresHandler;
 use datafusion::prelude::SessionContext;
 use datafusion_postgres::{ServerOptions, serve_with_handlers};

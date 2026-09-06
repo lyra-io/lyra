@@ -3,7 +3,7 @@
 //! Cata parses and plans queries, maintains the cluster view through Oxia,
 //! and distributes execution tasks to Func runtimes.
 
-pub mod config;
+pub mod options;
 
 mod error;
 mod planner;

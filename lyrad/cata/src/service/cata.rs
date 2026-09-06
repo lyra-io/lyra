@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::config::CataOptions;
+use crate::options::CataOptions;
 use crate::planner::SqlPlanner;
 use crate::postgres::PostgresServer;
 use datafusion::logical_expr::LogicalPlan;

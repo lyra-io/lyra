@@ -1,5 +1,5 @@
 use cata::Cata;
-use cata::config::{CataOptions, PostgresOptions};
+use cata::options::{CataOptions, PostgresOptions};
 use clap::Parser;
 use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use std::sync::Arc;
