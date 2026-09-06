@@ -1,4 +1,4 @@
-use super::Session;
+use super::QueryHandler;
 use crate::error::to_pgwire_error;
 use crate::sql::parse_catalog_statement;
 use async_trait::async_trait;
@@ -12,7 +12,7 @@ use futures_util::Sink;
 use std::fmt::Debug;
 
 #[async_trait]
-impl SimpleQueryHandler for Session {
+impl SimpleQueryHandler for QueryHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,

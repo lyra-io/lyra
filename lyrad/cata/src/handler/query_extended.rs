@@ -1,4 +1,4 @@
-use super::Session;
+use super::QueryHandler;
 use crate::error::to_pgwire_error;
 use crate::sql::{CataQueryParser, DataFusionStatement, parse_catalog_statement};
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 #[async_trait]
-impl ExtendedQueryHandler for Session {
+impl ExtendedQueryHandler for QueryHandler {
     type Statement = DataFusionStatement;
     type QueryParser = CataQueryParser;
 
