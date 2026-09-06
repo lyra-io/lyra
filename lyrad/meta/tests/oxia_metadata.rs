@@ -1,6 +1,8 @@
 use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use meta::metadata::{Metadata, MetadataPutCondition};
-use meta::proto::pb_catalog::{Column, Connection, Secret, SecretRef, Sink, Source, Table};
+use meta::proto::pb_catalog::{
+    Column, Connection, Database, Schema, Secret, SecretRef, Sink, Source, Table,
+};
 use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +15,8 @@ async fn stores_typed_protobuf_metadata() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let database_name = format!("test-database-{suffix}");
+    let schema_name = "public";
     let secret_name = format!("test-secret-{suffix}");
     let connection_name = format!("test-connection-{suffix}");
     let source_name = format!("test-source-{suffix}");
@@ -22,8 +26,29 @@ async fn stores_typed_protobuf_metadata() {
         .await
         .unwrap();
 
+    let database_version = metadata
+        .put_database(
+            Database {
+                name: database_name.clone(),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
+    let schema_version = metadata
+        .put_schema(
+            &database_name,
+            Schema {
+                name: schema_name.to_string(),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
     let secret_version = metadata
         .put_secret(
+            &database_name,
+            schema_name,
             Secret {
                 name: secret_name.clone(),
                 value: b"password".to_vec().into(),
@@ -34,6 +59,8 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap();
     let connection_version = metadata
         .put_connection(
+            &database_name,
+            schema_name,
             Connection {
                 name: connection_name.clone(),
                 options: HashMap::from([
@@ -51,6 +78,8 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap();
     let source_version = metadata
         .put_source(
+            &database_name,
+            schema_name,
             Source {
                 name: source_name.clone(),
                 options: HashMap::from([
@@ -64,6 +93,8 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap();
     let sink_version = metadata
         .put_sink(
+            &database_name,
+            schema_name,
             Sink {
                 name: sink_name.clone(),
                 options: HashMap::from([
@@ -77,6 +108,8 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap();
     let table_version = metadata
         .put_table(
+            &database_name,
+            schema_name,
             Table {
                 name: table_name.clone(),
                 source: source_name.clone(),
@@ -95,7 +128,7 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap();
 
     let stored = metadata
-        .get_connection(&connection_name)
+        .get_connection(&database_name, schema_name, &connection_name)
         .await
         .unwrap()
         .unwrap();
@@ -104,7 +137,7 @@ async fn stores_typed_protobuf_metadata() {
     assert_eq!(stored.value().secret_refs[0].data, secret_name);
     assert_eq!(
         metadata
-            .get_table(&table_name)
+            .get_table(&database_name, schema_name, &table_name)
             .await
             .unwrap()
             .unwrap()
@@ -114,23 +147,51 @@ async fn stores_typed_protobuf_metadata() {
     );
 
     metadata
-        .delete_table(&table_name, Some(table_version))
+        .delete_table(
+            &database_name,
+            schema_name,
+            &table_name,
+            Some(table_version),
+        )
         .await
         .unwrap();
     metadata
-        .delete_sink(&sink_name, Some(sink_version))
+        .delete_sink(&database_name, schema_name, &sink_name, Some(sink_version))
         .await
         .unwrap();
     metadata
-        .delete_source(&source_name, Some(source_version))
+        .delete_source(
+            &database_name,
+            schema_name,
+            &source_name,
+            Some(source_version),
+        )
         .await
         .unwrap();
     metadata
-        .delete_connection(&connection_name, Some(connection_version))
+        .delete_connection(
+            &database_name,
+            schema_name,
+            &connection_name,
+            Some(connection_version),
+        )
         .await
         .unwrap();
     metadata
-        .delete_secret(&secret_name, Some(secret_version))
+        .delete_secret(
+            &database_name,
+            schema_name,
+            &secret_name,
+            Some(secret_version),
+        )
+        .await
+        .unwrap();
+    metadata
+        .delete_schema(&database_name, schema_name, Some(schema_version))
+        .await
+        .unwrap();
+    metadata
+        .delete_database(&database_name, Some(database_version))
         .await
         .unwrap();
 }

@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::error::to_pgwire_error;
+use crate::handler::{DatabaseHandles, client_database};
 use crate::sql::{CatalogStatement, CreateSecret, SecretStatement};
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
@@ -10,6 +11,7 @@ use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
 use datafusion_postgres::Parser as DataFusionParser;
 use datafusion_postgres::pgwire::api::portal::Format;
+use datafusion_postgres::pgwire::api::query::ExtendedQueryHandler;
 use datafusion_postgres::pgwire::api::results::FieldInfo;
 use datafusion_postgres::pgwire::api::stmt::QueryParser;
 use datafusion_postgres::pgwire::api::{ClientInfo, Type};
@@ -57,12 +59,17 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
 
 pub(crate) struct CataQueryParser {
     // Immutable state
-    datafusion: Arc<DataFusionParser>,
+    databases: Arc<DatabaseHandles>,
+    default_parser: Arc<DataFusionParser>,
 }
 
 impl CataQueryParser {
-    pub(crate) fn new(datafusion: Arc<DataFusionParser>) -> Self {
-        Self { datafusion }
+    pub(crate) fn new(databases: Arc<DatabaseHandles>) -> Self {
+        let default_parser = databases.default().query_parser();
+        Self {
+            databases,
+            default_parser,
+        }
     }
 }
 
@@ -86,11 +93,16 @@ impl QueryParser for CataQueryParser {
             return Ok((sql.to_string(), None));
         }
 
-        self.datafusion.parse_sql(client, sql, types).await
+        self.databases
+            .get(client_database(client))
+            .map_err(to_pgwire_error)?
+            .query_parser()
+            .parse_sql(client, sql, types)
+            .await
     }
 
     fn get_parameter_types(&self, statement: &Self::Statement) -> PgWireResult<Vec<Type>> {
-        self.datafusion.get_parameter_types(statement)
+        self.default_parser.get_parameter_types(statement)
     }
 
     fn get_result_schema(
@@ -98,7 +110,8 @@ impl QueryParser for CataQueryParser {
         statement: &Self::Statement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        self.datafusion.get_result_schema(statement, column_format)
+        self.default_parser
+            .get_result_schema(statement, column_format)
     }
 }
 

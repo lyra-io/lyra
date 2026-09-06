@@ -48,7 +48,7 @@ pub async fn run(args: CataArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cata_options = CataOptions::new(host.clone(), port).with_max_connections(max_connections);
     let oxia = OxiaOptions::new(options.meta.service_address, options.meta.namespace);
     let metadata = Arc::new(OxiaMetadata::new(&oxia).await?);
-    let cata = Cata::new(cata_options, metadata)?;
+    let cata = Cata::new(cata_options, metadata).await?;
 
     info!(
         config = %args.config.display(),

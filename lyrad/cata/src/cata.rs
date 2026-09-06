@@ -1,14 +1,16 @@
 use crate::Result;
-use crate::handler::{QueryHandler, StartupHandler};
+use crate::handler::{DatabaseHandles, QueryHandler, StartupHandler};
 use crate::options::CataOptions;
-use crate::sql::SqlPlanner;
 use datafusion_postgres::pgwire::api::ConnectionManager;
 use datafusion_postgres::pgwire::api::PgWireServerHandlers;
 use datafusion_postgres::pgwire::api::auth::StartupHandler as PgWireStartupHandler;
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::{ServerOptions, serve_with_handlers};
-use meta::metadata::Metadata;
+use meta::metadata::{
+    DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, Metadata, MetadataError, MetadataPutCondition,
+};
+use meta::proto::pb_catalog::{Database, Schema};
 use std::sync::Arc;
 
 pub struct Cata {
@@ -22,12 +24,42 @@ pub struct Cata {
 }
 
 impl Cata {
-    pub fn new(options: CataOptions, metadata: Arc<dyn Metadata>) -> Result<Self> {
-        let planner = SqlPlanner::new()?;
+    pub async fn new(options: CataOptions, metadata: Arc<dyn Metadata>) -> Result<Self> {
+        match metadata
+            .put_database(
+                Database {
+                    name: DEFAULT_DATABASE_NAME.to_string(),
+                },
+                MetadataPutCondition::NotExists,
+            )
+            .await
+        {
+            Ok(_) | Err(MetadataError::Conflict(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match metadata
+            .put_schema(
+                DEFAULT_DATABASE_NAME,
+                Schema {
+                    name: DEFAULT_SCHEMA_NAME.to_string(),
+                },
+                MetadataPutCondition::NotExists,
+            )
+            .await
+        {
+            Ok(_) | Err(MetadataError::Conflict(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let databases = Arc::new(DatabaseHandles::new()?);
         let connection_manager = Arc::new(ConnectionManager::new());
         let cancel_handler = Arc::new(DefaultCancelHandler::new(Arc::clone(&connection_manager)));
-        let query_handler = Arc::new(QueryHandler::new(Arc::clone(planner.context()), metadata));
-        let startup_handler = Arc::new(StartupHandler::new(connection_manager));
+        let query_handler = Arc::new(QueryHandler::new(
+            Arc::clone(&databases),
+            Arc::clone(&metadata),
+        ));
+        let startup_handler =
+            Arc::new(StartupHandler::new(connection_manager, metadata, databases));
         Ok(Self {
             cancel_handler,
             options,

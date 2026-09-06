@@ -23,6 +23,12 @@ pub enum CataError {
     #[error("secret {0:?} already exists")]
     SecretAlreadyExists(String),
 
+    #[error("database {0:?} does not exist")]
+    DatabaseNotFound(String),
+
+    #[error("schema {schema:?} does not exist in database {database:?}")]
+    SchemaNotFound { database: String, schema: String },
+
     #[error("PostgreSQL server failed: {0}")]
     Server(#[from] io::Error),
 }

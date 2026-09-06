@@ -830,6 +830,7 @@ name = "cata"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dashmap",
  "datafusion",
  "datafusion-pg-catalog",
  "datafusion-postgres",

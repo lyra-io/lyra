@@ -20,8 +20,18 @@ impl SecretExecutor {
         Self { metadata }
     }
 
-    pub async fn create(&self, statement: &CreateSecret) -> Result<CreateSecretOutcome> {
-        if self.metadata.get_secret(statement.name()).await?.is_some() {
+    pub async fn create(
+        &self,
+        database: &str,
+        schema: &str,
+        statement: &CreateSecret,
+    ) -> Result<CreateSecretOutcome> {
+        if self
+            .metadata
+            .get_secret(database, schema, statement.name())
+            .await?
+            .is_some()
+        {
             return if statement.if_not_exists() {
                 Ok(CreateSecretOutcome::AlreadyExists)
             } else {
@@ -35,7 +45,7 @@ impl SecretExecutor {
         };
         match self
             .metadata
-            .put_secret(secret, MetadataPutCondition::NotExists)
+            .put_secret(database, schema, secret, MetadataPutCondition::NotExists)
             .await
         {
             Ok(_) => Ok(CreateSecretOutcome::Created),

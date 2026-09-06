@@ -9,13 +9,25 @@ impl Keyspace {
 
     pub fn object(&self, path: &str, name: &str) -> Result<String> {
         self.validate_path(path)?;
-        if name.is_empty() || name.contains('/') || name.contains('~') {
+        self.validate_name(name)?;
+        Ok(format!("{path}{name}"))
+    }
+
+    pub fn collection(&self, path: &str, name: &str, collection: &str) -> Result<String> {
+        self.validate_path(path)?;
+        self.validate_name(name)?;
+        if collection.is_empty()
+            || collection.starts_with('/')
+            || !collection.ends_with('/')
+            || collection.contains("//")
+            || collection.contains('~')
+        {
             return Err(MetadataError::InvalidKey {
-                key: name.to_string(),
-                reason: "metadata object names cannot be empty or contain reserved characters",
+                key: collection.to_string(),
+                reason: "metadata collection paths must be relative constants ending in a slash",
             });
         }
-        Ok(format!("{path}{name}"))
+        Ok(format!("{path}{name}/{collection}"))
     }
 
     pub fn range(&self, path: &str) -> Result<(String, String)> {
@@ -36,26 +48,50 @@ impl Keyspace {
         }
         Ok(())
     }
+
+    fn validate_name(&self, name: &str) -> Result<()> {
+        if name.is_empty() || name.contains('/') || name.contains('~') {
+            return Err(MetadataError::InvalidKey {
+                key: name.to_string(),
+                reason: "metadata object names cannot be empty or contain reserved characters",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::path::{CONNECTION_PATH, SOURCE_PATH};
+    use crate::metadata::path::{DATABASE_PATH, SCHEMA_PATH, SOURCE_PATH};
 
     #[test]
     fn maps_logical_keys_into_the_configured_keyspace() {
         let keyspace = Keyspace::new();
 
         assert_eq!(
-            keyspace.object(CONNECTION_PATH, "kafka").unwrap(),
-            "/lyra/v1/connections/kafka"
+            keyspace.object(DATABASE_PATH, "dev").unwrap(),
+            "/lyra/v1/databases/dev"
         );
         assert_eq!(
-            keyspace.range(SOURCE_PATH).unwrap(),
+            keyspace
+                .collection(DATABASE_PATH, "dev", SCHEMA_PATH)
+                .unwrap(),
+            "/lyra/v1/databases/dev/schemas/"
+        );
+        assert_eq!(
+            keyspace
+                .collection("/lyra/v1/databases/dev/schemas/", "public", SOURCE_PATH)
+                .unwrap(),
+            "/lyra/v1/databases/dev/schemas/public/sources/"
+        );
+        assert_eq!(
+            keyspace
+                .range("/lyra/v1/databases/dev/schemas/public/sources/")
+                .unwrap(),
             (
-                "/lyra/v1/sources/".to_string(),
-                "/lyra/v1/sources/~".to_string()
+                "/lyra/v1/databases/dev/schemas/public/sources/".to_string(),
+                "/lyra/v1/databases/dev/schemas/public/sources/~".to_string()
             )
         );
     }
@@ -64,7 +100,12 @@ mod tests {
     fn rejects_keys_outside_the_keyspace() {
         let keyspace = Keyspace::new();
 
-        assert!(keyspace.object("connections/", "kafka").is_err());
-        assert!(keyspace.object(CONNECTION_PATH, "nested/name").is_err());
+        assert!(keyspace.object("databases/", "dev").is_err());
+        assert!(keyspace.object(DATABASE_PATH, "nested/name").is_err());
+        assert!(
+            keyspace
+                .collection(DATABASE_PATH, "dev", "/secrets/")
+                .is_err()
+        );
     }
 }

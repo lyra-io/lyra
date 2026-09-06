@@ -2,6 +2,14 @@ syntax = "proto3";
 
 package io.lyra.proto.catalog.v1;
 
+message Database {
+  string name = 1;
+}
+
+message Schema {
+  string name = 1;
+}
+
 message Connection {
   string name = 1;
   map<string, string> options = 2;
