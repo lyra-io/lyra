@@ -2705,6 +2705,7 @@ dependencies = [
  "arrow-array 56.2.1",
  "arrow-flight",
  "arrow-schema 56.2.1",
+ "cata",
  "clap",
  "futures-util",
  "libc",

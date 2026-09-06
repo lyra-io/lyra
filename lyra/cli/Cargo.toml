@@ -9,6 +9,7 @@ name = "lyra"
 path = "src/main.rs"
 
 [dependencies]
+cata = { path = "../../lyrad/cata" }
 arrow-array = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
