@@ -7,7 +7,14 @@ fn main() {
         .build_server(true)
         .compile_protos_with_config(
             config,
-            &["proto/pb_external.proto", "proto/pb_catalog.proto"],
+            &[
+                "proto/pb_external.proto",
+                "proto/pb_catalog_identity.proto",
+                "proto/pb_catalog_io.proto",
+                "proto/pb_catalog_namespace.proto",
+                "proto/pb_catalog_stream.proto",
+                "proto/pb_catalog_table.proto",
+            ],
             &["proto"],
         )
         .unwrap();

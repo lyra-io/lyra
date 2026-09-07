@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package io.lyra.proto.catalog.v1;
+
+message StreamMeta {
+  string name = 1;
+  int64 stream_id = 2;
+  StreamStatus status = 3;
+  int64 term = 4;
+  int64 version = 5;
+  int64 lra = 6;
+}
+
+message Segment {
+  repeated UnitInfo ensemble = 1;
+  int64 start_offset = 2;
+}
+
+enum StreamStatus {
+  ACTIVE = 0;
+  SEALED = 1;
+}
+
+enum UnitStatus {
+  WRITABLE = 0;
+  READONLY = 1;
+}
+
+message UnitInfo {
+  string id = 1;
+  string address = 2;
+}
+
+message UnitRegistration {
+  UnitInfo unit = 1;
+  UnitStatus status = 2;
+  string zone = 3;
+  double cpu_usage = 4;
+  double memory_usage = 5;
+  double disk_usage = 6;
+}
