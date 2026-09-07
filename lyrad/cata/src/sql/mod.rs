@@ -11,5 +11,5 @@ pub use statement::{
     AlterDatabase, AlterSchema, AlterSecret, AlterUser, AlterUserAction, CatalogStatement,
     CreateDatabase, CreateSchema, CreateSecret, CreateUser, DatabaseStatement, DropDatabase,
     DropSchema, DropSecret, DropUser, SchemaName, SchemaStatement, SecretName, SecretStatement,
-    ShowDatabases, ShowSchemas, ShowSecrets, ShowUsers, UserPassword, UserStatement,
+    ShowDatabases, ShowSchemas, ShowSecrets, ShowUsers, UserStatement, Value,
 };

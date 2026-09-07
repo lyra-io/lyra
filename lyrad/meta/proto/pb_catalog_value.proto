@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package io.lyra.proto.catalog.v1;
+
+message Value {
+  oneof kind {
+    string literal = 1;
+    string secret = 2;
+    Scram scram = 3;
+  }
+}
+
+message Scram {
+  bytes salt = 1;
+  bytes salted_password = 2;
+  uint32 iterations = 3;
+}

@@ -12,6 +12,7 @@ pub(crate) fn to_pgwire_error(error: CataError) -> PgWireError {
         CataError::SecretAlreadyExists(_) => ("ERROR", "42710"),
         CataError::SecretNotFound(_) => ("ERROR", "42704"),
         CataError::SecretChanged(_) => ("ERROR", "40001"),
+        CataError::InvalidPasswordSecret(_) => ("ERROR", "22023"),
         CataError::SecretInUse { .. } => ("ERROR", "2BP01"),
         CataError::DatabaseNotFound(_) => ("ERROR", "3D000"),
         CataError::DatabaseAlreadyExists(_) => ("ERROR", "42P04"),

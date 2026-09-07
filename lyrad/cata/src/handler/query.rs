@@ -138,14 +138,14 @@ impl QueryHandler {
             }
             CatalogStatement::User(UserStatement::Create(statement)) => {
                 self.user_executor
-                    .create(&statement)
+                    .create(database, schemas, &statement)
                     .await
                     .map_err(to_pgwire_error)?;
                 Ok(Response::Execution(Tag::new("CREATE USER")))
             }
             CatalogStatement::User(UserStatement::Alter(statement)) => {
                 self.user_executor
-                    .alter(current_user, &statement)
+                    .alter(database, schemas, current_user, &statement)
                     .await
                     .map_err(to_pgwire_error)?;
                 Ok(Response::Execution(Tag::new("ALTER USER")))

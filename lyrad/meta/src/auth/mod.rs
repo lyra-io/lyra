@@ -2,10 +2,7 @@ mod basic;
 mod error;
 mod identity;
 
-pub use basic::{
-    BASIC_PASSWORD_ITERATIONS, BasicAuthenticationProvider, make_password_credential,
-    verify_password_credential,
-};
+pub use basic::BasicAuthenticationProvider;
 pub use error::{AuthenticationError, Result};
 pub use identity::AuthenticatedUser;
 

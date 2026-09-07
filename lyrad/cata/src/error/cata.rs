@@ -47,6 +47,9 @@ pub enum CataError {
     #[error("secret {0:?} changed concurrently")]
     SecretChanged(String),
 
+    #[error("secret {0:?} used as a password must contain valid UTF-8")]
+    InvalidPasswordSecret(String),
+
     #[error("cannot drop secret {secret:?} because connection {connection:?} depends on it")]
     SecretInUse { secret: String, connection: String },
 

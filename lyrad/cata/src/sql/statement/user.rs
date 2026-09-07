@@ -1,4 +1,4 @@
-use std::fmt;
+use super::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserStatement {
@@ -8,14 +8,14 @@ pub enum UserStatement {
     Show(ShowUsers),
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateUser {
     name: String,
-    password: String,
+    password: Value,
 }
 
 impl CreateUser {
-    pub fn new(name: String, password: String) -> Self {
+    pub fn new(name: String, password: Value) -> Self {
         Self { name, password }
     }
 
@@ -23,40 +23,15 @@ impl CreateUser {
         &self.name
     }
 
-    pub fn password(&self) -> &str {
+    pub fn password(&self) -> &Value {
         &self.password
-    }
-}
-
-impl fmt::Debug for CreateUser {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CreateUser")
-            .field("name", &self.name)
-            .field("password", &"[REDACTED]")
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum UserPassword {
-    Null,
-    Value(String),
-}
-
-impl fmt::Debug for UserPassword {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Null => formatter.write_str("Null"),
-            Self::Value(_) => formatter.write_str("Value([REDACTED])"),
-        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlterUserAction {
     Rename(String),
-    Password(UserPassword),
+    Password(Value),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

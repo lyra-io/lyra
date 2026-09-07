@@ -2,13 +2,13 @@ mod database;
 mod schema;
 mod secret;
 mod user;
+mod value;
 
 pub use database::{AlterDatabase, CreateDatabase, DatabaseStatement, DropDatabase, ShowDatabases};
 pub use schema::{AlterSchema, CreateSchema, DropSchema, SchemaName, SchemaStatement, ShowSchemas};
 pub use secret::{AlterSecret, CreateSecret, DropSecret, SecretName, SecretStatement, ShowSecrets};
-pub use user::{
-    AlterUser, AlterUserAction, CreateUser, DropUser, ShowUsers, UserPassword, UserStatement,
-};
+pub use user::{AlterUser, AlterUserAction, CreateUser, DropUser, ShowUsers, UserStatement};
+pub use value::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CatalogStatement {

@@ -15,6 +15,9 @@ pub enum MetadataError {
     #[error("metadata counter {0:?} is exhausted")]
     CounterExhausted(String),
 
+    #[error("user {0:?} password metadata must contain a valid SCRAM value")]
+    InvalidUserPassword(String),
+
     #[error("failed to decode protobuf metadata: {0}")]
     Decode(#[from] DecodeError),
 

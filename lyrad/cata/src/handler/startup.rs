@@ -5,11 +5,14 @@ use async_trait::async_trait;
 use datafusion_postgres::pgwire::api::ConnectionManager;
 use datafusion_postgres::pgwire::api::auth::DefaultServerParameterProvider;
 use datafusion_postgres::pgwire::api::auth::sasl::SASLAuthStartupHandler;
-use datafusion_postgres::pgwire::api::auth::sasl::scram::{SCRAM_ITERATIONS, ScramAuth};
+use datafusion_postgres::pgwire::api::auth::sasl::scram::{
+    SCRAM_ITERATIONS as PGWIRE_SCRAM_ITERATIONS, ScramAuth,
+};
 use datafusion_postgres::pgwire::api::auth::{AuthSource, LoginInfo, Password};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
-use meta::auth::{AuthenticationError, BASIC_PASSWORD_ITERATIONS, BasicAuthenticationProvider};
+use meta::auth::{AuthenticationError, BasicAuthenticationProvider};
 use meta::metadata::{DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, Metadata};
+use meta::utils::scram::SCRAM_ITERATIONS;
 use std::fmt;
 use std::sync::Arc;
 
@@ -39,8 +42,8 @@ impl StartupHandler {
         parameters.is_superuser = false;
         let source: Arc<dyn AuthSource> = self.source.clone();
         let mut scram = ScramAuth::new(source);
-        debug_assert_eq!(BASIC_PASSWORD_ITERATIONS as usize, SCRAM_ITERATIONS);
-        scram.set_iterations(BASIC_PASSWORD_ITERATIONS as usize);
+        debug_assert_eq!(SCRAM_ITERATIONS as usize, PGWIRE_SCRAM_ITERATIONS);
+        scram.set_iterations(SCRAM_ITERATIONS as usize);
         SASLAuthStartupHandler::new(Arc::new(parameters))
             .with_connection_manager(Arc::clone(&self.connection_manager))
             .with_scram(scram)
@@ -71,18 +74,16 @@ impl MetadataPasswordSource {
         let name = login
             .user()
             .ok_or_else(|| to_pgwire_error(CataError::AuthenticationRequired))?;
-        let credential =
-            self.provider
-                .password_credential(name)
-                .await
-                .map_err(|error| match error {
-                    AuthenticationError::InvalidCredentials => {
-                        PgWireError::InvalidPassword(name.to_string())
-                    }
-                    AuthenticationError::Metadata(error) => {
-                        to_pgwire_error(CataError::Metadata(error))
-                    }
-                })?;
+        let credential = self
+            .provider
+            .scram(name)
+            .await
+            .map_err(|error| match error {
+                AuthenticationError::InvalidCredentials => {
+                    PgWireError::InvalidPassword(name.to_string())
+                }
+                AuthenticationError::Metadata(error) => to_pgwire_error(CataError::Metadata(error)),
+            })?;
 
         let database = login.database().unwrap_or(DEFAULT_DATABASE_NAME);
         if self
@@ -136,9 +137,9 @@ impl AuthSource for MetadataPasswordSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meta::auth::make_password_credential;
     use meta::metadata::{MemoryMetadata, MetadataPutCondition};
     use meta::proto::pb_catalog::{Database, Schema, User};
+    use meta::utils::scram::make_scram_value;
 
     #[tokio::test]
     async fn reads_scram_credentials_for_valid_logins() {
@@ -147,7 +148,7 @@ mod tests {
             .put_user(
                 User {
                     name: "alice".to_string(),
-                    password: Some(make_password_credential("s3cr3t")),
+                    password: Some(make_scram_value("s3cr3t")),
                 },
                 MetadataPutCondition::NotExists,
             )

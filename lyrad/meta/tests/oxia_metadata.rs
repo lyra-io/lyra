@@ -1,8 +1,7 @@
 use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use meta::metadata::{Metadata, MetadataPutCondition};
-use meta::proto::pb_catalog::{
-    Connection, Database, PasswordCredential, Schema, Secret, SecretRef, User,
-};
+use meta::proto::pb_catalog::{Connection, Database, Schema, Secret, SecretRef, User};
+use meta::utils::scram::make_scram_value;
 use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,11 +27,7 @@ async fn stores_typed_protobuf_metadata() {
         .put_user(
             User {
                 name: user_name.clone(),
-                password: Some(PasswordCredential {
-                    salt: b"salt".to_vec().into(),
-                    salted_password: b"hash".to_vec().into(),
-                    iterations: 4096,
-                }),
+                password: Some(make_scram_value("password")),
             },
             MetadataPutCondition::NotExists,
         )

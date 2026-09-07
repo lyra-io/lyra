@@ -5,11 +5,11 @@ use crate::sql::{
     AlterDatabase, AlterSchema, AlterSecret, AlterUser, AlterUserAction, CatalogStatement,
     CreateDatabase, CreateSchema, CreateSecret, CreateUser, DatabaseStatement, DropDatabase,
     DropSchema, DropSecret, DropUser, SchemaName, SchemaStatement, SecretName, SecretStatement,
-    ShowDatabases, ShowSchemas, ShowSecrets, ShowUsers, UserPassword, UserStatement,
+    ShowDatabases, ShowSchemas, ShowSecrets, ShowUsers, UserStatement, Value,
 };
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::sqlparser::ast::{DollarQuotedString, Statement, Value};
+use datafusion::sql::sqlparser::ast::{DollarQuotedString, Statement, Value as SqlValue};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
@@ -151,9 +151,9 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
 
 fn parse_secret_value0(parser: &mut Parser, statement: &str) -> Result<Vec<u8>> {
     let value = match parser.parse_value()?.value {
-        Value::SingleQuotedString(value)
-        | Value::EscapedStringLiteral(value)
-        | Value::DollarQuotedString(DollarQuotedString { value, .. }) => value.into_bytes(),
+        SqlValue::SingleQuotedString(value)
+        | SqlValue::EscapedStringLiteral(value)
+        | SqlValue::DollarQuotedString(DollarQuotedString { value, .. }) => value.into_bytes(),
         _ => {
             return Err(ParserError::ParserError(format!(
                 "{statement} value must be a string literal"
@@ -170,7 +170,9 @@ fn parse_like0(parser: &mut Parser, statement: &str) -> Result<Option<String>> {
     }
 
     match parser.parse_value()?.value {
-        Value::SingleQuotedString(value) | Value::EscapedStringLiteral(value) => Ok(Some(value)),
+        SqlValue::SingleQuotedString(value) | SqlValue::EscapedStringLiteral(value) => {
+            Ok(Some(value))
+        }
         _ => Err(ParserError::ParserError(format!(
             "{statement} LIKE pattern must be a string literal"
         ))
@@ -178,30 +180,34 @@ fn parse_like0(parser: &mut Parser, statement: &str) -> Result<Option<String>> {
     }
 }
 
-fn parse_user_password0(parser: &mut Parser) -> Result<UserPassword> {
+fn parse_user_password0(parser: &mut Parser) -> Result<Value> {
     if parser.parse_keyword(Keyword::NULL) {
-        return Ok(UserPassword::Null);
+        return Ok(Value::Null);
+    }
+    if parser.parse_keyword(Keyword::SECRET) {
+        return Ok(Value::Secret(parse_secret_name0(parser)?));
     }
     match parser.parse_value()?.value {
-        Value::SingleQuotedString(value)
-        | Value::EscapedStringLiteral(value)
-        | Value::DollarQuotedString(DollarQuotedString { value, .. }) => {
-            Ok(UserPassword::Value(value))
+        SqlValue::SingleQuotedString(value)
+        | SqlValue::EscapedStringLiteral(value)
+        | SqlValue::DollarQuotedString(DollarQuotedString { value, .. }) => {
+            Ok(Value::Literal(value))
         }
-        _ => Err(
-            ParserError::ParserError("PASSWORD must be a string literal or NULL".to_string())
-                .into(),
-        ),
+        _ => Err(ParserError::ParserError(
+            "PASSWORD must be a string literal, SECRET name, or NULL".to_string(),
+        )
+        .into()),
     }
 }
 
-fn parse_create_user_password0(parser: &mut Parser) -> Result<String> {
-    match parse_user_password0(parser)? {
-        UserPassword::Value(password) => Ok(password),
-        UserPassword::Null => Err(ParserError::ParserError(
-            "CREATE USER PASSWORD must be a string literal".to_string(),
+fn parse_create_user_password0(parser: &mut Parser) -> Result<Value> {
+    let password = parse_user_password0(parser)?;
+    match password {
+        Value::Null => Err(ParserError::ParserError(
+            "CREATE USER PASSWORD must be a string literal or SECRET name".to_string(),
         )
         .into()),
+        Value::Literal(_) | Value::Secret(_) | Value::Scram(_) => Ok(password),
     }
 }
 
@@ -441,7 +447,24 @@ mod tests {
             panic!("expected CREATE USER")
         };
         assert_eq!(statement.name(), "alice");
-        assert_eq!(statement.password(), "s3cr3t");
+        assert_eq!(statement.password(), &Value::Literal("s3cr3t".to_string()));
+    }
+
+    #[test]
+    fn parses_create_user_with_secret_password() {
+        let statement =
+            parse_catalog_statement("CREATE USER Alice PASSWORD SECRET private.login_password")
+                .unwrap()
+                .unwrap();
+
+        let CatalogStatement::User(UserStatement::Create(statement)) = statement else {
+            panic!("expected CREATE USER")
+        };
+        let Value::Secret(secret) = statement.password() else {
+            panic!("expected secret password")
+        };
+        assert_eq!(secret.schema(), Some("private"));
+        assert_eq!(secret.name(), "login_password");
     }
 
     #[test]
@@ -495,10 +518,23 @@ mod tests {
         let CatalogStatement::User(UserStatement::Alter(statement)) = statement else {
             panic!("expected ALTER USER")
         };
-        assert_eq!(
-            statement.action(),
-            &AlterUserAction::Password(UserPassword::Null)
-        );
+        assert_eq!(statement.action(), &AlterUserAction::Password(Value::Null));
+    }
+
+    #[test]
+    fn parses_alter_user_with_secret_password() {
+        let statement = parse_catalog_statement("ALTER USER alice PASSWORD SECRET login_password")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::User(UserStatement::Alter(statement)) = statement else {
+            panic!("expected ALTER USER")
+        };
+        let AlterUserAction::Password(Value::Secret(secret)) = statement.action() else {
+            panic!("expected secret password")
+        };
+        assert_eq!(secret.schema(), None);
+        assert_eq!(secret.name(), "login_password");
     }
 
     #[test]

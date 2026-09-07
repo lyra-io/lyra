@@ -5,6 +5,7 @@ use crate::metadata::path::{
 };
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
+    validate_user,
 };
 use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
 use async_trait::async_trait;
@@ -184,6 +185,7 @@ impl Metadata for OxiaMetadata {
         user: User,
         condition: MetadataPutCondition,
     ) -> Result<MetadataVersion> {
+        validate_user(&user)?;
         let key = self.keyspace.object(USER_PATH, &user.name)?;
         self.put0(&key, &user, condition, Some(USER_PARTITION_KEY))
             .await
@@ -209,6 +211,7 @@ impl Metadata for OxiaMetadata {
         user: User,
         expected_version: MetadataVersion,
     ) -> Result<MetadataVersion> {
+        validate_user(&user)?;
         let old_key = self.keyspace.object(USER_PATH, name)?;
         let new_key = self.keyspace.object(USER_PATH, &user.name)?;
         let put = self.put0(

@@ -1,16 +1,9 @@
 use crate::auth::{AuthenticatedUser, AuthenticationError, AuthenticationProvider, Result};
 use crate::metadata::Metadata;
-use crate::proto::pb_catalog::PasswordCredential;
+use crate::proto::pb_catalog::Scram;
+use crate::utils::scram::{as_scram, is_valid_scram, verify_scram};
 use async_trait::async_trait;
-use ring::pbkdf2::{self, PBKDF2_HMAC_SHA256};
-use std::borrow::Cow;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-
-pub const BASIC_PASSWORD_ITERATIONS: u32 = 4096;
-
-const BASIC_PASSWORD_SALT_LENGTH: usize = 18;
-const SCRAM_SHA_256_OUTPUT_LENGTH: usize = 32;
 
 pub struct BasicAuthenticationProvider {
     // Immutable state
@@ -22,7 +15,7 @@ impl BasicAuthenticationProvider {
         Self { metadata }
     }
 
-    pub async fn password_credential(&self, name: &str) -> Result<PasswordCredential> {
+    pub async fn scram(&self, name: &str) -> Result<Scram> {
         let user = self
             .metadata
             .get_user(name)
@@ -30,8 +23,10 @@ impl BasicAuthenticationProvider {
             .ok_or(AuthenticationError::InvalidCredentials)?;
         user.value()
             .password
-            .clone()
-            .filter(valid_password_credential0)
+            .as_ref()
+            .and_then(as_scram)
+            .filter(|scram| is_valid_scram(scram))
+            .cloned()
             .ok_or(AuthenticationError::InvalidCredentials)
     }
 }
@@ -48,67 +43,13 @@ impl AuthenticationProvider for BasicAuthenticationProvider {
             .value()
             .password
             .as_ref()
+            .and_then(as_scram)
             .ok_or(AuthenticationError::InvalidCredentials)?;
-        if !valid_password_credential0(credential)
-            || !verify_password_credential(password, credential)
-        {
+        if !is_valid_scram(credential) || !verify_scram(password, credential) {
             return Err(AuthenticationError::InvalidCredentials);
         }
         Ok(AuthenticatedUser::new(user.value().name.clone()))
     }
-}
-
-pub fn make_password_credential(password: &str) -> PasswordCredential {
-    let salt = rand::random::<[u8; BASIC_PASSWORD_SALT_LENGTH]>();
-    PasswordCredential {
-        salted_password: derive_password0(password, &salt, BASIC_PASSWORD_ITERATIONS)
-            .expect("the basic password iteration count is nonzero")
-            .into(),
-        salt: salt.to_vec().into(),
-        iterations: BASIC_PASSWORD_ITERATIONS,
-    }
-}
-
-pub fn verify_password_credential(password: &str, credential: &PasswordCredential) -> bool {
-    let Some(iterations) = NonZeroU32::new(credential.iterations) else {
-        return false;
-    };
-    if credential.salted_password.len() != SCRAM_SHA_256_OUTPUT_LENGTH {
-        return false;
-    }
-    let normalized = normalize_password0(password);
-    pbkdf2::verify(
-        PBKDF2_HMAC_SHA256,
-        iterations,
-        &credential.salt,
-        normalized.as_bytes(),
-        &credential.salted_password,
-    )
-    .is_ok()
-}
-
-fn derive_password0(password: &str, salt: &[u8], iterations: u32) -> Option<Vec<u8>> {
-    let iterations = NonZeroU32::new(iterations)?;
-    let normalized = normalize_password0(password);
-    let mut salted_password = vec![0; SCRAM_SHA_256_OUTPUT_LENGTH];
-    pbkdf2::derive(
-        PBKDF2_HMAC_SHA256,
-        iterations,
-        salt,
-        normalized.as_bytes(),
-        &mut salted_password,
-    );
-    Some(salted_password)
-}
-
-fn normalize_password0(password: &str) -> Cow<'_, str> {
-    stringprep::saslprep(password).unwrap_or(Cow::Borrowed(password))
-}
-
-fn valid_password_credential0(credential: &PasswordCredential) -> bool {
-    credential.iterations == BASIC_PASSWORD_ITERATIONS
-        && credential.salted_password.len() == SCRAM_SHA_256_OUTPUT_LENGTH
-        && !credential.salt.is_empty()
 }
 
 #[cfg(test)]
@@ -116,18 +57,7 @@ mod tests {
     use super::*;
     use crate::metadata::{MemoryMetadata, MetadataPutCondition};
     use crate::proto::pb_catalog::User;
-
-    #[test]
-    fn stores_scram_salted_password_material() {
-        let first = make_password_credential("s3cr3t");
-        let second = make_password_credential("s3cr3t");
-
-        assert_eq!(first.iterations, BASIC_PASSWORD_ITERATIONS);
-        assert!(verify_password_credential("s3cr3t", &first));
-        assert!(!verify_password_credential("wrong", &first));
-        assert_ne!(first.salted_password.as_ref(), b"s3cr3t");
-        assert_ne!(first.salt, second.salt);
-    }
+    use crate::utils::scram::make_scram_value;
 
     #[tokio::test]
     async fn authenticates_a_catalog_user() {
@@ -136,7 +66,7 @@ mod tests {
             .put_user(
                 User {
                     name: "alice".to_string(),
-                    password: Some(make_password_credential("s3cr3t")),
+                    password: Some(make_scram_value("s3cr3t")),
                 },
                 MetadataPutCondition::NotExists,
             )

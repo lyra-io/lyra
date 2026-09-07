@@ -1,5 +1,6 @@
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
+    validate_user,
 };
 use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
 use async_trait::async_trait;
@@ -123,6 +124,7 @@ impl Metadata for MemoryMetadata {
         user: User,
         condition: MetadataPutCondition,
     ) -> Result<MetadataVersion> {
+        validate_user(&user)?;
         let mut state = self.state.write().await;
         let State {
             next_version,
@@ -154,6 +156,7 @@ impl Metadata for MemoryMetadata {
         user: User,
         expected_version: MetadataVersion,
     ) -> Result<MetadataVersion> {
+        validate_user(&user)?;
         let mut state = self.state.write().await;
         let old_name = name.to_string();
         if state.users.contains_key(&user.name)

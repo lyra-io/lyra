@@ -22,23 +22,61 @@ async fn authenticates_catalog_users() {
     root.batch_execute("CREATE USER reader WITH PASSWORD 'reader-password'")
         .await
         .unwrap();
+    root.batch_execute("CREATE SECRET login_password VALUE 'secret-password'")
+        .await
+        .unwrap();
+    root.batch_execute("CREATE USER secret_reader PASSWORD SECRET login_password")
+        .await
+        .unwrap();
 
     let reader = connect0(port, "reader", "reader-password").await;
     let value: i64 = reader.query_one("SELECT 1", &[]).await.unwrap().get(0);
     assert_eq!(value, 1);
+    let secret_reader = connect0(port, "secret_reader", "secret-password").await;
+    let value: i64 = secret_reader
+        .query_one("SELECT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(value, 1);
+
+    root.batch_execute("ALTER USER reader PASSWORD SECRET login_password")
+        .await
+        .unwrap();
+    root.batch_execute("DROP SECRET login_password")
+        .await
+        .unwrap();
+    let reader = connect0(port, "reader", "secret-password").await;
+    let value: i64 = reader.query_one("SELECT 1", &[]).await.unwrap().get(0);
+    assert_eq!(value, 1);
+
+    root.batch_execute("ALTER USER secret_reader PASSWORD NULL")
+        .await
+        .unwrap();
+    let without_password = format!(
+        "host=127.0.0.1 port={port} user=secret_reader password=secret-password \
+         dbname=dev sslmode=disable"
+    );
+    assert!(
+        tokio_postgres::connect(&without_password, NoTls)
+            .await
+            .is_err()
+    );
 
     let rows = root
         .query("SELECT name FROM rw_catalog.rw_users ORDER BY name", &[])
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get::<_, String>(0), "reader");
     assert_eq!(rows[1].get::<_, String>(0), "root");
+    assert_eq!(rows[2].get::<_, String>(0), "secret_reader");
 
     let rows = root.query("SHOW USERS", &[]).await.unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get::<_, String>(0), "reader");
     assert_eq!(rows[1].get::<_, String>(0), "root");
+    assert_eq!(rows[2].get::<_, String>(0), "secret_reader");
 
     let roles = root
         .query(
@@ -47,7 +85,7 @@ async fn authenticates_catalog_users() {
         )
         .await
         .unwrap();
-    assert_eq!(roles.len(), 2);
+    assert_eq!(roles.len(), 3);
 
     let invalid =
         format!("host=127.0.0.1 port={port} user=root password=wrong dbname=dev sslmode=disable");

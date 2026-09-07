@@ -1,9 +1,10 @@
 use super::matches_like;
-use crate::sql::{AlterUser, AlterUserAction, CreateUser, DropUser, ShowUsers, UserPassword};
+use crate::sql::{AlterUser, AlterUserAction, CreateUser, DropUser, SecretName, ShowUsers, Value};
 use crate::{CataError, Result};
-use meta::auth::make_password_credential;
 use meta::metadata::{Metadata, MetadataError, MetadataPutCondition};
-use meta::proto::pb_catalog::{PasswordCredential, User};
+use meta::proto::pb_catalog::{User, Value as MetadataValue, value};
+use meta::utils::scram::make_scram;
+use std::str;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,14 +28,21 @@ impl UserExecutor {
         Self { metadata }
     }
 
-    pub async fn create(&self, statement: &CreateUser) -> Result<CreateUserOutcome> {
+    pub async fn create(
+        &self,
+        database: &str,
+        schemas: &[String],
+        statement: &CreateUser,
+    ) -> Result<CreateUserOutcome> {
         if self.metadata.get_user(statement.name()).await?.is_some() {
             return Err(CataError::UserAlreadyExists(statement.name().to_string()));
         }
 
         let user = User {
             name: statement.name().to_string(),
-            password: Some(make_password_credential(statement.password())),
+            password: self
+                .password0(database, schemas, statement.password())
+                .await?,
         };
         self.metadata
             .put_user(user, MetadataPutCondition::NotExists)
@@ -48,7 +56,13 @@ impl UserExecutor {
         Ok(CreateUserOutcome::Created)
     }
 
-    pub async fn alter(&self, current_user: Option<&str>, statement: &AlterUser) -> Result<()> {
+    pub async fn alter(
+        &self,
+        database: &str,
+        schemas: &[String],
+        current_user: Option<&str>,
+        statement: &AlterUser,
+    ) -> Result<()> {
         let Some(record) = self.metadata.get_user(statement.name()).await? else {
             return Err(CataError::UserNotFound(statement.name().to_string()));
         };
@@ -75,7 +89,7 @@ impl UserExecutor {
             }
             AlterUserAction::Password(password) => {
                 let mut user = record.value().clone();
-                user.password = Self::password0(password);
+                user.password = self.password0(database, schemas, password).await?;
                 self.metadata
                     .put_user(user, MetadataPutCondition::Version(record.version()))
                     .await
@@ -144,10 +158,192 @@ impl UserExecutor {
         Ok(users)
     }
 
-    fn password0(password: &UserPassword) -> Option<PasswordCredential> {
-        match password {
-            UserPassword::Null => None,
-            UserPassword::Value(password) => Some(make_password_credential(password)),
+    async fn password0(
+        &self,
+        database: &str,
+        schemas: &[String],
+        password: &Value,
+    ) -> Result<Option<MetadataValue>> {
+        let value = match password {
+            Value::Null => return Ok(None),
+            Value::Literal(password) => Value::Scram(make_scram(password)),
+            Value::Secret(secret) => {
+                let password = self.secret0(database, schemas, secret).await?;
+                let password = str::from_utf8(&password)
+                    .map_err(|_| CataError::InvalidPasswordSecret(secret.name().to_string()))?;
+                Value::Scram(make_scram(password))
+            }
+            Value::Scram(scram) => Value::Scram(scram.clone()),
+        };
+        let Value::Scram(scram) = value else {
+            unreachable!("password values are normalized to SCRAM before metadata storage")
+        };
+        Ok(Some(MetadataValue {
+            kind: Some(value::Kind::Scram(scram)),
+        }))
+    }
+
+    async fn secret0(
+        &self,
+        database: &str,
+        schemas: &[String],
+        secret: &SecretName,
+    ) -> Result<Vec<u8>> {
+        if let Some(schema) = secret.schema() {
+            if self.metadata.get_schema(database, schema).await?.is_none() {
+                return Err(CataError::SchemaNotFound {
+                    database: database.to_string(),
+                    schema: schema.to_string(),
+                });
+            }
+            return self
+                .metadata
+                .get_secret(database, schema, secret.name())
+                .await?
+                .map(|record| record.value().value.to_vec())
+                .ok_or_else(|| CataError::SecretNotFound(secret.name().to_string()));
         }
+
+        for schema in schemas {
+            if let Some(record) = self
+                .metadata
+                .get_secret(database, schema, secret.name())
+                .await?
+            {
+                return Ok(record.value().value.to_vec());
+            }
+        }
+        Err(CataError::SecretNotFound(secret.name().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meta::metadata::{DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, MemoryMetadata};
+    use meta::proto::pb_catalog::{Schema, Secret};
+    use meta::utils::scram::{as_scram, verify_scram};
+
+    async fn metadata0() -> Arc<MemoryMetadata> {
+        let metadata = Arc::new(MemoryMetadata::new());
+        metadata
+            .put_schema(
+                DEFAULT_DATABASE_NAME,
+                Schema {
+                    name: DEFAULT_SCHEMA_NAME.to_string(),
+                },
+                MetadataPutCondition::NotExists,
+            )
+            .await
+            .unwrap();
+        metadata
+    }
+
+    #[tokio::test]
+    async fn stores_literal_passwords_as_scram() {
+        let metadata = metadata0().await;
+        let executor = UserExecutor::new(metadata.clone());
+        executor
+            .create(
+                DEFAULT_DATABASE_NAME,
+                &[DEFAULT_SCHEMA_NAME.to_string()],
+                &CreateUser::new("alice".to_string(), Value::Literal("password".to_string())),
+            )
+            .await
+            .unwrap();
+
+        let user = metadata.get_user("alice").await.unwrap().unwrap();
+        let scram = user.value().password.as_ref().and_then(as_scram).unwrap();
+        assert!(verify_scram("password", scram));
+    }
+
+    #[tokio::test]
+    async fn resolves_secret_passwords_before_storage() {
+        let metadata = metadata0().await;
+        metadata
+            .put_secret(
+                DEFAULT_DATABASE_NAME,
+                DEFAULT_SCHEMA_NAME,
+                Secret {
+                    name: "login_password".to_string(),
+                    value: b"password".to_vec().into(),
+                },
+                MetadataPutCondition::NotExists,
+            )
+            .await
+            .unwrap();
+        let executor = UserExecutor::new(metadata.clone());
+        executor
+            .create(
+                DEFAULT_DATABASE_NAME,
+                &[DEFAULT_SCHEMA_NAME.to_string()],
+                &CreateUser::new(
+                    "alice".to_string(),
+                    Value::Secret(SecretName::new(
+                        Some(DEFAULT_SCHEMA_NAME.to_string()),
+                        "login_password".to_string(),
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let user = metadata.get_user("alice").await.unwrap().unwrap();
+        let scram = user.value().password.as_ref().and_then(as_scram).unwrap();
+        assert!(verify_scram("password", scram));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_password_secrets() {
+        let metadata = metadata0().await;
+        let executor = UserExecutor::new(metadata);
+        let result = executor
+            .create(
+                DEFAULT_DATABASE_NAME,
+                &[DEFAULT_SCHEMA_NAME.to_string()],
+                &CreateUser::new(
+                    "alice".to_string(),
+                    Value::Secret(SecretName::new(None, "missing".to_string())),
+                ),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CataError::SecretNotFound(name)) if name == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_utf8_password_secrets() {
+        let metadata = metadata0().await;
+        metadata
+            .put_secret(
+                DEFAULT_DATABASE_NAME,
+                DEFAULT_SCHEMA_NAME,
+                Secret {
+                    name: "login_password".to_string(),
+                    value: vec![0xff].into(),
+                },
+                MetadataPutCondition::NotExists,
+            )
+            .await
+            .unwrap();
+        let executor = UserExecutor::new(metadata);
+        let result = executor
+            .create(
+                DEFAULT_DATABASE_NAME,
+                &[DEFAULT_SCHEMA_NAME.to_string()],
+                &CreateUser::new(
+                    "alice".to_string(),
+                    Value::Secret(SecretName::new(None, "login_password".to_string())),
+                ),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CataError::InvalidPasswordSecret(name)) if name == "login_password"
+        ));
     }
 }

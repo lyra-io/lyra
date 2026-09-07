@@ -7,11 +7,12 @@ use datafusion_postgres::pgwire::api::auth::StartupHandler as PgWireStartupHandl
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::{ServerOptions, serve_with_handlers};
-use meta::auth::{BasicAuthenticationProvider, make_password_credential};
+use meta::auth::BasicAuthenticationProvider;
 use meta::metadata::{
     DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, Metadata, MetadataError, MetadataPutCondition,
 };
 use meta::proto::pb_catalog::{Database, Schema, User};
+use meta::utils::scram::make_scram_value;
 use std::sync::Arc;
 
 pub struct Cata {
@@ -59,7 +60,7 @@ impl Cata {
                 .ok_or(crate::CataError::BootstrapUserRequired)?;
             let user = User {
                 name: name.to_string(),
-                password: Some(make_password_credential(password)),
+                password: Some(make_scram_value(password)),
             };
             match metadata
                 .put_user(user, MetadataPutCondition::NotExists)
