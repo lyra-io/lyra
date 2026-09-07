@@ -1,13 +1,12 @@
 use crate::metadata::oxia::OxiaOptions;
 use crate::metadata::oxia::keyspace::Keyspace;
 use crate::metadata::path::{
-    CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, SINK_PATH, SOURCE_PATH, TABLE_PATH,
-    USER_PARTITION_KEY, USER_PATH,
+    CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, USER_PARTITION_KEY, USER_PATH,
 };
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
 };
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
+use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
 use oxia::{OxiaClient, OxiaError};
@@ -387,134 +386,6 @@ impl Metadata for OxiaMetadata {
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Connection>>> {
         let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        self.scan0(&path, Some(database)).await
-    }
-
-    async fn get_source(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Source>>> {
-        let path = self.object_path0(database, schema, SOURCE_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_source(
-        &self,
-        database: &str,
-        schema: &str,
-        source: Source,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, SOURCE_PATH)?;
-        let key = self.keyspace.object(&path, &source.name)?;
-        self.put0(&key, &source, condition, Some(database)).await
-    }
-
-    async fn delete_source(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, SOURCE_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_sources(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Source>>> {
-        let path = self.object_path0(database, schema, SOURCE_PATH)?;
-        self.scan0(&path, Some(database)).await
-    }
-
-    async fn get_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Sink>>> {
-        let path = self.object_path0(database, schema, SINK_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        sink: Sink,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, SINK_PATH)?;
-        let key = self.keyspace.object(&path, &sink.name)?;
-        self.put0(&key, &sink, condition, Some(database)).await
-    }
-
-    async fn delete_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, SINK_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_sinks(&self, database: &str, schema: &str) -> Result<Vec<MetadataRecord<Sink>>> {
-        let path = self.object_path0(database, schema, SINK_PATH)?;
-        self.scan0(&path, Some(database)).await
-    }
-
-    async fn get_table(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Table>>> {
-        let path = self.object_path0(database, schema, TABLE_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_table(
-        &self,
-        database: &str,
-        schema: &str,
-        table: Table,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, TABLE_PATH)?;
-        let key = self.keyspace.object(&path, &table.name)?;
-        self.put0(&key, &table, condition, Some(database)).await
-    }
-
-    async fn delete_table(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, TABLE_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_tables(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Table>>> {
-        let path = self.object_path0(database, schema, TABLE_PATH)?;
         self.scan0(&path, Some(database)).await
     }
 }

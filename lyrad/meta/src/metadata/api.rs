@@ -1,5 +1,5 @@
 use crate::metadata::Result;
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
+use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
 use async_trait::async_trait;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,84 +165,4 @@ pub trait Metadata: Send + Sync {
         database: &str,
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Connection>>>;
-
-    async fn get_source(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Source>>>;
-
-    async fn put_source(
-        &self,
-        database: &str,
-        schema: &str,
-        source: Source,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion>;
-
-    async fn delete_source(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()>;
-
-    async fn list_sources(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Source>>>;
-
-    async fn get_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Sink>>>;
-
-    async fn put_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        sink: Sink,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion>;
-
-    async fn delete_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()>;
-
-    async fn list_sinks(&self, database: &str, schema: &str) -> Result<Vec<MetadataRecord<Sink>>>;
-
-    async fn get_table(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Table>>>;
-
-    async fn put_table(
-        &self,
-        database: &str,
-        schema: &str,
-        table: Table,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion>;
-
-    async fn delete_table(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()>;
-
-    async fn list_tables(&self, database: &str, schema: &str)
-    -> Result<Vec<MetadataRecord<Table>>>;
 }

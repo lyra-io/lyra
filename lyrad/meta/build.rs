@@ -13,7 +13,6 @@ fn main() {
                 "proto/pb_catalog_io.proto",
                 "proto/pb_catalog_namespace.proto",
                 "proto/pb_catalog_stream.proto",
-                "proto/pb_catalog_table.proto",
             ],
             &["proto"],
         )

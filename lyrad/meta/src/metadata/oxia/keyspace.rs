@@ -63,7 +63,7 @@ impl Keyspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::path::{DATABASE_PATH, SCHEMA_PATH, SOURCE_PATH, USER_PATH};
+    use crate::metadata::path::{DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, USER_PATH};
 
     #[test]
     fn maps_logical_keys_into_the_configured_keyspace() {
@@ -85,17 +85,17 @@ mod tests {
         );
         assert_eq!(
             keyspace
-                .collection("/lyra/v1/databases/dev/schemas/", "public", SOURCE_PATH)
+                .collection("/lyra/v1/databases/dev/schemas/", "public", SECRET_PATH)
                 .unwrap(),
-            "/lyra/v1/databases/dev/schemas/public/sources/"
+            "/lyra/v1/databases/dev/schemas/public/secrets/"
         );
         assert_eq!(
             keyspace
-                .range("/lyra/v1/databases/dev/schemas/public/sources/")
+                .range("/lyra/v1/databases/dev/schemas/public/secrets/")
                 .unwrap(),
             (
-                "/lyra/v1/databases/dev/schemas/public/sources/".to_string(),
-                "/lyra/v1/databases/dev/schemas/public/sources/~".to_string()
+                "/lyra/v1/databases/dev/schemas/public/secrets/".to_string(),
+                "/lyra/v1/databases/dev/schemas/public/secrets/~".to_string()
             )
         );
     }

@@ -17,13 +17,3 @@ message SecretRef {
   string name = 1;
   string data = 2;
 }
-
-message Source {
-  string name = 1;
-  map<string, string> options = 2;
-}
-
-message Sink {
-  string name = 1;
-  map<string, string> options = 2;
-}

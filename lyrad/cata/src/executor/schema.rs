@@ -200,13 +200,10 @@ pub(crate) async fn schema_is_empty(
     database: &str,
     schema: &str,
 ) -> Result<bool> {
-    Ok(metadata.list_tables(database, schema).await?.is_empty()
-        && metadata.list_sinks(database, schema).await?.is_empty()
-        && metadata.list_sources(database, schema).await?.is_empty()
-        && metadata
-            .list_connections(database, schema)
-            .await?
-            .is_empty()
+    Ok(metadata
+        .list_connections(database, schema)
+        .await?
+        .is_empty()
         && metadata.list_secrets(database, schema).await?.is_empty())
 }
 
@@ -215,36 +212,6 @@ async fn drop_schema_contents0(
     database: &str,
     schema: &str,
 ) -> Result<()> {
-    for record in metadata.list_tables(database, schema).await? {
-        metadata
-            .delete_table(
-                database,
-                schema,
-                &record.value().name,
-                Some(record.version()),
-            )
-            .await?;
-    }
-    for record in metadata.list_sinks(database, schema).await? {
-        metadata
-            .delete_sink(
-                database,
-                schema,
-                &record.value().name,
-                Some(record.version()),
-            )
-            .await?;
-    }
-    for record in metadata.list_sources(database, schema).await? {
-        metadata
-            .delete_source(
-                database,
-                schema,
-                &record.value().name,
-                Some(record.version()),
-            )
-            .await?;
-    }
     for record in metadata.list_connections(database, schema).await? {
         metadata
             .delete_connection(

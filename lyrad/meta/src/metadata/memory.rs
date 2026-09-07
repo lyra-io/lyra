@@ -1,7 +1,7 @@
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
 };
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
+use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -20,9 +20,6 @@ struct State {
     schemas: HashMap<SchemaKey, MetadataRecord<Schema>>,
     secrets: HashMap<ObjectKey, MetadataRecord<Secret>>,
     connections: HashMap<ObjectKey, MetadataRecord<Connection>>,
-    sources: HashMap<ObjectKey, MetadataRecord<Source>>,
-    sinks: HashMap<ObjectKey, MetadataRecord<Sink>>,
-    tables: HashMap<ObjectKey, MetadataRecord<Table>>,
 }
 
 #[derive(Default)]
@@ -402,176 +399,6 @@ impl Metadata for MemoryMetadata {
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Connection>>> {
         Ok(list0(&self.state.read().await.connections, |key| {
-            key.0 == database && key.1 == schema
-        }))
-    }
-
-    async fn get_source(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Source>>> {
-        Ok(get0(
-            &self.state.read().await.sources,
-            &object_key0(database, schema, name),
-        ))
-    }
-
-    async fn put_source(
-        &self,
-        database: &str,
-        schema: &str,
-        source: Source,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            sources,
-            ..
-        } = &mut *state;
-        put0(
-            sources,
-            next_version,
-            object_key0(database, schema, &source.name),
-            source,
-            condition,
-        )
-    }
-
-    async fn delete_source(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.sources,
-            &object_key0(database, schema, name),
-            expected_version,
-        )
-    }
-
-    async fn list_sources(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Source>>> {
-        Ok(list0(&self.state.read().await.sources, |key| {
-            key.0 == database && key.1 == schema
-        }))
-    }
-
-    async fn get_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Sink>>> {
-        Ok(get0(
-            &self.state.read().await.sinks,
-            &object_key0(database, schema, name),
-        ))
-    }
-
-    async fn put_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        sink: Sink,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            sinks,
-            ..
-        } = &mut *state;
-        put0(
-            sinks,
-            next_version,
-            object_key0(database, schema, &sink.name),
-            sink,
-            condition,
-        )
-    }
-
-    async fn delete_sink(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.sinks,
-            &object_key0(database, schema, name),
-            expected_version,
-        )
-    }
-
-    async fn list_sinks(&self, database: &str, schema: &str) -> Result<Vec<MetadataRecord<Sink>>> {
-        Ok(list0(&self.state.read().await.sinks, |key| {
-            key.0 == database && key.1 == schema
-        }))
-    }
-
-    async fn get_table(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Table>>> {
-        Ok(get0(
-            &self.state.read().await.tables,
-            &object_key0(database, schema, name),
-        ))
-    }
-
-    async fn put_table(
-        &self,
-        database: &str,
-        schema: &str,
-        table: Table,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            tables,
-            ..
-        } = &mut *state;
-        put0(
-            tables,
-            next_version,
-            object_key0(database, schema, &table.name),
-            table,
-            condition,
-        )
-    }
-
-    async fn delete_table(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.tables,
-            &object_key0(database, schema, name),
-            expected_version,
-        )
-    }
-
-    async fn list_tables(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Table>>> {
-        Ok(list0(&self.state.read().await.tables, |key| {
             key.0 == database && key.1 == schema
         }))
     }

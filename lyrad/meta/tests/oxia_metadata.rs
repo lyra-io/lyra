@@ -1,8 +1,7 @@
 use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use meta::metadata::{Metadata, MetadataPutCondition};
 use meta::proto::pb_catalog::{
-    Column, Connection, Database, PasswordCredential, Schema, Secret, SecretRef, Sink, Source,
-    Table, User,
+    Connection, Database, PasswordCredential, Schema, Secret, SecretRef, User,
 };
 use std::collections::HashMap;
 use std::env;
@@ -21,9 +20,6 @@ async fn stores_typed_protobuf_metadata() {
     let schema_name = "public";
     let secret_name = format!("test-secret-{suffix}");
     let connection_name = format!("test-connection-{suffix}");
-    let source_name = format!("test-source-{suffix}");
-    let sink_name = format!("test-sink-{suffix}");
-    let table_name = format!("test-table-{suffix}");
     let renamed_user_name = format!("test-renamed-user-{suffix}");
     let metadata = OxiaMetadata::new(&OxiaOptions::new(address, "default"))
         .await
@@ -92,57 +88,6 @@ async fn stores_typed_protobuf_metadata() {
         )
         .await
         .unwrap();
-    let source_version = metadata
-        .put_source(
-            &database_name,
-            schema_name,
-            Source {
-                name: source_name.clone(),
-                options: HashMap::from([
-                    ("connection".to_string(), connection_name.clone()),
-                    ("topic".to_string(), "orders".to_string()),
-                ]),
-            },
-            MetadataPutCondition::NotExists,
-        )
-        .await
-        .unwrap();
-    let sink_version = metadata
-        .put_sink(
-            &database_name,
-            schema_name,
-            Sink {
-                name: sink_name.clone(),
-                options: HashMap::from([
-                    ("connection".to_string(), connection_name.clone()),
-                    ("topic".to_string(), "orders-output".to_string()),
-                ]),
-            },
-            MetadataPutCondition::NotExists,
-        )
-        .await
-        .unwrap();
-    let table_version = metadata
-        .put_table(
-            &database_name,
-            schema_name,
-            Table {
-                name: table_name.clone(),
-                source: source_name.clone(),
-                sink: sink_name.clone(),
-                columns: vec![Column {
-                    name: "id".to_string(),
-                    data_type: "BIGINT".to_string(),
-                    nullable: false,
-                }],
-                primary_key: vec!["id".to_string()],
-                options: HashMap::new(),
-            },
-            MetadataPutCondition::NotExists,
-        )
-        .await
-        .unwrap();
-
     let stored = metadata
         .get_connection(&database_name, schema_name, &connection_name)
         .await
@@ -161,39 +106,6 @@ async fn stores_typed_protobuf_metadata() {
             .name,
         user_name
     );
-    assert_eq!(
-        metadata
-            .get_table(&database_name, schema_name, &table_name)
-            .await
-            .unwrap()
-            .unwrap()
-            .value()
-            .source,
-        source_name
-    );
-
-    metadata
-        .delete_table(
-            &database_name,
-            schema_name,
-            &table_name,
-            Some(table_version),
-        )
-        .await
-        .unwrap();
-    metadata
-        .delete_sink(&database_name, schema_name, &sink_name, Some(sink_version))
-        .await
-        .unwrap();
-    metadata
-        .delete_source(
-            &database_name,
-            schema_name,
-            &source_name,
-            Some(source_version),
-        )
-        .await
-        .unwrap();
     metadata
         .delete_connection(
             &database_name,
