@@ -68,9 +68,6 @@ mod tests {
                 User {
                     id: 7,
                     name: "alice".to_string(),
-                    is_superuser: true,
-                    can_create_database: true,
-                    can_create_user: true,
                     password: None,
                 },
                 MetadataPutCondition::NotExists,

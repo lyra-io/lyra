@@ -5,11 +5,10 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 #[tokio::test]
-async fn authenticates_and_authorizes_catalog_users() {
+async fn authenticates_catalog_users() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -20,24 +19,23 @@ async fn authenticates_and_authorizes_catalog_users() {
     let server = tokio::spawn(cata.serve());
 
     let root = connect0(port, "root", "s3cr3t").await;
-    root.batch_execute("CREATE USER reader PASSWORD 'reader-password'")
+    root.batch_execute("CREATE USER reader WITH PASSWORD 'reader-password'")
         .await
         .unwrap();
 
     let reader = connect0(port, "reader", "reader-password").await;
-    let error = reader
-        .batch_execute("CREATE USER forbidden PASSWORD 'password'")
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error.as_db_error().unwrap().code(),
-        &SqlState::INSUFFICIENT_PRIVILEGE
-    );
+    let value: i64 = reader.query_one("SELECT 1", &[]).await.unwrap().get(0);
+    assert_eq!(value, 1);
 
     let rows = root
         .query("SELECT name FROM rw_catalog.rw_users ORDER BY name", &[])
         .await
         .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "reader");
+    assert_eq!(rows[1].get::<_, String>(0), "root");
+
+    let rows = root.query("SHOW USERS", &[]).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, String>(0), "reader");
     assert_eq!(rows[1].get::<_, String>(0), "root");

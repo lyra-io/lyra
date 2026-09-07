@@ -4,11 +4,8 @@ package io.lyra.proto.catalog.v1;
 
 message User {
   string name = 1;
-  bool is_superuser = 2;
-  bool can_create_database = 3;
-  bool can_create_user = 4;
-  reserved 5;
-  reserved "can_login";
+  reserved 2, 3, 4, 5;
+  reserved "is_superuser", "can_create_database", "can_create_user", "can_login";
   PasswordCredential password = 6;
   uint32 id = 7;
 }

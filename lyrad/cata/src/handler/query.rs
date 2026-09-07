@@ -1,11 +1,9 @@
 use super::DatabaseHandles;
 use crate::error::to_pgwire_error;
-use crate::executor::{
-    Authorization, DatabaseExecutor, SchemaExecutor, SecretExecutor, UserExecutor,
-};
+use crate::executor::{DatabaseExecutor, SchemaExecutor, SecretExecutor, UserExecutor};
 use crate::sql::{
     CataQueryParser, CatalogStatement, DatabaseStatement, SchemaStatement, SecretStatement,
-    UserStatement, show_names_fields, show_users_fields,
+    UserStatement, show_names_fields,
 };
 use datafusion_postgres::pgwire::api::portal::Format;
 use datafusion_postgres::pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
@@ -18,7 +16,6 @@ pub(crate) struct QueryHandler {
     // Immutable state
     pub(super) databases: Arc<DatabaseHandles>,
     pub(super) parser: Arc<CataQueryParser>,
-    authorization: Authorization,
     database_executor: DatabaseExecutor,
     schema_executor: SchemaExecutor,
     secret_executor: SecretExecutor,
@@ -28,7 +25,6 @@ pub(crate) struct QueryHandler {
 impl QueryHandler {
     pub(crate) fn new(databases: Arc<DatabaseHandles>, metadata: Arc<dyn Metadata>) -> Self {
         let parser = Arc::new(CataQueryParser::new(Arc::clone(&databases)));
-        let authorization = Authorization::new(Arc::clone(&metadata));
         let database_executor =
             DatabaseExecutor::new(Arc::clone(&metadata), Arc::clone(&databases));
         let schema_executor = SchemaExecutor::new(Arc::clone(&metadata));
@@ -37,7 +33,6 @@ impl QueryHandler {
         Self {
             databases,
             parser,
-            authorization,
             database_executor,
             schema_executor,
             secret_executor,
@@ -53,12 +48,6 @@ impl QueryHandler {
         statement: CatalogStatement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Response> {
-        let user = self
-            .authorization
-            .check(current_user, &statement)
-            .await
-            .map_err(to_pgwire_error)?;
-        let current_user = user.name.as_str();
         match statement {
             CatalogStatement::Database(DatabaseStatement::Create(statement)) => {
                 self.database_executor
@@ -156,14 +145,14 @@ impl QueryHandler {
             }
             CatalogStatement::User(UserStatement::Alter(statement)) => {
                 self.user_executor
-                    .alter(Some(current_user), &statement)
+                    .alter(current_user, &statement)
                     .await
                     .map_err(to_pgwire_error)?;
                 Ok(Response::Execution(Tag::new("ALTER USER")))
             }
             CatalogStatement::User(UserStatement::Drop(statement)) => {
                 self.user_executor
-                    .drop(Some(current_user), &statement)
+                    .drop(current_user, &statement)
                     .await
                     .map_err(to_pgwire_error)?;
                 Ok(Response::Execution(Tag::new("DROP USER")))
@@ -174,19 +163,7 @@ impl QueryHandler {
                     .show(&statement)
                     .await
                     .map_err(to_pgwire_error)?;
-                let fields = Arc::new(show_users_fields(column_format));
-                let row_fields = Arc::clone(&fields);
-                let rows = stream::iter(users.into_iter().map(move |user| {
-                    let mut encoder = DataRowEncoder::new(Arc::clone(&row_fields));
-                    encoder.encode_field(&Some(user.name()))?;
-                    encoder.encode_field(&Some(user.superuser()))?;
-                    encoder.encode_field(&Some(user.create_database()))?;
-                    encoder.encode_field(&Some(user.create_user()))?;
-                    Ok(encoder.take_row())
-                }));
-                let mut response = QueryResponse::new(fields, rows);
-                response.set_command_tag("SHOW");
-                Ok(Response::Query(response))
+                Self::show0(users, column_format)
             }
         }
     }

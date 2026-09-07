@@ -35,14 +35,8 @@ pub enum CataError {
     #[error("authentication is required")]
     AuthenticationRequired,
 
-    #[error("permission denied for {0}")]
-    PermissionDenied(String),
-
-    #[error("a bootstrap administrator is required when the user catalog is empty")]
-    BootstrapAdministratorRequired,
-
-    #[error("the user catalog must contain at least one superuser")]
-    AdministratorRequired,
+    #[error("a bootstrap user is required when the user catalog is empty")]
+    BootstrapUserRequired,
 
     #[error("user {0:?} has an invalid password credential")]
     InvalidPasswordCredential(String),

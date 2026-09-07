@@ -34,9 +34,6 @@ async fn stores_typed_protobuf_metadata() {
         .put_user(
             User {
                 name: user_name.clone(),
-                is_superuser: false,
-                can_create_database: true,
-                can_create_user: false,
                 password: Some(PasswordCredential {
                     salt: b"salt".to_vec().into(),
                     salted_password: b"hash".to_vec().into(),
@@ -157,14 +154,15 @@ async fn stores_typed_protobuf_metadata() {
     assert_eq!(stored.value().name, connection_name);
     assert_eq!(stored.value().options["type"], "kafka");
     assert_eq!(stored.value().secret_refs[0].data, secret_name);
-    assert!(
+    assert_eq!(
         metadata
             .get_user(&user_name)
             .await
             .unwrap()
             .unwrap()
             .value()
-            .can_create_database
+            .name,
+        user_name
     );
     assert_eq!(
         metadata

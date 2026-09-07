@@ -51,11 +51,11 @@ impl PgCatalogContextProvider for CatalogContextProvider {
         let user = self.metadata.get_user(name).await.ok()??;
         Some(Role {
             name: user.value().name.clone(),
-            is_superuser: user.value().is_superuser,
+            is_superuser: false,
             can_login: user.value().password.is_some(),
-            can_create_db: user.value().can_create_database,
-            can_create_role: user.value().can_create_user,
-            can_create_user: user.value().can_create_user,
+            can_create_db: false,
+            can_create_role: false,
+            can_create_user: false,
             can_replication: false,
             grants: Vec::new(),
             inherited_roles: Vec::new(),
@@ -144,18 +144,9 @@ impl TableProvider for RwUsersTable {
             .iter()
             .map(|user| user.value().name.as_str())
             .collect::<Vec<_>>();
-        let is_super = users
-            .iter()
-            .map(|user| user.value().is_superuser)
-            .collect::<Vec<_>>();
-        let create_db = users
-            .iter()
-            .map(|user| user.value().can_create_database)
-            .collect::<Vec<_>>();
-        let create_user = users
-            .iter()
-            .map(|user| user.value().can_create_user)
-            .collect::<Vec<_>>();
+        let is_super = vec![false; users.len()];
+        let create_db = vec![false; users.len()];
+        let create_user = vec![false; users.len()];
         let can_login = users
             .iter()
             .map(|user| user.value().password.is_some())
@@ -167,7 +158,7 @@ impl TableProvider for RwUsersTable {
             Arc::new(BooleanArray::from(create_db)),
             Arc::new(BooleanArray::from(create_user)),
             Arc::new(BooleanArray::from(can_login)),
-            Arc::new(BooleanArray::from(is_super)),
+            Arc::new(BooleanArray::from(vec![false; users.len()])),
         ];
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)?;
         Ok(MemorySourceConfig::try_new_exec(

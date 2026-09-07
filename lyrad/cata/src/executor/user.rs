@@ -1,11 +1,7 @@
 use super::matches_like;
-use crate::sql::{
-    AlterUser, AlterUserAction, CreateUser, DropUser, ShowUsers, UserOptions, UserPassword,
-};
+use crate::authentication::make_password_credential;
+use crate::sql::{AlterUser, AlterUserAction, CreateUser, DropUser, ShowUsers, UserPassword};
 use crate::{CataError, Result};
-use datafusion_postgres::pgwire::api::auth::sasl::scram::{
-    SCRAM_ITERATIONS, gen_salted_password, random_nonce,
-};
 use meta::metadata::{Metadata, MetadataError, MetadataPutCondition};
 use meta::proto::pb_catalog::{PasswordCredential, User};
 use std::sync::Arc;
@@ -19,31 +15,6 @@ pub enum CreateUserOutcome {
 pub enum DropUserOutcome {
     Dropped,
     NotFound,
-}
-
-pub(crate) struct UserSummary {
-    name: String,
-    superuser: bool,
-    create_database: bool,
-    create_user: bool,
-}
-
-impl UserSummary {
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub(crate) fn superuser(&self) -> bool {
-        self.superuser
-    }
-
-    pub(crate) fn create_database(&self) -> bool {
-        self.create_database
-    }
-
-    pub(crate) fn create_user(&self) -> bool {
-        self.create_user
-    }
 }
 
 pub(crate) struct UserExecutor {
@@ -61,14 +32,10 @@ impl UserExecutor {
             return Err(CataError::UserAlreadyExists(statement.name().to_string()));
         }
 
-        let options = statement.options();
         let user = User {
             id: self.metadata.allocate_user_id().await?,
             name: statement.name().to_string(),
-            is_superuser: options.superuser().unwrap_or(false),
-            can_create_database: options.create_database().unwrap_or(false),
-            can_create_user: options.create_user().unwrap_or(false),
-            password: Self::password0(options.password()),
+            password: Some(make_password_credential(statement.password())),
         };
         self.metadata
             .put_user(user, MetadataPutCondition::NotExists)
@@ -107,13 +74,9 @@ impl UserExecutor {
                         error => error.into(),
                     })?;
             }
-            AlterUserAction::Options(options) => {
-                if record.value().is_superuser && options.superuser() == Some(false) {
-                    self.require_administrator_remains0(&[statement.name().to_string()])
-                        .await?;
-                }
+            AlterUserAction::Password(password) => {
                 let mut user = record.value().clone();
-                Self::apply_options0(&mut user, options);
+                user.password = Self::password0(password);
                 self.metadata
                     .put_user(user, MetadataPutCondition::Version(record.version()))
                     .await
@@ -138,13 +101,11 @@ impl UserExecutor {
             if current_user == Some(name.as_str()) {
                 return Err(CataError::UserInUse(name.clone()));
             }
-            if records.iter().any(|(existing, _, _)| existing == name) {
+            if records.iter().any(|(existing, _)| existing == name) {
                 continue;
             }
             match self.metadata.get_user(name).await? {
-                Some(record) => {
-                    records.push((name.clone(), record.version(), record.value().is_superuser));
-                }
+                Some(record) => records.push((name.clone(), record.version())),
                 None if statement.if_exists() => {}
                 None => return Err(CataError::UserNotFound(name.clone())),
             }
@@ -153,18 +114,9 @@ impl UserExecutor {
         if records.is_empty() {
             return Ok(DropUserOutcome::NotFound);
         }
-        if records.iter().any(|(_, _, is_superuser)| *is_superuser) {
-            self.require_administrator_remains0(
-                &records
-                    .iter()
-                    .map(|(name, _, _)| name.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
-        }
         let deletes = records
             .iter()
-            .map(|(name, version, _)| (name.clone(), *version))
+            .map(|(name, version)| (name.clone(), *version))
             .collect::<Vec<_>>();
         self.metadata
             .delete_users(&deletes)
@@ -176,7 +128,7 @@ impl UserExecutor {
         Ok(DropUserOutcome::Dropped)
     }
 
-    pub async fn show(&self, statement: &ShowUsers) -> Result<Vec<UserSummary>> {
+    pub async fn show(&self, statement: &ShowUsers) -> Result<Vec<String>> {
         let mut users = self
             .metadata
             .list_users()
@@ -187,97 +139,16 @@ impl UserExecutor {
                     .like()
                     .is_none_or(|pattern| matches_like(&user.value().name, pattern))
             })
-            .map(|user| UserSummary {
-                name: user.value().name.clone(),
-                superuser: user.value().is_superuser,
-                create_database: user.value().can_create_database,
-                create_user: user.value().can_create_user,
-            })
+            .map(|user| user.value().name.clone())
             .collect::<Vec<_>>();
-        users.sort_by(|left, right| left.name.cmp(&right.name));
+        users.sort();
         Ok(users)
     }
 
-    fn apply_options0(user: &mut User, options: &UserOptions) {
-        if let Some(value) = options.superuser() {
-            user.is_superuser = value;
-        }
-        if let Some(value) = options.create_database() {
-            user.can_create_database = value;
-        }
-        if let Some(value) = options.create_user() {
-            user.can_create_user = value;
-        }
-        match options.password() {
-            UserPassword::Unchanged => {}
-            UserPassword::Null => user.password = None,
-            UserPassword::Value(_) => user.password = Self::password0(options.password()),
-        }
-    }
-
     fn password0(password: &UserPassword) -> Option<PasswordCredential> {
-        let UserPassword::Value(password) = password else {
-            return None;
-        };
-        Some(make_password_credential(password))
-    }
-
-    async fn require_administrator_remains0(&self, removed: &[String]) -> Result<()> {
-        if self.metadata.list_users().await?.into_iter().any(|user| {
-            user.value().is_superuser && !removed.iter().any(|name| name == &user.value().name)
-        }) {
-            Ok(())
-        } else {
-            Err(CataError::AdministratorRequired)
+        match password {
+            UserPassword::Null => None,
+            UserPassword::Value(password) => Some(make_password_credential(password)),
         }
-    }
-}
-
-pub(crate) fn make_password_credential(password: &str) -> PasswordCredential {
-    let salt = random_nonce().into_bytes();
-    PasswordCredential {
-        salted_password: gen_salted_password(password, &salt, SCRAM_ITERATIONS).into(),
-        salt: salt.into(),
-        iterations: SCRAM_ITERATIONS as u32,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use meta::metadata::MemoryMetadata;
-
-    #[test]
-    fn stores_scram_salted_password_material() {
-        let password = UserPassword::Value("s3cr3t".to_string());
-        let first = UserExecutor::password0(&password).unwrap();
-        let second = UserExecutor::password0(&password).unwrap();
-
-        assert_eq!(first.iterations, SCRAM_ITERATIONS as u32);
-        assert_eq!(
-            first.salted_password.as_ref(),
-            gen_salted_password("s3cr3t", &first.salt, SCRAM_ITERATIONS)
-        );
-        assert_ne!(first.salted_password.as_ref(), b"s3cr3t");
-        assert_ne!(first.salt, second.salt);
-    }
-
-    #[tokio::test]
-    async fn refuses_to_drop_the_last_superuser() {
-        let metadata = Arc::new(MemoryMetadata::new());
-        let executor = UserExecutor::new(metadata);
-        executor
-            .create(&CreateUser::new(
-                "root".to_string(),
-                UserOptions::new(Some(true), Some(true), Some(true), UserPassword::Unchanged),
-            ))
-            .await
-            .unwrap();
-
-        let result = executor
-            .drop(None, &DropUser::new(vec!["root".to_string()], false))
-            .await;
-
-        assert!(matches!(result, Err(CataError::AdministratorRequired)));
     }
 }

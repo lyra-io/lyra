@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::executor::make_password_credential;
+use crate::authentication::{PasswordAuthenticationProvider, make_password_credential};
 use crate::handler::{DatabaseHandles, QueryHandler, StartupHandler};
 use crate::options::CataOptions;
 use datafusion_postgres::pgwire::api::ConnectionManager;
@@ -26,7 +26,7 @@ pub struct Cata {
 
 impl Cata {
     pub async fn new(options: CataOptions, metadata: Arc<dyn Metadata>) -> Result<Self> {
-        Self::bootstrap_administrator0(&options, &metadata).await?;
+        Self::bootstrap_user0(&options, &metadata).await?;
         Self::bootstrap_database0(&metadata).await?;
 
         let databases = Arc::new(DatabaseHandles::new(Arc::clone(&metadata))?);
@@ -36,8 +36,14 @@ impl Cata {
             Arc::clone(&databases),
             Arc::clone(&metadata),
         ));
-        let startup_handler =
-            Arc::new(StartupHandler::new(connection_manager, metadata, databases));
+        let authentication_provider = Arc::new(PasswordAuthenticationProvider::new(
+            metadata,
+            Arc::clone(&databases),
+        ));
+        let startup_handler = Arc::new(StartupHandler::new(
+            connection_manager,
+            vec![authentication_provider],
+        ));
         Ok(Self {
             cancel_handler,
             options,
@@ -46,19 +52,13 @@ impl Cata {
         })
     }
 
-    async fn bootstrap_administrator0(
-        options: &CataOptions,
-        metadata: &Arc<dyn Metadata>,
-    ) -> Result<()> {
+    async fn bootstrap_user0(options: &CataOptions, metadata: &Arc<dyn Metadata>) -> Result<()> {
         if metadata.list_users().await?.is_empty() {
             let (name, password) = options
                 .bootstrap_user()
-                .ok_or(crate::CataError::BootstrapAdministratorRequired)?;
+                .ok_or(crate::CataError::BootstrapUserRequired)?;
             let user = User {
                 name: name.to_string(),
-                is_superuser: true,
-                can_create_database: true,
-                can_create_user: true,
                 password: Some(make_password_credential(password)),
                 id: metadata.allocate_user_id().await?,
             };
@@ -71,16 +71,11 @@ impl Cata {
             }
         }
 
-        let users = metadata.list_users().await?;
-        let configured = options.bootstrap_user().map(|(name, _)| name);
-        users
-            .iter()
-            .find(|user| {
-                configured == Some(user.value().name.as_str()) && user.value().is_superuser
-            })
-            .or_else(|| users.iter().find(|user| user.value().is_superuser))
-            .map(|_| ())
-            .ok_or(crate::CataError::AdministratorRequired)
+        if metadata.list_users().await?.is_empty() {
+            Err(crate::CataError::BootstrapUserRequired)
+        } else {
+            Ok(())
+        }
     }
 
     async fn bootstrap_database0(metadata: &Arc<dyn Metadata>) -> Result<()> {
@@ -160,16 +155,13 @@ mod tests {
     use meta::metadata::MemoryMetadata;
 
     #[tokio::test]
-    async fn bootstraps_the_administrator_and_default_catalog() {
+    async fn bootstraps_the_user_and_default_catalog() {
         let metadata = Arc::new(MemoryMetadata::new());
         let options = CataOptions::default().with_bootstrap_user("root", "s3cr3t");
 
         let _cata = Cata::new(options, metadata.clone()).await.unwrap();
 
         let user = metadata.get_user("root").await.unwrap().unwrap();
-        assert!(user.value().is_superuser);
-        assert!(user.value().can_create_database);
-        assert!(user.value().can_create_user);
         assert!(user.value().password.is_some());
         assert!(
             metadata
@@ -188,14 +180,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requires_a_bootstrap_administrator_for_an_empty_catalog() {
+    async fn requires_a_bootstrap_user_for_an_empty_catalog() {
         let metadata = Arc::new(MemoryMetadata::new());
 
         let result = Cata::new(CataOptions::default(), metadata).await;
 
         assert!(matches!(
             result,
-            Err(crate::CataError::BootstrapAdministratorRequired)
+            Err(crate::CataError::BootstrapUserRequired)
         ));
     }
 }
