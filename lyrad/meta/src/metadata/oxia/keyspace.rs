@@ -63,12 +63,16 @@ impl Keyspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::path::{DATABASE_PATH, SCHEMA_PATH, SOURCE_PATH};
+    use crate::metadata::path::{DATABASE_PATH, SCHEMA_PATH, SOURCE_PATH, USER_PATH};
 
     #[test]
     fn maps_logical_keys_into_the_configured_keyspace() {
         let keyspace = Keyspace::new();
 
+        assert_eq!(
+            keyspace.object(USER_PATH, "root").unwrap(),
+            "/lyra/v1/users/root"
+        );
         assert_eq!(
             keyspace.object(DATABASE_PATH, "dev").unwrap(),
             "/lyra/v1/databases/dev"

@@ -1,7 +1,8 @@
 use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use meta::metadata::{Metadata, MetadataPutCondition};
 use meta::proto::pb_catalog::{
-    Column, Connection, Database, Schema, Secret, SecretRef, Sink, Source, Table,
+    Column, Connection, Database, PasswordCredential, Schema, Secret, SecretRef, Sink, Source,
+    Table, User,
 };
 use std::collections::HashMap;
 use std::env;
@@ -16,6 +17,7 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap()
         .as_nanos();
     let database_name = format!("test-database-{suffix}");
+    let user_name = format!("test-user-{suffix}");
     let schema_name = "public";
     let secret_name = format!("test-secret-{suffix}");
     let connection_name = format!("test-connection-{suffix}");
@@ -26,6 +28,24 @@ async fn stores_typed_protobuf_metadata() {
         .await
         .unwrap();
 
+    let user_version = metadata
+        .put_user(
+            User {
+                name: user_name.clone(),
+                is_superuser: false,
+                can_create_database: true,
+                can_create_user: false,
+                can_login: true,
+                password: Some(PasswordCredential {
+                    salt: b"salt".to_vec().into(),
+                    salted_password: b"hash".to_vec().into(),
+                    iterations: 4096,
+                }),
+            },
+            MetadataPutCondition::NotExists,
+        )
+        .await
+        .unwrap();
     let database_version = metadata
         .put_database(
             Database {
@@ -135,6 +155,15 @@ async fn stores_typed_protobuf_metadata() {
     assert_eq!(stored.value().name, connection_name);
     assert_eq!(stored.value().options["type"], "kafka");
     assert_eq!(stored.value().secret_refs[0].data, secret_name);
+    assert!(
+        metadata
+            .get_user(&user_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .value()
+            .can_create_database
+    );
     assert_eq!(
         metadata
             .get_table(&database_name, schema_name, &table_name)
@@ -192,6 +221,10 @@ async fn stores_typed_protobuf_metadata() {
         .unwrap();
     metadata
         .delete_database(&database_name, Some(database_version))
+        .await
+        .unwrap();
+    metadata
+        .delete_user(&user_name, Some(user_version))
         .await
         .unwrap();
 }

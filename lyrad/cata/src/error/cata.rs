@@ -20,6 +20,18 @@ pub enum CataError {
     #[error(transparent)]
     Metadata(#[from] MetadataError),
 
+    #[error("user {0:?} already exists")]
+    UserAlreadyExists(String),
+
+    #[error("user {0:?} does not exist")]
+    UserNotFound(String),
+
+    #[error("user {0:?} changed concurrently")]
+    UserChanged(String),
+
+    #[error("user {0:?} is the current user")]
+    UserInUse(String),
+
     #[error("secret {0:?} already exists")]
     SecretAlreadyExists(String),
 

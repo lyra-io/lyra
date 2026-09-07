@@ -1,5 +1,5 @@
 use crate::metadata::Result;
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table};
+use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
 use async_trait::async_trait;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +45,22 @@ pub enum MetadataPutCondition {
 
 #[async_trait]
 pub trait Metadata: Send + Sync {
+    async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>>;
+
+    async fn put_user(
+        &self,
+        user: User,
+        condition: MetadataPutCondition,
+    ) -> Result<MetadataVersion>;
+
+    async fn delete_user(
+        &self,
+        name: &str,
+        expected_version: Option<MetadataVersion>,
+    ) -> Result<()>;
+
+    async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>>;
+
     async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>>;
 
     async fn put_database(

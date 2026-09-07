@@ -2,6 +2,21 @@ syntax = "proto3";
 
 package io.lyra.proto.catalog.v1;
 
+message User {
+  string name = 1;
+  bool is_superuser = 2;
+  bool can_create_database = 3;
+  bool can_create_user = 4;
+  bool can_login = 5;
+  PasswordCredential password = 6;
+}
+
+message PasswordCredential {
+  bytes salt = 1;
+  bytes salted_password = 2;
+  uint32 iterations = 3;
+}
+
 message Database {
   string name = 1;
 }

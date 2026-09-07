@@ -2,9 +2,10 @@ use crate::Result;
 use crate::error::to_pgwire_error;
 use crate::handler::{DatabaseHandles, client_database};
 use crate::sql::{
-    AlterDatabase, AlterSchema, AlterSecret, CatalogStatement, CreateDatabase, CreateSchema,
-    CreateSecret, DatabaseStatement, DropDatabase, DropSchema, DropSecret, SchemaName,
-    SchemaStatement, SecretName, SecretStatement, ShowDatabases, ShowSchemas, ShowSecrets,
+    AlterDatabase, AlterSchema, AlterSecret, AlterUser, AlterUserAction, CatalogStatement,
+    CreateDatabase, CreateSchema, CreateSecret, CreateUser, DatabaseStatement, DropDatabase,
+    DropSchema, DropSecret, DropUser, SchemaName, SchemaStatement, SecretName, SecretStatement,
+    ShowDatabases, ShowSchemas, ShowSecrets, ShowUsers, UserOptions, UserPassword, UserStatement,
 };
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
@@ -50,6 +51,11 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
             parse_schema_name0(&mut parser)?,
             if_not_exists,
         )))
+    } else if parser.parse_keywords(&[Keyword::CREATE, Keyword::USER]) {
+        CatalogStatement::User(UserStatement::Create(CreateUser::new(
+            parse_identifier0(&mut parser)?,
+            parse_user_options0(&mut parser, false)?,
+        )))
     } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::SECRET]) {
         let secret = parse_secret_name0(&mut parser)?;
         parser.expect_keyword(Keyword::VALUE)?;
@@ -69,6 +75,14 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
             schema,
             parse_identifier0(&mut parser)?,
         )))
+    } else if parser.parse_keywords(&[Keyword::ALTER, Keyword::USER]) {
+        let name = parse_identifier0(&mut parser)?;
+        let action = if parser.parse_keywords(&[Keyword::RENAME, Keyword::TO]) {
+            AlterUserAction::Rename(parse_identifier0(&mut parser)?)
+        } else {
+            AlterUserAction::Options(parse_user_options0(&mut parser, true)?)
+        };
+        CatalogStatement::User(UserStatement::Alter(AlterUser::new(name, action)))
     } else if parser.parse_keywords(&[Keyword::DROP, Keyword::SECRET]) {
         let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         CatalogStatement::Secret(SecretStatement::Drop(DropSecret::new(
@@ -88,6 +102,13 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
         CatalogStatement::Schema(SchemaStatement::Drop(DropSchema::new(
             schema, if_exists, cascade,
         )))
+    } else if parser.parse_keywords(&[Keyword::DROP, Keyword::USER]) {
+        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let mut names = vec![parse_identifier0(&mut parser)?];
+        while parser.consume_token(&Token::Comma) {
+            names.push(parse_identifier0(&mut parser)?);
+        }
+        CatalogStatement::User(UserStatement::Drop(DropUser::new(names, if_exists)))
     } else if parser.parse_keyword(Keyword::SHOW) {
         let object = parse_identifier0(&mut parser)?;
         match object.as_str() {
@@ -97,6 +118,10 @@ pub fn parse_catalog_statement(sql: &str) -> Result<Option<CatalogStatement>> {
             "schemas" => CatalogStatement::Schema(SchemaStatement::Show(ShowSchemas::new(
                 parse_like0(&mut parser, "SHOW SCHEMAS")?,
             ))),
+            "users" => CatalogStatement::User(UserStatement::Show(ShowUsers::new(parse_like0(
+                &mut parser,
+                "SHOW USERS",
+            )?))),
             "secrets" => {
                 let schema = if parser.parse_keyword(Keyword::FROM) {
                     Some(parse_identifier0(&mut parser)?)
@@ -148,6 +173,97 @@ fn parse_like0(parser: &mut Parser, statement: &str) -> Result<Option<String>> {
     }
 }
 
+fn parse_user_options0(parser: &mut Parser, required: bool) -> Result<UserOptions> {
+    let with = parser.parse_keyword(Keyword::WITH);
+    let mut superuser = None;
+    let mut create_database = None;
+    let mut create_user = None;
+    let mut password = UserPassword::Unchanged;
+    let mut found = false;
+
+    loop {
+        if parser.parse_keyword(Keyword::SUPERUSER) {
+            set_user_option0(&mut superuser, true, "SUPERUSER")?;
+        } else if parser.parse_keyword(Keyword::NOSUPERUSER) {
+            set_user_option0(&mut superuser, false, "SUPERUSER")?;
+        } else if parser.parse_keyword(Keyword::CREATEDB) {
+            set_user_option0(&mut create_database, true, "CREATEDB")?;
+        } else if parser.parse_keyword(Keyword::NOCREATEDB) {
+            set_user_option0(&mut create_database, false, "CREATEDB")?;
+        } else if parse_word0(parser, "CREATEUSER") {
+            set_user_option0(&mut create_user, true, "CREATEUSER")?;
+        } else if parse_word0(parser, "NOCREATEUSER") {
+            set_user_option0(&mut create_user, false, "CREATEUSER")?;
+        } else if parser.parse_keyword(Keyword::PASSWORD) {
+            if !matches!(password, UserPassword::Unchanged) {
+                return Err(ParserError::ParserError(
+                    "PASSWORD was specified more than once".to_string(),
+                )
+                .into());
+            }
+            password = parse_user_password0(parser)?;
+        } else {
+            break;
+        }
+        found = true;
+    }
+
+    if with && !found {
+        return Err(
+            ParserError::ParserError("WITH requires at least one user option".to_string()).into(),
+        );
+    }
+    if required && !found {
+        return Err(ParserError::ParserError(
+            "ALTER USER requires RENAME TO or at least one user option".to_string(),
+        )
+        .into());
+    }
+    Ok(UserOptions::new(
+        superuser,
+        create_database,
+        create_user,
+        password,
+    ))
+}
+
+fn parse_user_password0(parser: &mut Parser) -> Result<UserPassword> {
+    if parser.parse_keyword(Keyword::NULL) {
+        return Ok(UserPassword::Null);
+    }
+    match parser.parse_value()?.value {
+        Value::SingleQuotedString(value)
+        | Value::EscapedStringLiteral(value)
+        | Value::DollarQuotedString(DollarQuotedString { value, .. }) => {
+            Ok(UserPassword::Value(value))
+        }
+        _ => Err(
+            ParserError::ParserError("PASSWORD must be a string literal or NULL".to_string())
+                .into(),
+        ),
+    }
+}
+
+fn set_user_option0(option: &mut Option<bool>, value: bool, name: &str) -> Result<()> {
+    if option.replace(value).is_some() {
+        return Err(
+            ParserError::ParserError(format!("{name} was specified more than once")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn parse_word0(parser: &mut Parser, expected: &str) -> bool {
+    let matched = match parser.peek_token().token {
+        Token::Word(word) => word.value.eq_ignore_ascii_case(expected),
+        _ => false,
+    };
+    if matched {
+        let _ = parser.next_token();
+    }
+    matched
+}
+
 fn parse_schema_name0(parser: &mut Parser) -> Result<SchemaName> {
     let first = parse_identifier0(parser)?;
     if parser.consume_token(&Token::Period) {
@@ -176,16 +292,52 @@ fn parse_identifier0(parser: &mut Parser) -> Result<String> {
 }
 
 pub(crate) fn show_names_fields(column_format: Option<&Format>) -> Vec<FieldInfo> {
-    let format = column_format
-        .map(|format| format.format_for(0))
-        .unwrap_or(FieldFormat::Text);
     vec![FieldInfo::new(
         "Name".to_string(),
         None,
         None,
         Type::VARCHAR,
-        format,
+        format0(column_format, 0),
     )]
+}
+
+pub(crate) fn show_users_fields(column_format: Option<&Format>) -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new(
+            "Name".to_string(),
+            None,
+            None,
+            Type::VARCHAR,
+            format0(column_format, 0),
+        ),
+        FieldInfo::new(
+            "Superuser".to_string(),
+            None,
+            None,
+            Type::BOOL,
+            format0(column_format, 1),
+        ),
+        FieldInfo::new(
+            "Create DB".to_string(),
+            None,
+            None,
+            Type::BOOL,
+            format0(column_format, 2),
+        ),
+        FieldInfo::new(
+            "Create user".to_string(),
+            None,
+            None,
+            Type::BOOL,
+            format0(column_format, 3),
+        ),
+    ]
+}
+
+fn format0(column_format: Option<&Format>, index: usize) -> FieldFormat {
+    column_format
+        .map(|format| format.format_for(index))
+        .unwrap_or(FieldFormat::Text)
 }
 
 pub(crate) struct CataQueryParser {
@@ -247,6 +399,9 @@ impl QueryParser for CataQueryParser {
                 | CatalogStatement::Schema(SchemaStatement::Show(_))
                 | CatalogStatement::Secret(SecretStatement::Show(_)) => {
                     Ok(show_names_fields(column_format))
+                }
+                CatalogStatement::User(UserStatement::Show(_)) => {
+                    Ok(show_users_fields(column_format))
                 }
                 _ => Ok(Vec::new()),
             };
@@ -366,6 +521,131 @@ mod tests {
             panic!("expected SHOW SCHEMAS")
         };
         assert_eq!(statement.like(), Some("event%"));
+    }
+
+    #[test]
+    fn parses_create_user_with_options() {
+        let statement = parse_catalog_statement(
+            "CREATE USER Alice WITH SUPERUSER CREATEDB NOCREATEUSER PASSWORD 's3cr3t'",
+        )
+        .unwrap()
+        .unwrap();
+
+        let CatalogStatement::User(UserStatement::Create(statement)) = statement else {
+            panic!("expected CREATE USER")
+        };
+        assert_eq!(statement.name(), "alice");
+        assert_eq!(statement.options().superuser(), Some(true));
+        assert_eq!(statement.options().create_database(), Some(true));
+        assert_eq!(statement.options().create_user(), Some(false));
+        assert_eq!(
+            statement.options().password(),
+            &UserPassword::Value("s3cr3t".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_create_user_without_options() {
+        let statement = parse_catalog_statement("CREATE USER reader")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::User(UserStatement::Create(statement)) = statement else {
+            panic!("expected CREATE USER")
+        };
+        assert_eq!(statement.name(), "reader");
+        assert_eq!(statement.options(), &UserOptions::default());
+    }
+
+    #[test]
+    fn rejects_create_user_with_without_options() {
+        let error = parse_catalog_statement("CREATE USER reader WITH").unwrap_err();
+
+        assert!(error.to_string().contains("WITH requires"));
+    }
+
+    #[test]
+    fn parses_alter_user_rename() {
+        let statement = parse_catalog_statement("ALTER USER alice RENAME TO admin")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::User(UserStatement::Alter(statement)) = statement else {
+            panic!("expected ALTER USER")
+        };
+        assert_eq!(statement.name(), "alice");
+        assert_eq!(
+            statement.action(),
+            &AlterUserAction::Rename("admin".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_alter_user_options() {
+        let statement =
+            parse_catalog_statement("ALTER USER alice WITH NOSUPERUSER CREATEUSER PASSWORD NULL")
+                .unwrap()
+                .unwrap();
+
+        let CatalogStatement::User(UserStatement::Alter(statement)) = statement else {
+            panic!("expected ALTER USER")
+        };
+        let AlterUserAction::Options(options) = statement.action() else {
+            panic!("expected ALTER USER options")
+        };
+        assert_eq!(options.superuser(), Some(false));
+        assert_eq!(options.create_user(), Some(true));
+        assert_eq!(options.password(), &UserPassword::Null);
+    }
+
+    #[test]
+    fn parses_drop_multiple_users() {
+        let statement = parse_catalog_statement("DROP USER IF EXISTS alice, Bob")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::User(UserStatement::Drop(statement)) = statement else {
+            panic!("expected DROP USER")
+        };
+        assert_eq!(statement.names(), &["alice".to_string(), "bob".to_string()]);
+        assert!(statement.if_exists());
+    }
+
+    #[test]
+    fn parses_show_users_like_pattern() {
+        let statement = parse_catalog_statement("SHOW USERS LIKE 'admin%'")
+            .unwrap()
+            .unwrap();
+
+        let CatalogStatement::User(UserStatement::Show(statement)) = statement else {
+            panic!("expected SHOW USERS")
+        };
+        assert_eq!(statement.like(), Some("admin%"));
+    }
+
+    #[test]
+    fn rejects_duplicate_user_options() {
+        let error = parse_catalog_statement("CREATE USER alice SUPERUSER NOSUPERUSER").unwrap_err();
+
+        assert!(error.to_string().contains("specified more than once"));
+    }
+
+    #[test]
+    fn redacts_user_password_from_debug_output() {
+        let statement = parse_catalog_statement("CREATE USER alice PASSWORD 's3cr3t'")
+            .unwrap()
+            .unwrap();
+        let output = format!("{statement:?}");
+
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn rejects_alter_user_without_action() {
+        let error = parse_catalog_statement("ALTER USER alice").unwrap_err();
+
+        assert!(error.to_string().contains("requires RENAME TO"));
     }
 
     #[test]

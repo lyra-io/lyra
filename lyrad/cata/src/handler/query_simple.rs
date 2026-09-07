@@ -1,5 +1,5 @@
 use super::QueryHandler;
-use super::{client_database, client_schemas};
+use super::{client_database, client_schemas, client_user};
 use crate::error::to_pgwire_error;
 use crate::sql::parse_catalog_statement;
 use async_trait::async_trait;
@@ -23,9 +23,17 @@ impl SimpleQueryHandler for QueryHandler {
     {
         let database = client_database(client).to_string();
         let schemas = client_schemas(client);
+        let current_user = client_user(client).map(ToString::to_string);
         if let Some(statement) = parse_catalog_statement(query).map_err(to_pgwire_error)? {
             return Ok(vec![
-                self.execute(&database, &schemas, statement, None).await?,
+                self.execute(
+                    &database,
+                    &schemas,
+                    current_user.as_deref(),
+                    statement,
+                    None,
+                )
+                .await?,
             ]);
         }
 

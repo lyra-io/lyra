@@ -4,6 +4,10 @@ use datafusion_postgres::pgwire::error::{ErrorInfo, PgWireError};
 pub(crate) fn to_pgwire_error(error: CataError) -> PgWireError {
     let (severity, code) = match error {
         CataError::Sql(_) => ("ERROR", "42601"),
+        CataError::UserAlreadyExists(_) => ("ERROR", "42710"),
+        CataError::UserNotFound(_) => ("ERROR", "42704"),
+        CataError::UserChanged(_) => ("ERROR", "40001"),
+        CataError::UserInUse(_) => ("ERROR", "55006"),
         CataError::SecretAlreadyExists(_) => ("ERROR", "42710"),
         CataError::SecretNotFound(_) => ("ERROR", "42704"),
         CataError::SecretChanged(_) => ("ERROR", "40001"),

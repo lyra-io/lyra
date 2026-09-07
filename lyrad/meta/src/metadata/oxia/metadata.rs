@@ -2,11 +2,12 @@ use crate::metadata::oxia::OxiaOptions;
 use crate::metadata::oxia::keyspace::Keyspace;
 use crate::metadata::path::{
     CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, SINK_PATH, SOURCE_PATH, TABLE_PATH,
+    USER_PATH,
 };
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
 };
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table};
+use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
 use async_trait::async_trait;
 use oxia::{OxiaClient, OxiaError};
 use prost::Message;
@@ -46,11 +47,20 @@ impl OxiaMetadata {
             .collection(&self.schema_path0(database)?, schema, path)
     }
 
-    async fn get0<T>(&self, key: &str) -> Result<Option<MetadataRecord<T>>>
+    async fn get0<T>(
+        &self,
+        key: &str,
+        partition_key: Option<&str>,
+    ) -> Result<Option<MetadataRecord<T>>>
     where
         T: Message + Default,
     {
-        match self.client.get(key).await {
+        let request = self.client.get(key);
+        let result = match partition_key {
+            Some(partition_key) => request.partition_key(partition_key).await,
+            None => request.await,
+        };
+        match result {
             Ok(record) => {
                 let value = T::decode(record.value.unwrap_or_default())?;
                 let version = MetadataVersion::new(record.version.version_id);
@@ -66,11 +76,16 @@ impl OxiaMetadata {
         key: &str,
         value: &T,
         condition: MetadataPutCondition,
+        partition_key: Option<&str>,
     ) -> Result<MetadataVersion>
     where
         T: Message,
     {
         let request = self.client.put(key, value.encode_to_vec());
+        let request = match partition_key {
+            Some(partition_key) => request.partition_key(partition_key),
+            None => request,
+        };
         let result = match condition {
             MetadataPutCondition::Unconditional => request.await,
             MetadataPutCondition::NotExists => request.expected_record_not_exists().await,
@@ -83,8 +98,17 @@ impl OxiaMetadata {
         Ok(MetadataVersion::new(result.version.version_id))
     }
 
-    async fn delete0(&self, key: &str, expected_version: Option<MetadataVersion>) -> Result<()> {
+    async fn delete0(
+        &self,
+        key: &str,
+        expected_version: Option<MetadataVersion>,
+        partition_key: Option<&str>,
+    ) -> Result<()> {
         let request = self.client.delete(key);
+        let request = match partition_key {
+            Some(partition_key) => request.partition_key(partition_key),
+            None => request,
+        };
         let result = match expected_version {
             Some(version) => request.expected_version_id(version.value()).await,
             None => request.await,
@@ -93,14 +117,21 @@ impl OxiaMetadata {
         Ok(())
     }
 
-    async fn scan0<T>(&self, prefix: &str) -> Result<Vec<MetadataRecord<T>>>
+    async fn scan0<T>(
+        &self,
+        prefix: &str,
+        partition_key: Option<&str>,
+    ) -> Result<Vec<MetadataRecord<T>>>
     where
         T: Message + Default,
     {
         let (first, last) = self.keyspace.range(prefix)?;
-        self.client
-            .range_scan(first, last)
-            .await?
+        let request = self.client.range_scan(first, last);
+        let records = match partition_key {
+            Some(partition_key) => request.partition_key(partition_key).await?,
+            None => request.await?,
+        };
+        records
             .into_iter()
             .map(|record| {
                 let value = T::decode(record.value.unwrap_or_default())?;
@@ -110,14 +141,21 @@ impl OxiaMetadata {
             .collect()
     }
 
-    async fn scan_direct0<T>(&self, prefix: &str) -> Result<Vec<MetadataRecord<T>>>
+    async fn scan_direct0<T>(
+        &self,
+        prefix: &str,
+        partition_key: Option<&str>,
+    ) -> Result<Vec<MetadataRecord<T>>>
     where
         T: Message + Default,
     {
         let (first, last) = self.keyspace.range(prefix)?;
-        self.client
-            .range_scan(first, last)
-            .await?
+        let request = self.client.range_scan(first, last);
+        let records = match partition_key {
+            Some(partition_key) => request.partition_key(partition_key).await?,
+            None => request.await?,
+        };
+        records
             .into_iter()
             .filter(|record| {
                 record
@@ -136,9 +174,36 @@ impl OxiaMetadata {
 
 #[async_trait]
 impl Metadata for OxiaMetadata {
+    async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
+        let key = self.keyspace.object(USER_PATH, name)?;
+        self.get0(&key, None).await
+    }
+
+    async fn put_user(
+        &self,
+        user: User,
+        condition: MetadataPutCondition,
+    ) -> Result<MetadataVersion> {
+        let key = self.keyspace.object(USER_PATH, &user.name)?;
+        self.put0(&key, &user, condition, None).await
+    }
+
+    async fn delete_user(
+        &self,
+        name: &str,
+        expected_version: Option<MetadataVersion>,
+    ) -> Result<()> {
+        let key = self.keyspace.object(USER_PATH, name)?;
+        self.delete0(&key, expected_version, None).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>> {
+        self.scan_direct0(USER_PATH, None).await
+    }
+
     async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>> {
         let key = self.keyspace.object(DATABASE_PATH, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(name)).await
     }
 
     async fn put_database(
@@ -147,7 +212,8 @@ impl Metadata for OxiaMetadata {
         condition: MetadataPutCondition,
     ) -> Result<MetadataVersion> {
         let key = self.keyspace.object(DATABASE_PATH, &database.name)?;
-        self.put0(&key, &database, condition).await
+        self.put0(&key, &database, condition, Some(&database.name))
+            .await
     }
 
     async fn delete_database(
@@ -156,11 +222,11 @@ impl Metadata for OxiaMetadata {
         expected_version: Option<MetadataVersion>,
     ) -> Result<()> {
         let key = self.keyspace.object(DATABASE_PATH, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(name)).await
     }
 
     async fn list_databases(&self) -> Result<Vec<MetadataRecord<Database>>> {
-        self.scan_direct0(DATABASE_PATH).await
+        self.scan_direct0(DATABASE_PATH, None).await
     }
 
     async fn get_schema(
@@ -169,7 +235,7 @@ impl Metadata for OxiaMetadata {
         name: &str,
     ) -> Result<Option<MetadataRecord<Schema>>> {
         let key = self.keyspace.object(&self.schema_path0(database)?, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(database)).await
     }
 
     async fn put_schema(
@@ -181,7 +247,7 @@ impl Metadata for OxiaMetadata {
         let key = self
             .keyspace
             .object(&self.schema_path0(database)?, &schema.name)?;
-        self.put0(&key, &schema, condition).await
+        self.put0(&key, &schema, condition, Some(database)).await
     }
 
     async fn delete_schema(
@@ -191,11 +257,12 @@ impl Metadata for OxiaMetadata {
         expected_version: Option<MetadataVersion>,
     ) -> Result<()> {
         let key = self.keyspace.object(&self.schema_path0(database)?, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(database)).await
     }
 
     async fn list_schemas(&self, database: &str) -> Result<Vec<MetadataRecord<Schema>>> {
-        self.scan_direct0(&self.schema_path0(database)?).await
+        self.scan_direct0(&self.schema_path0(database)?, Some(database))
+            .await
     }
 
     async fn get_secret(
@@ -206,7 +273,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<Option<MetadataRecord<Secret>>> {
         let path = self.object_path0(database, schema, SECRET_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(database)).await
     }
 
     async fn put_secret(
@@ -218,7 +285,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<MetadataVersion> {
         let path = self.object_path0(database, schema, SECRET_PATH)?;
         let key = self.keyspace.object(&path, &secret.name)?;
-        self.put0(&key, &secret, condition).await
+        self.put0(&key, &secret, condition, Some(database)).await
     }
 
     async fn delete_secret(
@@ -230,7 +297,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<()> {
         let path = self.object_path0(database, schema, SECRET_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(database)).await
     }
 
     async fn list_secrets(
@@ -239,7 +306,7 @@ impl Metadata for OxiaMetadata {
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Secret>>> {
         let path = self.object_path0(database, schema, SECRET_PATH)?;
-        self.scan0(&path).await
+        self.scan0(&path, Some(database)).await
     }
 
     async fn get_connection(
@@ -250,7 +317,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<Option<MetadataRecord<Connection>>> {
         let path = self.object_path0(database, schema, CONNECTION_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(database)).await
     }
 
     async fn put_connection(
@@ -262,7 +329,8 @@ impl Metadata for OxiaMetadata {
     ) -> Result<MetadataVersion> {
         let path = self.object_path0(database, schema, CONNECTION_PATH)?;
         let key = self.keyspace.object(&path, &connection.name)?;
-        self.put0(&key, &connection, condition).await
+        self.put0(&key, &connection, condition, Some(database))
+            .await
     }
 
     async fn delete_connection(
@@ -274,7 +342,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<()> {
         let path = self.object_path0(database, schema, CONNECTION_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(database)).await
     }
 
     async fn list_connections(
@@ -283,7 +351,7 @@ impl Metadata for OxiaMetadata {
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Connection>>> {
         let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        self.scan0(&path).await
+        self.scan0(&path, Some(database)).await
     }
 
     async fn get_source(
@@ -294,7 +362,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<Option<MetadataRecord<Source>>> {
         let path = self.object_path0(database, schema, SOURCE_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(database)).await
     }
 
     async fn put_source(
@@ -306,7 +374,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<MetadataVersion> {
         let path = self.object_path0(database, schema, SOURCE_PATH)?;
         let key = self.keyspace.object(&path, &source.name)?;
-        self.put0(&key, &source, condition).await
+        self.put0(&key, &source, condition, Some(database)).await
     }
 
     async fn delete_source(
@@ -318,7 +386,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<()> {
         let path = self.object_path0(database, schema, SOURCE_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(database)).await
     }
 
     async fn list_sources(
@@ -327,7 +395,7 @@ impl Metadata for OxiaMetadata {
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Source>>> {
         let path = self.object_path0(database, schema, SOURCE_PATH)?;
-        self.scan0(&path).await
+        self.scan0(&path, Some(database)).await
     }
 
     async fn get_sink(
@@ -338,7 +406,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<Option<MetadataRecord<Sink>>> {
         let path = self.object_path0(database, schema, SINK_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(database)).await
     }
 
     async fn put_sink(
@@ -350,7 +418,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<MetadataVersion> {
         let path = self.object_path0(database, schema, SINK_PATH)?;
         let key = self.keyspace.object(&path, &sink.name)?;
-        self.put0(&key, &sink, condition).await
+        self.put0(&key, &sink, condition, Some(database)).await
     }
 
     async fn delete_sink(
@@ -362,12 +430,12 @@ impl Metadata for OxiaMetadata {
     ) -> Result<()> {
         let path = self.object_path0(database, schema, SINK_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(database)).await
     }
 
     async fn list_sinks(&self, database: &str, schema: &str) -> Result<Vec<MetadataRecord<Sink>>> {
         let path = self.object_path0(database, schema, SINK_PATH)?;
-        self.scan0(&path).await
+        self.scan0(&path, Some(database)).await
     }
 
     async fn get_table(
@@ -378,7 +446,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<Option<MetadataRecord<Table>>> {
         let path = self.object_path0(database, schema, TABLE_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.get0(&key).await
+        self.get0(&key, Some(database)).await
     }
 
     async fn put_table(
@@ -390,7 +458,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<MetadataVersion> {
         let path = self.object_path0(database, schema, TABLE_PATH)?;
         let key = self.keyspace.object(&path, &table.name)?;
-        self.put0(&key, &table, condition).await
+        self.put0(&key, &table, condition, Some(database)).await
     }
 
     async fn delete_table(
@@ -402,7 +470,7 @@ impl Metadata for OxiaMetadata {
     ) -> Result<()> {
         let path = self.object_path0(database, schema, TABLE_PATH)?;
         let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version).await
+        self.delete0(&key, expected_version, Some(database)).await
     }
 
     async fn list_tables(
@@ -411,6 +479,6 @@ impl Metadata for OxiaMetadata {
         schema: &str,
     ) -> Result<Vec<MetadataRecord<Table>>> {
         let path = self.object_path0(database, schema, TABLE_PATH)?;
-        self.scan0(&path).await
+        self.scan0(&path, Some(database)).await
     }
 }
