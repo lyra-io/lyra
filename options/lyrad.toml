@@ -6,3 +6,6 @@ namespace = "default"
 host = "127.0.0.1"
 port = 5432
 max_connections = 0
+bootstrap_user = "root"
+# Development-only password; replace it before deployment.
+bootstrap_password = "lyra"

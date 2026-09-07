@@ -32,6 +32,21 @@ pub enum CataError {
     #[error("user {0:?} is the current user")]
     UserInUse(String),
 
+    #[error("authentication is required")]
+    AuthenticationRequired,
+
+    #[error("permission denied for {0}")]
+    PermissionDenied(String),
+
+    #[error("a bootstrap administrator is required when the user catalog is empty")]
+    BootstrapAdministratorRequired,
+
+    #[error("the user catalog must contain at least one superuser")]
+    AdministratorRequired,
+
+    #[error("user {0:?} has an invalid password credential")]
+    InvalidPasswordCredential(String),
+
     #[error("secret {0:?} already exists")]
     SecretAlreadyExists(String),
 

@@ -45,6 +45,8 @@ pub enum MetadataPutCondition {
 
 #[async_trait]
 pub trait Metadata: Send + Sync {
+    async fn allocate_user_id(&self) -> Result<u32>;
+
     async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>>;
 
     async fn put_user(
@@ -60,6 +62,15 @@ pub trait Metadata: Send + Sync {
     ) -> Result<()>;
 
     async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>>;
+
+    async fn rename_user(
+        &self,
+        name: &str,
+        user: User,
+        expected_version: MetadataVersion,
+    ) -> Result<MetadataVersion>;
+
+    async fn delete_users(&self, users: &[(String, MetadataVersion)]) -> Result<()>;
 
     async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>>;
 

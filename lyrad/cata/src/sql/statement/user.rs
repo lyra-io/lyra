@@ -46,6 +46,10 @@ impl UserOptions {
     pub fn password(&self) -> &UserPassword {
         &self.password
     }
+
+    pub fn changes_privileges(&self) -> bool {
+        self.superuser.is_some() || self.create_database.is_some() || self.create_user.is_some()
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]

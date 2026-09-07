@@ -91,9 +91,8 @@ impl SchemaExecutor {
             });
         }
 
-        let new_schema = Schema {
-            name: statement.new_name().to_string(),
-        };
+        let mut new_schema = record.value().clone();
+        new_schema.name = statement.new_name().to_string();
         let new_version = self
             .metadata
             .put_schema(database, new_schema, MetadataPutCondition::NotExists)

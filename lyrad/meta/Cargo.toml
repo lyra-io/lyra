@@ -6,6 +6,7 @@ resolver = "3"
 
 [dependencies]
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 libc = { workspace = true }
 oxia-client = { workspace = true }
 tonic = { workspace = true }

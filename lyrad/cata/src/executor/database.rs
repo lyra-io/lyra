@@ -113,9 +113,8 @@ impl DatabaseExecutor {
             }
         }
 
-        let new_database = Database {
-            name: statement.new_name().to_string(),
-        };
+        let mut new_database = record.value().clone();
+        new_database.name = statement.new_name().to_string();
         let new_database_version = self
             .metadata
             .put_database(new_database, MetadataPutCondition::NotExists)

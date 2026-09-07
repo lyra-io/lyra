@@ -8,6 +8,8 @@ pub(crate) fn to_pgwire_error(error: CataError) -> PgWireError {
         CataError::UserNotFound(_) => ("ERROR", "42704"),
         CataError::UserChanged(_) => ("ERROR", "40001"),
         CataError::UserInUse(_) => ("ERROR", "55006"),
+        CataError::AuthenticationRequired => ("ERROR", "28000"),
+        CataError::PermissionDenied(_) => ("ERROR", "42501"),
         CataError::SecretAlreadyExists(_) => ("ERROR", "42710"),
         CataError::SecretNotFound(_) => ("ERROR", "42704"),
         CataError::SecretChanged(_) => ("ERROR", "40001"),

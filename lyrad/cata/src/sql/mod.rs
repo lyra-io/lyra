@@ -1,7 +1,9 @@
+mod catalog;
 mod parser;
 mod planner;
 mod statement;
 
+pub(crate) use catalog::{CatalogContextProvider, register_rw_catalog};
 pub use parser::parse_catalog_statement;
 pub(crate) use parser::{
     CataQueryParser, DataFusionStatement, show_names_fields, show_users_fields,

@@ -85,10 +85,8 @@ impl SecretExecutor {
                 statement.secret().name().to_string(),
             ));
         };
-        let secret = Secret {
-            name: statement.secret().name().to_string(),
-            value: statement.value().to_vec().into(),
-        };
+        let mut secret = record.value().clone();
+        secret.value = statement.value().to_vec().into();
 
         self.metadata
             .put_secret(

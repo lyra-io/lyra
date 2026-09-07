@@ -2,13 +2,16 @@ use crate::metadata::oxia::OxiaOptions;
 use crate::metadata::oxia::keyspace::Keyspace;
 use crate::metadata::path::{
     CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, SINK_PATH, SOURCE_PATH, TABLE_PATH,
-    USER_PATH,
+    USER_ID_PATH, USER_PARTITION_KEY, USER_PATH,
 };
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
 };
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
+use crate::proto::pb_catalog::{
+    CatalogCounter, Connection, Database, Schema, Secret, Sink, Source, Table, User,
+};
 use async_trait::async_trait;
+use futures_util::future::try_join_all;
 use oxia::{OxiaClient, OxiaError};
 use prost::Message;
 
@@ -174,9 +177,39 @@ impl OxiaMetadata {
 
 #[async_trait]
 impl Metadata for OxiaMetadata {
+    async fn allocate_user_id(&self) -> Result<u32> {
+        loop {
+            let record = self
+                .get0::<CatalogCounter>(USER_ID_PATH, Some(USER_PARTITION_KEY))
+                .await?;
+            let (value, condition) =
+                match record {
+                    Some(record) => (
+                        record.value().value.checked_add(1).ok_or_else(|| {
+                            MetadataError::CounterExhausted(USER_ID_PATH.to_string())
+                        })?,
+                        MetadataPutCondition::Version(record.version()),
+                    ),
+                    None => (1, MetadataPutCondition::NotExists),
+                };
+            let counter = CatalogCounter { value };
+            match self
+                .put0(USER_ID_PATH, &counter, condition, Some(USER_PARTITION_KEY))
+                .await
+            {
+                Ok(_) => {
+                    return u32::try_from(value)
+                        .map_err(|_| MetadataError::CounterExhausted(USER_ID_PATH.to_string()));
+                }
+                Err(MetadataError::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
         let key = self.keyspace.object(USER_PATH, name)?;
-        self.get0(&key, None).await
+        self.get0(&key, Some(USER_PARTITION_KEY)).await
     }
 
     async fn put_user(
@@ -185,7 +218,8 @@ impl Metadata for OxiaMetadata {
         condition: MetadataPutCondition,
     ) -> Result<MetadataVersion> {
         let key = self.keyspace.object(USER_PATH, &user.name)?;
-        self.put0(&key, &user, condition, None).await
+        self.put0(&key, &user, condition, Some(USER_PARTITION_KEY))
+            .await
     }
 
     async fn delete_user(
@@ -194,11 +228,45 @@ impl Metadata for OxiaMetadata {
         expected_version: Option<MetadataVersion>,
     ) -> Result<()> {
         let key = self.keyspace.object(USER_PATH, name)?;
-        self.delete0(&key, expected_version, None).await
+        self.delete0(&key, expected_version, Some(USER_PARTITION_KEY))
+            .await
     }
 
     async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>> {
-        self.scan_direct0(USER_PATH, None).await
+        self.scan_direct0(USER_PATH, Some(USER_PARTITION_KEY)).await
+    }
+
+    async fn rename_user(
+        &self,
+        name: &str,
+        user: User,
+        expected_version: MetadataVersion,
+    ) -> Result<MetadataVersion> {
+        let old_key = self.keyspace.object(USER_PATH, name)?;
+        let new_key = self.keyspace.object(USER_PATH, &user.name)?;
+        let put = self.put0(
+            &new_key,
+            &user,
+            MetadataPutCondition::NotExists,
+            Some(USER_PARTITION_KEY),
+        );
+        let delete = self.delete0(&old_key, Some(expected_version), Some(USER_PARTITION_KEY));
+        let (version, ()) = tokio::try_join!(put, delete)?;
+        Ok(version)
+    }
+
+    async fn delete_users(&self, users: &[(String, MetadataVersion)]) -> Result<()> {
+        let records = users
+            .iter()
+            .map(|(name, version)| Ok((self.keyspace.object(USER_PATH, name)?, *version)))
+            .collect::<Result<Vec<_>>>()?;
+        try_join_all(
+            records
+                .iter()
+                .map(|(key, version)| self.delete0(key, Some(*version), Some(USER_PARTITION_KEY))),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>> {

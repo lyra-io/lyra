@@ -24,9 +24,11 @@ async fn stores_typed_protobuf_metadata() {
     let source_name = format!("test-source-{suffix}");
     let sink_name = format!("test-sink-{suffix}");
     let table_name = format!("test-table-{suffix}");
+    let renamed_user_name = format!("test-renamed-user-{suffix}");
     let metadata = OxiaMetadata::new(&OxiaOptions::new(address, "default"))
         .await
         .unwrap();
+    let user_id = metadata.allocate_user_id().await.unwrap();
 
     let user_version = metadata
         .put_user(
@@ -35,12 +37,12 @@ async fn stores_typed_protobuf_metadata() {
                 is_superuser: false,
                 can_create_database: true,
                 can_create_user: false,
-                can_login: true,
                 password: Some(PasswordCredential {
                     salt: b"salt".to_vec().into(),
                     salted_password: b"hash".to_vec().into(),
                     iterations: 4096,
                 }),
+                id: user_id,
             },
             MetadataPutCondition::NotExists,
         )
@@ -223,8 +225,20 @@ async fn stores_typed_protobuf_metadata() {
         .delete_database(&database_name, Some(database_version))
         .await
         .unwrap();
+    let mut user = metadata
+        .get_user(&user_name)
+        .await
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    user.name = renamed_user_name.clone();
+    let user_version = metadata
+        .rename_user(&user_name, user, user_version)
+        .await
+        .unwrap();
     metadata
-        .delete_user(&user_name, Some(user_version))
+        .delete_users(&[(renamed_user_name, user_version)])
         .await
         .unwrap();
 }

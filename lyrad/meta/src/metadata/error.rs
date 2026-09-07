@@ -12,6 +12,9 @@ pub enum MetadataError {
     #[error("metadata write condition was not satisfied for key {0:?}")]
     Conflict(String),
 
+    #[error("metadata counter {0:?} is exhausted")]
+    CounterExhausted(String),
+
     #[error("failed to decode protobuf metadata: {0}")]
     Decode(#[from] DecodeError),
 

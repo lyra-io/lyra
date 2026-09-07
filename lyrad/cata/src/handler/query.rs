@@ -1,6 +1,8 @@
 use super::DatabaseHandles;
 use crate::error::to_pgwire_error;
-use crate::executor::{DatabaseExecutor, SchemaExecutor, SecretExecutor, UserExecutor};
+use crate::executor::{
+    Authorization, DatabaseExecutor, SchemaExecutor, SecretExecutor, UserExecutor,
+};
 use crate::sql::{
     CataQueryParser, CatalogStatement, DatabaseStatement, SchemaStatement, SecretStatement,
     UserStatement, show_names_fields, show_users_fields,
@@ -16,6 +18,7 @@ pub(crate) struct QueryHandler {
     // Immutable state
     pub(super) databases: Arc<DatabaseHandles>,
     pub(super) parser: Arc<CataQueryParser>,
+    authorization: Authorization,
     database_executor: DatabaseExecutor,
     schema_executor: SchemaExecutor,
     secret_executor: SecretExecutor,
@@ -25,6 +28,7 @@ pub(crate) struct QueryHandler {
 impl QueryHandler {
     pub(crate) fn new(databases: Arc<DatabaseHandles>, metadata: Arc<dyn Metadata>) -> Self {
         let parser = Arc::new(CataQueryParser::new(Arc::clone(&databases)));
+        let authorization = Authorization::new(Arc::clone(&metadata));
         let database_executor =
             DatabaseExecutor::new(Arc::clone(&metadata), Arc::clone(&databases));
         let schema_executor = SchemaExecutor::new(Arc::clone(&metadata));
@@ -33,6 +37,7 @@ impl QueryHandler {
         Self {
             databases,
             parser,
+            authorization,
             database_executor,
             schema_executor,
             secret_executor,
@@ -48,6 +53,12 @@ impl QueryHandler {
         statement: CatalogStatement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Response> {
+        let user = self
+            .authorization
+            .check(current_user, &statement)
+            .await
+            .map_err(to_pgwire_error)?;
+        let current_user = user.name.as_str();
         match statement {
             CatalogStatement::Database(DatabaseStatement::Create(statement)) => {
                 self.database_executor
@@ -145,14 +156,14 @@ impl QueryHandler {
             }
             CatalogStatement::User(UserStatement::Alter(statement)) => {
                 self.user_executor
-                    .alter(current_user, &statement)
+                    .alter(Some(current_user), &statement)
                     .await
                     .map_err(to_pgwire_error)?;
                 Ok(Response::Execution(Tag::new("ALTER USER")))
             }
             CatalogStatement::User(UserStatement::Drop(statement)) => {
                 self.user_executor
-                    .drop(current_user, &statement)
+                    .drop(Some(current_user), &statement)
                     .await
                     .map_err(to_pgwire_error)?;
                 Ok(Response::Execution(Tag::new("DROP USER")))

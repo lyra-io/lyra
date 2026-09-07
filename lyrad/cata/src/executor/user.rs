@@ -63,11 +63,11 @@ impl UserExecutor {
 
         let options = statement.options();
         let user = User {
+            id: self.metadata.allocate_user_id().await?,
             name: statement.name().to_string(),
             is_superuser: options.superuser().unwrap_or(false),
             can_create_database: options.create_database().unwrap_or(false),
             can_create_user: options.create_user().unwrap_or(false),
-            can_login: true,
             password: Self::password0(options.password()),
         };
         self.metadata
@@ -92,33 +92,26 @@ impl UserExecutor {
                 if current_user == Some(statement.name()) {
                     return Err(CataError::UserInUse(statement.name().to_string()));
                 }
+                if self.metadata.get_user(new_name).await?.is_some() {
+                    return Err(CataError::UserAlreadyExists(new_name.clone()));
+                }
                 let mut user = record.value().clone();
                 user.name = new_name.clone();
-                let new_version = self
-                    .metadata
-                    .put_user(user, MetadataPutCondition::NotExists)
+                self.metadata
+                    .rename_user(statement.name(), user, record.version())
                     .await
                     .map_err(|error| match error {
-                        MetadataError::Conflict(_) => {
-                            CataError::UserAlreadyExists(new_name.clone())
-                        }
-                        error => error.into(),
-                    })?;
-                if let Err(error) = self
-                    .metadata
-                    .delete_user(statement.name(), Some(record.version()))
-                    .await
-                {
-                    let _ = self.metadata.delete_user(new_name, Some(new_version)).await;
-                    return Err(match error {
                         MetadataError::Conflict(_) => {
                             CataError::UserChanged(statement.name().to_string())
                         }
                         error => error.into(),
-                    });
-                }
+                    })?;
             }
             AlterUserAction::Options(options) => {
+                if record.value().is_superuser && options.superuser() == Some(false) {
+                    self.require_administrator_remains0(&[statement.name().to_string()])
+                        .await?;
+                }
                 let mut user = record.value().clone();
                 Self::apply_options0(&mut user, options);
                 self.metadata
@@ -145,11 +138,13 @@ impl UserExecutor {
             if current_user == Some(name.as_str()) {
                 return Err(CataError::UserInUse(name.clone()));
             }
-            if records.iter().any(|(existing, _)| existing == name) {
+            if records.iter().any(|(existing, _, _)| existing == name) {
                 continue;
             }
             match self.metadata.get_user(name).await? {
-                Some(record) => records.push((name.clone(), record.version())),
+                Some(record) => {
+                    records.push((name.clone(), record.version(), record.value().is_superuser));
+                }
                 None if statement.if_exists() => {}
                 None => return Err(CataError::UserNotFound(name.clone())),
             }
@@ -158,15 +153,26 @@ impl UserExecutor {
         if records.is_empty() {
             return Ok(DropUserOutcome::NotFound);
         }
-        for (name, version) in records {
-            self.metadata
-                .delete_user(&name, Some(version))
-                .await
-                .map_err(|error| match error {
-                    MetadataError::Conflict(_) => CataError::UserChanged(name),
-                    error => error.into(),
-                })?;
+        if records.iter().any(|(_, _, is_superuser)| *is_superuser) {
+            self.require_administrator_remains0(
+                &records
+                    .iter()
+                    .map(|(name, _, _)| name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         }
+        let deletes = records
+            .iter()
+            .map(|(name, version, _)| (name.clone(), *version))
+            .collect::<Vec<_>>();
+        self.metadata
+            .delete_users(&deletes)
+            .await
+            .map_err(|error| match error {
+                MetadataError::Conflict(_) => CataError::UserChanged(deletes[0].0.clone()),
+                error => error.into(),
+            })?;
         Ok(DropUserOutcome::Dropped)
     }
 
@@ -213,18 +219,33 @@ impl UserExecutor {
         let UserPassword::Value(password) = password else {
             return None;
         };
-        let salt = random_nonce().into_bytes();
-        Some(PasswordCredential {
-            salted_password: gen_salted_password(password, &salt, SCRAM_ITERATIONS).into(),
-            salt: salt.into(),
-            iterations: SCRAM_ITERATIONS as u32,
-        })
+        Some(make_password_credential(password))
+    }
+
+    async fn require_administrator_remains0(&self, removed: &[String]) -> Result<()> {
+        if self.metadata.list_users().await?.into_iter().any(|user| {
+            user.value().is_superuser && !removed.iter().any(|name| name == &user.value().name)
+        }) {
+            Ok(())
+        } else {
+            Err(CataError::AdministratorRequired)
+        }
+    }
+}
+
+pub(crate) fn make_password_credential(password: &str) -> PasswordCredential {
+    let salt = random_nonce().into_bytes();
+    PasswordCredential {
+        salted_password: gen_salted_password(password, &salt, SCRAM_ITERATIONS).into(),
+        salt: salt.into(),
+        iterations: SCRAM_ITERATIONS as u32,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meta::metadata::MemoryMetadata;
 
     #[test]
     fn stores_scram_salted_password_material() {
@@ -239,5 +260,24 @@ mod tests {
         );
         assert_ne!(first.salted_password.as_ref(), b"s3cr3t");
         assert_ne!(first.salt, second.salt);
+    }
+
+    #[tokio::test]
+    async fn refuses_to_drop_the_last_superuser() {
+        let metadata = Arc::new(MemoryMetadata::new());
+        let executor = UserExecutor::new(metadata);
+        executor
+            .create(&CreateUser::new(
+                "root".to_string(),
+                UserOptions::new(Some(true), Some(true), Some(true), UserPassword::Unchanged),
+            ))
+            .await
+            .unwrap();
+
+        let result = executor
+            .drop(None, &DropUser::new(vec!["root".to_string()], false))
+            .await;
+
+        assert!(matches!(result, Err(CataError::AdministratorRequired)));
     }
 }

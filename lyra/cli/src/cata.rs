@@ -34,6 +34,8 @@ struct CataProcessOptions {
     host: String,
     port: u16,
     max_connections: usize,
+    bootstrap_user: Option<String>,
+    bootstrap_password: Option<String>,
 }
 
 pub async fn run(args: CataArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -44,8 +46,23 @@ pub async fn run(args: CataArgs) -> Result<(), Box<dyn std::error::Error>> {
         host,
         port,
         max_connections,
+        bootstrap_user,
+        bootstrap_password,
     } = options.cata;
-    let cata_options = CataOptions::new(host.clone(), port).with_max_connections(max_connections);
+    let mut cata_options =
+        CataOptions::new(host.clone(), port).with_max_connections(max_connections);
+    match (bootstrap_user, bootstrap_password) {
+        (Some(user), Some(password)) => {
+            cata_options = cata_options.with_bootstrap_user(user, password);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "cata.bootstrap_user and cata.bootstrap_password must be configured together"
+                    .into(),
+            );
+        }
+    }
     let oxia = OxiaOptions::new(options.meta.service_address, options.meta.namespace);
     let metadata = Arc::new(OxiaMetadata::new(&oxia).await?);
     let cata = Cata::new(cata_options, metadata).await?;
@@ -82,5 +99,25 @@ mod tests {
         assert_eq!(options.meta.namespace, "default");
         assert_eq!(options.cata.host, "127.0.0.1");
         assert_eq!(options.cata.port, 5432);
+    }
+
+    #[test]
+    fn allows_bootstrap_credentials_to_be_omitted() {
+        let options: LyradOptions = toml::from_str(
+            r#"
+                [meta]
+                service_address = "127.0.0.1:6648"
+                namespace = "default"
+
+                [cata]
+                host = "127.0.0.1"
+                port = 5432
+                max_connections = 0
+            "#,
+        )
+        .unwrap();
+
+        assert!(options.cata.bootstrap_user.is_none());
+        assert!(options.cata.bootstrap_password.is_none());
     }
 }

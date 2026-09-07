@@ -7,8 +7,10 @@ message User {
   bool is_superuser = 2;
   bool can_create_database = 3;
   bool can_create_user = 4;
-  bool can_login = 5;
+  reserved 5;
+  reserved "can_login";
   PasswordCredential password = 6;
+  uint32 id = 7;
 }
 
 message PasswordCredential {
@@ -64,6 +66,10 @@ message Table {
   repeated Column columns = 4;
   repeated string primary_key = 5;
   map<string, string> options = 6;
+}
+
+message CatalogCounter {
+  uint64 value = 1;
 }
 
 message StreamMeta {
