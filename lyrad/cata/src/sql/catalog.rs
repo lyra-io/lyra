@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{MemorySchemaProvider, SchemaProvider, Session, TableProvider};
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -91,7 +91,6 @@ struct RwUsersTable {
 impl RwUsersTable {
     fn new(metadata: Arc<dyn Metadata>) -> Self {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("is_super", DataType::Boolean, false),
             Field::new("create_db", DataType::Boolean, false),
@@ -136,10 +135,6 @@ impl TableProvider for RwUsersTable {
         users.sort_by(|left, right| left.value().name.cmp(&right.value().name));
         users.truncate(limit.unwrap_or(users.len()).min(users.len()));
 
-        let ids = users
-            .iter()
-            .map(|user| i32::try_from(user.value().id).unwrap_or(i32::MAX))
-            .collect::<Vec<_>>();
         let names = users
             .iter()
             .map(|user| user.value().name.as_str())
@@ -152,7 +147,6 @@ impl TableProvider for RwUsersTable {
             .map(|user| user.value().password.is_some())
             .collect::<Vec<_>>();
         let arrays: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from(ids)),
             Arc::new(StringArray::from(names)),
             Arc::new(BooleanArray::from(is_super.clone())),
             Arc::new(BooleanArray::from(create_db)),

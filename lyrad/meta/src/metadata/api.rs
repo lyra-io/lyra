@@ -45,8 +45,6 @@ pub enum MetadataPutCondition {
 
 #[async_trait]
 pub trait Metadata: Send + Sync {
-    async fn allocate_user_id(&self) -> Result<u32>;
-
     async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>>;
 
     async fn put_user(

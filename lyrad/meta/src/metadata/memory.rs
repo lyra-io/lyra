@@ -15,7 +15,6 @@ type ObjectKey = (String, String, String);
 struct State {
     // Mutable state
     next_version: i64,
-    next_user_id: u32,
     users: HashMap<String, MetadataRecord<User>>,
     databases: HashMap<String, MetadataRecord<Database>>,
     schemas: HashMap<SchemaKey, MetadataRecord<Schema>>,
@@ -118,15 +117,6 @@ fn object_key0(database: &str, schema: &str, name: &str) -> ObjectKey {
 
 #[async_trait]
 impl Metadata for MemoryMetadata {
-    async fn allocate_user_id(&self) -> Result<u32> {
-        let mut state = self.state.write().await;
-        state.next_user_id = state
-            .next_user_id
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::CounterExhausted("memory-user-id".to_string()))?;
-        Ok(state.next_user_id)
-    }
-
     async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
         Ok(get0(&self.state.read().await.users, &name.to_string()))
     }
@@ -591,10 +581,9 @@ impl Metadata for MemoryMetadata {
 mod tests {
     use super::*;
 
-    fn user(name: &str, id: u32) -> User {
+    fn user(name: &str) -> User {
         User {
             name: name.to_string(),
-            id,
             ..User::default()
         }
     }
@@ -603,16 +592,16 @@ mod tests {
     async fn atomically_renames_and_deletes_users() {
         let metadata = MemoryMetadata::new();
         let alice_version = metadata
-            .put_user(user("alice", 1), MetadataPutCondition::NotExists)
+            .put_user(user("alice"), MetadataPutCondition::NotExists)
             .await
             .unwrap();
         let bob_version = metadata
-            .put_user(user("bob", 2), MetadataPutCondition::NotExists)
+            .put_user(user("bob"), MetadataPutCondition::NotExists)
             .await
             .unwrap();
 
         let admin_version = metadata
-            .rename_user("alice", user("admin", 1), alice_version)
+            .rename_user("alice", user("admin"), alice_version)
             .await
             .unwrap();
         metadata

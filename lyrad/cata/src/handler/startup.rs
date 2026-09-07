@@ -146,7 +146,6 @@ mod tests {
         metadata
             .put_user(
                 User {
-                    id: 1,
                     name: "alice".to_string(),
                     password: Some(make_password_credential("s3cr3t")),
                 },

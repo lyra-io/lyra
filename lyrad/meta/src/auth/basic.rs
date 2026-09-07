@@ -54,10 +54,7 @@ impl AuthenticationProvider for BasicAuthenticationProvider {
         {
             return Err(AuthenticationError::InvalidCredentials);
         }
-        Ok(AuthenticatedUser::new(
-            user.value().id,
-            user.value().name.clone(),
-        ))
+        Ok(AuthenticatedUser::new(user.value().name.clone()))
     }
 }
 
@@ -138,7 +135,6 @@ mod tests {
         metadata
             .put_user(
                 User {
-                    id: 1,
                     name: "alice".to_string(),
                     password: Some(make_password_credential("s3cr3t")),
                 },
@@ -150,7 +146,6 @@ mod tests {
 
         let user = provider.authenticate("alice", "s3cr3t").await.unwrap();
 
-        assert_eq!(user.id(), 1);
         assert_eq!(user.name(), "alice");
         assert!(matches!(
             provider.authenticate("alice", "wrong").await,

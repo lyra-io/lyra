@@ -1,5 +1,4 @@
 pub const USER_PATH: &str = "/lyra/v1/users/";
-pub const USER_ID_PATH: &str = "/lyra/v1/user-id";
 pub const USER_PARTITION_KEY: &str = "/lyra/v1/users";
 pub const DATABASE_PATH: &str = "/lyra/v1/databases/";
 pub const SCHEMA_PATH: &str = "schemas/";

@@ -33,7 +33,6 @@ impl UserExecutor {
         }
 
         let user = User {
-            id: self.metadata.allocate_user_id().await?,
             name: statement.name().to_string(),
             password: Some(make_password_credential(statement.password())),
         };

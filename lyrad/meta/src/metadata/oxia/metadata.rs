@@ -2,14 +2,12 @@ use crate::metadata::oxia::OxiaOptions;
 use crate::metadata::oxia::keyspace::Keyspace;
 use crate::metadata::path::{
     CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, SINK_PATH, SOURCE_PATH, TABLE_PATH,
-    USER_ID_PATH, USER_PARTITION_KEY, USER_PATH,
+    USER_PARTITION_KEY, USER_PATH,
 };
 use crate::metadata::{
     Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
 };
-use crate::proto::pb_catalog::{
-    CatalogCounter, Connection, Database, Schema, Secret, Sink, Source, Table, User,
-};
+use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, Sink, Source, Table, User};
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
 use oxia::{OxiaClient, OxiaError};
@@ -177,36 +175,6 @@ impl OxiaMetadata {
 
 #[async_trait]
 impl Metadata for OxiaMetadata {
-    async fn allocate_user_id(&self) -> Result<u32> {
-        loop {
-            let record = self
-                .get0::<CatalogCounter>(USER_ID_PATH, Some(USER_PARTITION_KEY))
-                .await?;
-            let (value, condition) =
-                match record {
-                    Some(record) => (
-                        record.value().value.checked_add(1).ok_or_else(|| {
-                            MetadataError::CounterExhausted(USER_ID_PATH.to_string())
-                        })?,
-                        MetadataPutCondition::Version(record.version()),
-                    ),
-                    None => (1, MetadataPutCondition::NotExists),
-                };
-            let counter = CatalogCounter { value };
-            match self
-                .put0(USER_ID_PATH, &counter, condition, Some(USER_PARTITION_KEY))
-                .await
-            {
-                Ok(_) => {
-                    return u32::try_from(value)
-                        .map_err(|_| MetadataError::CounterExhausted(USER_ID_PATH.to_string()));
-                }
-                Err(MetadataError::Conflict(_)) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
         let key = self.keyspace.object(USER_PATH, name)?;
         self.get0(&key, Some(USER_PARTITION_KEY)).await

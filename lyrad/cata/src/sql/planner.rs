@@ -36,7 +36,7 @@ impl SqlPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::array::StringArray;
     use meta::metadata::{MemoryMetadata, MetadataPutCondition};
     use meta::proto::pb_catalog::User;
 
@@ -66,7 +66,6 @@ mod tests {
         metadata
             .put_user(
                 User {
-                    id: 7,
                     name: "alice".to_string(),
                     password: None,
                 },
@@ -93,23 +92,17 @@ mod tests {
 
         let users = planner
             .context()
-            .sql("SELECT id, name FROM rw_catalog.rw_users")
+            .sql("SELECT name FROM rw_catalog.rw_users")
             .await
             .unwrap()
             .collect()
             .await
             .unwrap();
-        let ids = users[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
         let names = users[0]
-            .column(1)
+            .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(ids.value(0), 7);
         assert_eq!(names.value(0), "alice");
     }
 }

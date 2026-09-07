@@ -28,8 +28,6 @@ async fn stores_typed_protobuf_metadata() {
     let metadata = OxiaMetadata::new(&OxiaOptions::new(address, "default"))
         .await
         .unwrap();
-    let user_id = metadata.allocate_user_id().await.unwrap();
-
     let user_version = metadata
         .put_user(
             User {
@@ -39,7 +37,6 @@ async fn stores_typed_protobuf_metadata() {
                     salted_password: b"hash".to_vec().into(),
                     iterations: 4096,
                 }),
-                id: user_id,
             },
             MetadataPutCondition::NotExists,
         )

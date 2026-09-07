@@ -60,7 +60,6 @@ impl Cata {
             let user = User {
                 name: name.to_string(),
                 password: Some(make_password_credential(password)),
-                id: metadata.allocate_user_id().await?,
             };
             match metadata
                 .put_user(user, MetadataPutCondition::NotExists)

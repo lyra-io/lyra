@@ -4,10 +4,7 @@ package io.lyra.proto.catalog.v1;
 
 message User {
   string name = 1;
-  reserved 2, 3, 4, 5;
-  reserved "is_superuser", "can_create_database", "can_create_user", "can_login";
   PasswordCredential password = 6;
-  uint32 id = 7;
 }
 
 message PasswordCredential {
@@ -63,10 +60,6 @@ message Table {
   repeated Column columns = 4;
   repeated string primary_key = 5;
   map<string, string> options = 6;
-}
-
-message CatalogCounter {
-  uint64 value = 1;
 }
 
 message StreamMeta {
