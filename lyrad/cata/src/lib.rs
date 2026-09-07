@@ -5,7 +5,6 @@
 
 pub mod options;
 
-mod authentication;
 mod cata;
 mod error;
 mod executor;

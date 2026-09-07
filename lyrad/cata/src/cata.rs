@@ -1,5 +1,4 @@
 use crate::Result;
-use crate::authentication::{PasswordAuthenticationProvider, make_password_credential};
 use crate::handler::{DatabaseHandles, QueryHandler, StartupHandler};
 use crate::options::CataOptions;
 use datafusion_postgres::pgwire::api::ConnectionManager;
@@ -8,6 +7,7 @@ use datafusion_postgres::pgwire::api::auth::StartupHandler as PgWireStartupHandl
 use datafusion_postgres::pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::{ServerOptions, serve_with_handlers};
+use meta::auth::{BasicAuthenticationProvider, make_password_credential};
 use meta::metadata::{
     DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, Metadata, MetadataError, MetadataPutCondition,
 };
@@ -36,13 +36,13 @@ impl Cata {
             Arc::clone(&databases),
             Arc::clone(&metadata),
         ));
-        let authentication_provider = Arc::new(PasswordAuthenticationProvider::new(
-            metadata,
-            Arc::clone(&databases),
-        ));
+        let authentication_provider =
+            Arc::new(BasicAuthenticationProvider::new(Arc::clone(&metadata)));
         let startup_handler = Arc::new(StartupHandler::new(
             connection_manager,
-            vec![authentication_provider],
+            authentication_provider,
+            metadata,
+            Arc::clone(&databases),
         ));
         Ok(Self {
             cancel_handler,

@@ -38,9 +38,6 @@ pub enum CataError {
     #[error("a bootstrap user is required when the user catalog is empty")]
     BootstrapUserRequired,
 
-    #[error("user {0:?} has an invalid password credential")]
-    InvalidPasswordCredential(String),
-
     #[error("secret {0:?} already exists")]
     SecretAlreadyExists(String),
 

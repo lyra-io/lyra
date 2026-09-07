@@ -1,7 +1,7 @@
 use super::matches_like;
-use crate::authentication::make_password_credential;
 use crate::sql::{AlterUser, AlterUserAction, CreateUser, DropUser, ShowUsers, UserPassword};
 use crate::{CataError, Result};
+use meta::auth::make_password_credential;
 use meta::metadata::{Metadata, MetadataError, MetadataPutCondition};
 use meta::proto::pb_catalog::{PasswordCredential, User};
 use std::sync::Arc;
