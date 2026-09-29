@@ -9,3 +9,19 @@ build_search_index = false
 
 [extra]
 github = "https://github.com/lyra-io"
+
+[[extra.navigation]]
+name = "Home"
+path = "/"
+
+[[extra.navigation]]
+name = "Documentation"
+path = "/docs/"
+
+[[extra.navigation]]
+name = "Reference"
+path = "/reference/"
+
+[[extra.navigation]]
+name = "Blog"
+path = "/blog/"

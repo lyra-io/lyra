@@ -1,66 +1,64 @@
+{% set route = current_path | default(value="/404.html") %}
+{% set meta_title = config.title %}
+{% set meta_description = config.description %}
+{% if page is defined %}
+  {% set meta_title = page.title ~ " — Lyra" %}
+  {% set meta_description = page.description | default(value=config.description) %}
+{% elif section is defined and route != "/" %}
+  {% set meta_title = section.title ~ " — Lyra" %}
+  {% set meta_description = section.description | default(value=config.description) %}
+{% endif %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}{{ config.title }}{% endblock %}</title>
-<meta name="description" content="{{ config.description }}">
-<meta property="og:title" content="{{ config.title }}">
-<meta property="og:description" content="{{ config.description }}">
-<meta property="og:type" content="website">
-<meta property="og:url" content="{{ config.base_url }}">
-<meta property="og:image" content="{{ get_url(path='logo.png') }}">
-<meta name="twitter:card" content="summary">
-<link rel="icon" href="{{ get_url(path='logo.svg') }}" type="image/svg+xml">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="{{ get_url(path='main.css') }}">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#fafbfc">
+  <title>{% block title %}{{ meta_title }}{% endblock %}</title>
+  <meta name="description" content="{{ meta_description }}">
+  <meta property="og:title" content="{{ meta_title }}">
+  <meta property="og:description" content="{{ meta_description }}">
+  <meta property="og:type" content="{% if page is defined and page.date %}article{% else %}website{% endif %}">
+  <meta property="og:url" content="{{ current_url | default(value=config.base_url) }}">
+  <meta property="og:image" content="{{ get_url(path='logo.png') }}">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="{{ current_url | default(value=config.base_url) }}">
+  <link rel="icon" href="{{ get_url(path='logo.svg') }}" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ get_url(path='main.css') }}">
+  <link rel="alternate" type="application/atom+xml" title="Lyra Blog" href="{{ get_url(path='blog/atom.xml') }}">
+  <script src="{{ get_url(path='site.js') }}" defer></script>
 </head>
 <body>
-
-<header class="nav">
-  <a class="nav__brand" href="{{ config.base_url }}">
-    <span class="nav__mark">{% include "mark.html" %}</span>
-    <span class="nav__word">Lyra</span>
-  </a>
-  <nav class="nav__links">
-    <a href="#architecture">Architecture</a>
-    <a href="#components">Components</a>
-    <a href="#start">Quickstart</a>
-    <a href="{{ config.extra.github }}" class="nav__gh">GitHub&nbsp;&rarr;</a>
-  </nav>
-</header>
-
-{% block content %}{% endblock %}
-
-<footer class="foot">
-  <div class="foot__inner">
-    <div class="foot__brand">
-      <span class="foot__mark">{% include "mark.html" %}</span>
-      <div>
-        <strong>Lyra</strong>
-        <p>One streaming system is all you need.</p>
-      </div>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="{{ get_url(path='/') }}" aria-label="Lyra home"><span class="brand-mark">{% include "mark.html" %}</span><span>Lyra</span></a>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav" hidden>Menu {{ <icon name="menu" /> }}</button>
+      <nav id="primary-nav" class="primary-nav" aria-label="Main navigation">
+        {% for item in config.extra.navigation %}
+          {% set active = route == item.path or (item.path != "/" and route is starting_with(pat=item.path)) %}
+          <a class="nav-link{% if active %} is-active{% endif %}" href="{{ get_url(path=item.path) }}"{% if active %} aria-current="{% if route == item.path %}page{% else %}true{% endif %}"{% endif %}>{{ item.name }}</a>
+        {% endfor %}
+        <a class="nav-github" href="{{ config.extra.github }}">{{ <icon name="github" /> }} GitHub {{ <icon name="external" /> }}</a>
+      </nav>
     </div>
-    <div class="foot__cols">
-      <div>
-        <h4>Components</h4>
-        <a href="https://github.com/lyra-io/lyra-meta">lyra-meta</a>
-        <a href="https://github.com/lyra-io/lyra-catalog">lyra-catalog</a>
-        <a href="https://github.com/lyra-io/lyra-stream">lyra-stream</a>
-        <a href="https://github.com/lyra-io/lyra-func">lyra-func</a>
+  </header>
+  <main id="main" tabindex="-1">{% block content %}{% endblock %}</main>
+  <footer class="site-footer">
+    <div class="container footer-grid">
+      <div class="footer-intro">
+        <a class="brand" href="{{ get_url(path='/') }}"><span class="brand-mark">{% include "mark.html" %}</span><span>Lyra</span></a>
+        <p>One streaming system<br>is all you need.</p>
       </div>
-      <div>
-        <h4>Project</h4>
-        <a href="{{ config.extra.github }}">GitHub organisation</a>
-        <a href="https://github.com/lyra-io/lyra-io.github.io/blob/main/LICENSE">Apache-2.0</a>
-      </div>
+      <div><h2>Learn</h2><a href="{{ get_url(path='docs/') }}">Documentation</a><a href="{{ get_url(path='docs/getting-started/') }}">Getting started</a><a href="{{ get_url(path='docs/architecture/') }}">Architecture</a></div>
+      <div><h2>Explore</h2><a href="{{ get_url(path='reference/') }}">Reference</a><a href="{{ get_url(path='blog/') }}">Blog</a><a href="{{ get_url(path='blog/atom.xml') }}">RSS feed</a></div>
+      <div><h2>Contribute</h2><a href="{{ config.extra.github }}">GitHub {{ <icon name="external" /> }}</a><a href="{{ get_url(path='docs/development/') }}">Developer guide</a><a href="https://github.com/lyra-io/lyra-io.github.io/blob/main/LICENSE">Apache 2.0 license</a></div>
     </div>
-  </div>
-  <div class="foot__rule"></div>
-  <p class="foot__legal">Apache-2.0 licensed. Built with Rust.</p>
-</footer>
-
+    <div class="container footer-bottom"><a href="#main">Back to top ↑</a></div>
+  </footer>
 </body>
 </html>

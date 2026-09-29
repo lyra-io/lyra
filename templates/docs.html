@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+{% if page is defined %}{% set document = page %}{% else %}{% set document = section %}{% endif %}
+<div class="container docs-layout">
+  <aside class="docs-sidebar" aria-label="Documentation navigation">
+    <a class="docs-home" href="{{ get_url(path='docs/') }}">{{ <icon name="book" /> }} Documentation</a>
+    <nav aria-label="Guides"><p class="eyebrow">LEARN &amp; BUILD</p>
+      {% set guides = [{"title": "Overview", "path": "/docs/"}, {"title": "Getting started", "path": "/docs/getting-started/"}, {"title": "Architecture", "path": "/docs/architecture/"}, {"title": "Development", "path": "/docs/development/"}] %}
+      {% for item in guides %}<a href="{{ get_url(path=item.path) }}"{% if route == item.path %} class="is-active" aria-current="page"{% endif %}>{{ item.title }}</a>{% endfor %}
+    </nav>
+    <nav aria-label="Reference"><p class="eyebrow">REFERENCE</p>
+      {% set references = [{"title": "Reference overview", "path": "/reference/"}, {"title": "Catalog SQL", "path": "/reference/catalog-sql/"}, {"title": "Configuration", "path": "/reference/configuration/"}] %}
+      {% for item in references %}<a href="{{ get_url(path=item.path) }}"{% if route == item.path %} class="is-active" aria-current="page"{% endif %}>{{ item.title }}</a>{% endfor %}
+    </nav>
+    <a class="sidebar-source" href="https://github.com/lyra-io/lyra-io.github.io">Documentation source {{ <icon name="external" /> }}</a>
+  </aside>
+  <article class="doc-main">
+    <header class="doc-header"><p class="eyebrow">{% if route is starting_with(pat="/reference/") %}REFERENCE{% else %}DOCUMENTATION{% endif %}</p><h1>{{ document.title }}</h1><p>{{ document.description }}</p></header>
+    <div class="prose">{{ document.content | replace(from="<pre", to='<pre tabindex="0"') | replace(from="<table>", to='<table tabindex="0">') | safe }}</div>
+    {% if document.extra.overview is defined %}
+      <div class="doc-link-grid">
+      {% if document.extra.overview == "docs" %}
+        <a href="{{ get_url(path='docs/getting-started/') }}">{{ <icon name="terminal" /> }}<h2>Getting started</h2><p>Run the catalog and make your first SQL connection.</p><span>Start here →</span></a>
+        <a href="{{ get_url(path='docs/architecture/') }}">{{ <icon name="meta" /> }}<h2>Architecture</h2><p>Understand the repositories and their shared contracts.</p><span>Explore the system →</span></a>
+        <a href="{{ get_url(path='reference/') }}">{{ <icon name="book" /> }}<h2>Reference</h2><p>Look up SQL statements and configuration options.</p><span>Find the details →</span></a>
+        <a href="{{ get_url(path='docs/development/') }}">{{ <icon name="func" /> }}<h2>Development</h2><p>Build from source and contribute to Lyra.</p><span>Open the code →</span></a>
+      {% else %}
+        <a href="{{ get_url(path='reference/catalog-sql/') }}">{{ <icon name="catalog" /> }}<h2>Catalog SQL</h2><p>Databases, schemas, users, and secrets.</p><span>SQL reference →</span></a>
+        <a href="{{ get_url(path='reference/configuration/') }}">{{ <icon name="terminal" /> }}<h2>Configuration</h2><p>Metadata connections and the catalog listener.</p><span>Configuration reference →</span></a>
+      {% endif %}
+      </div>
+    {% endif %}
+    {% if document.extra.next_path is defined %}<a class="doc-next" href="{{ get_url(path=document.extra.next_path) }}"><span><small>CONTINUE READING</small>{{ document.extra.next_title }}</span>{{ <icon name="arrow" /> }}</a>{% endif %}
+  </article>
+  <aside class="doc-toc" aria-label="On this page">{% if document.toc | length > 0 %}<p class="eyebrow">ON THIS PAGE</p>{% for heading in document.toc %}<a href="#{{ heading.id }}">{{ heading.title }}</a>{% endfor %}{% endif %}</aside>
+</div>
+{% endblock content %}

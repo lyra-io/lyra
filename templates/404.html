@@ -1,0 +1,3 @@
+{% extends "base.html" %}
+{% block title %}Page not found — Lyra{% endblock title %}
+{% block content %}<section class="container not-found"><p class="eyebrow">404 / A SMALL DETOUR</p><h1>This stream<br>ends here.</h1><p>The page you're looking for may have moved. Let's get you back to Lyra.</p><div class="actions"><a class="button button--primary" href="{{ get_url(path='/') }}">Back to Home {{ <icon name="arrow" /> }}</a><a class="button" href="{{ get_url(path='docs/') }}">Documentation</a></div></section>{% endblock content %}
