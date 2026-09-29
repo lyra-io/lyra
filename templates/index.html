@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<section class="hero">
+  <div class="hero__glyph" aria-hidden="true">{% include "mark.html" %}</div>
+  <div class="hero__inner">
+    <p class="pill"><span class="pill__dot"></span> Early development</p>
+    <h1>One streaming system<br>is all you need.</h1>
+    <p class="hero__lead">
+      Lyra is a streaming engine written in Rust. Durable log storage, a SQL
+      catalog and distributed execution are one system &mdash; not a broker, a
+      table format and a query engine stitched together at the seams.
+    </p>
+    <div class="hero__cta">
+      <a class="btn btn--solid" href="#start">Quickstart</a>
+      <a class="btn" href="https://github.com/lyra-io">GitHub</a>
+    </div>
+    <dl class="hero__facts">
+      <div><dt>Language</dt><dd>Rust 2024</dd></div>
+      <div><dt>Wire</dt><dd>PostgreSQL</dd></div>
+      <div><dt>Licence</dt><dd>Apache-2.0</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section class="band" id="architecture">
+  <div class="wrap">
+    <h2 class="sec__title">Four parts, one system</h2>
+    <p class="sec__lead">
+      Each part is its own repository and its own binary. They share one
+      library of contracts and one metadata store, so the seams between them
+      are types rather than file formats.
+    </p>
+
+    <div class="flow">
+      <div class="flow__row">
+        <div class="node node--client">
+          <span class="node__kind">any client</span>
+          <strong>psql &middot; JDBC &middot; drivers</strong>
+        </div>
+      </div>
+      <div class="flow__link"><span>PostgreSQL wire protocol</span></div>
+      <div class="flow__row">
+        <div class="node node--accent">
+          <span class="node__kind">lyra-catalog</span>
+          <strong>Parse &amp; plan</strong>
+        </div>
+        <div class="flow__arrow" aria-hidden="true">&rarr;</div>
+        <div class="node">
+          <span class="node__kind">lyra-func</span>
+          <strong>Execute fragments</strong>
+        </div>
+      </div>
+      <div class="flow__link"><span>reads and writes</span></div>
+      <div class="flow__row">
+        <div class="node">
+          <span class="node__kind">lyra-stream</span>
+          <strong>Write-ahead log &amp; segments</strong>
+        </div>
+      </div>
+      <div class="flow__base">
+        <span class="node__kind">lyra-meta</span>
+        <strong>Shared contracts &middot; metadata &middot; authentication</strong>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band band--alt" id="components">
+  <div class="wrap">
+    <h2 class="sec__title">Components</h2>
+    <div class="cards">
+
+      <article class="card">
+        <header>
+          <h3>lyra-catalog</h3>
+          <span class="tag tag--live">working</span>
+        </header>
+        <p>
+          Parses and plans SQL on DataFusion and speaks the PostgreSQL wire
+          protocol directly, so <code>psql</code> and any Postgres driver
+          connect without a shim. Handles databases, schemas, users, secrets
+          and connections, with SCRAM authentication.
+        </p>
+        <a class="card__link" href="https://github.com/lyra-io/lyra-catalog">lyra-catalog&nbsp;&rarr;</a>
+      </article>
+
+      <article class="card">
+        <header>
+          <h3>lyra-stream</h3>
+          <span class="tag tag--part">storage working</span>
+        </header>
+        <p>
+          A write-ahead log of segmented, CRC-checked records over a pluggable
+          virtual file system &mdash; direct I/O, buffered, or in-memory. The
+          log protocol is specified in TLA+. The gRPC service is next.
+        </p>
+        <a class="card__link" href="https://github.com/lyra-io/lyra-stream">lyra-stream&nbsp;&rarr;</a>
+      </article>
+
+      <article class="card">
+        <header>
+          <h3>lyra-meta</h3>
+          <span class="tag tag--live">working</span>
+        </header>
+        <p>
+          The one library every other part depends on: shared catalog types,
+          SCRAM authentication, common utilities, and the metadata interface
+          with its Oxia-backed implementation. A library, never a service.
+        </p>
+        <a class="card__link" href="https://github.com/lyra-io/lyra-meta">lyra-meta&nbsp;&rarr;</a>
+      </article>
+
+      <article class="card">
+        <header>
+          <h3>lyra-func</h3>
+          <span class="tag">planned</span>
+        </header>
+        <p>
+          The query task runtime. It executes the plan fragments catalog
+          produces, where a fragment acts as a source, a transformation, an
+          exchange, or a sink. Design in progress.
+        </p>
+        <a class="card__link" href="https://github.com/lyra-io/lyra-func">lyra-func&nbsp;&rarr;</a>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<section class="band" id="start">
+  <div class="wrap wrap--narrow">
+    <h2 class="sec__title">Quickstart</h2>
+    <p class="sec__lead">
+      The catalog is the front door. It needs a reachable
+      <a href="https://github.com/oxia-db/oxia">Oxia</a> service for metadata;
+      configure it under <code>[meta]</code>.
+    </p>
+
+    <div class="step">
+      <span class="step__n">1</span>
+      <div class="step__body">
+        <h3>Run the catalog</h3>
+<pre><code><span class="c">$</span> git clone https://github.com/lyra-io/lyra-catalog
+<span class="c">$</span> cd lyra-catalog
+<span class="c">$</span> cargo run -p lyra-catalog-cli -- \
+    serve --config options/lyra-catalog.toml</code></pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <span class="step__n">2</span>
+      <div class="step__body">
+        <h3>Connect with any Postgres client</h3>
+<pre><code><span class="c">$</span> psql -h 127.0.0.1 -p 5432 -U root</code></pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <span class="step__n">3</span>
+      <div class="step__body">
+        <h3>Speak SQL</h3>
+<pre><code><span class="k">CREATE DATABASE</span> analytics;
+<span class="k">CREATE SCHEMA</span> analytics.events;
+<span class="k">CREATE USER</span> reader <span class="k">WITH PASSWORD</span> <span class="s">'secret'</span>;</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band band--alt">
+  <div class="wrap wrap--narrow">
+    <h2 class="sec__title">Where it stands</h2>
+    <p class="sec__lead">
+      Lyra is early and under active development. This is what is real today,
+      not what is planned.
+    </p>
+    <ul class="status">
+      <li><span class="status__ok"></span><strong>lyra-catalog</strong> &mdash; SQL parsing, planning and pgwire, covered by 48 tests.</li>
+      <li><span class="status__ok"></span><strong>lyra-stream</strong> &mdash; WAL, segments and VFS, covered by 35 tests. The gRPC server is not wired up yet.</li>
+      <li><span class="status__ok"></span><strong>lyra-meta</strong> &mdash; contracts, auth and the Oxia metadata store, covered by 11 tests.</li>
+      <li><span class="status__wip"></span><strong>lyra-func</strong> &mdash; a scaffold. The runtime and its service contract are still being designed.</li>
+    </ul>
+  </div>
+</section>
+
+{% endblock %}

@@ -1,0 +1,11 @@
+base_url = "https://lyra-io.github.io"
+title = "Lyra"
+description = "One streaming system is all you need."
+
+compile_sass = true
+minify_html = true
+generate_feeds = false
+build_search_index = false
+
+[extra]
+github = "https://github.com/lyra-io"
